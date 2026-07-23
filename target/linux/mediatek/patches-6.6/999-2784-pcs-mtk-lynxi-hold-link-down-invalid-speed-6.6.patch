@@ -1,4 +1,4 @@
-From: Petr Wozniak <petr.wozniak@gmail.com>
+From: MedyMa <aneylovemzy@gmail.com>
 Date: Sun, 06 Jul 2026 16:00:00 +0200
 Subject: [PATCH 6.6] net: pcs: mtk-lynxi: don't report link up with
  unresolved speed in get_state
@@ -22,7 +22,7 @@ speed resolves.  This is the 6.6 equivalent of the 6.7+ link_poll guard
 Note: targets padavanonly's 6.6 kernel with existing PCS patches
 (999-2601, 999-2605) already applied.
 
-Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+Signed-off-by: MedyMa <aneylovemzy@gmail.com>
 ---
  drivers/net/pcs/pcs-mtk-lynxi.c | 7 +++++++
  1 file changed, 7 insertions(+)

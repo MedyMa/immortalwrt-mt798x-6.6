@@ -1,4 +1,4 @@
-From: Petr Wozniak <petr.wozniak@gmail.com>
+From: MedyMa <aneylovemzy@gmail.com>
 Date: Thu, 15 May 2026 12:00:00 +0200
 Subject: [PATCH 6.6] net: sfp: probe-based RTL8261BE rollball detection
 
@@ -32,11 +32,11 @@ The sfp_sm_add_mdio_bus() change from the 25.12 version is omitted
 here — this function was introduced in Linux 6.7+ and does not exist
 in the 6.6 kernel.
 
-Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+Signed-off-by: MedyMa <aneylovemzy@gmail.com>
 ---
  drivers/net/mdio/mdio-i2c.c | 48 ++++++++++++++++++++++++++++++++++++--------
  drivers/net/phy/sfp.c       |  1 +
- 2 files changed, 41 insertions(+), 8 deletions(-)
+ 2 files changed, 53 insertions(+), 7 deletions(-)
 
 --- a/drivers/net/mdio/mdio-i2c.c
 +++ b/drivers/net/mdio/mdio-i2c.c

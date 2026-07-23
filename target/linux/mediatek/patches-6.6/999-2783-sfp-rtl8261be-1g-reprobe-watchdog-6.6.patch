@@ -1,4 +1,4 @@
-From: Petr Wozniak <petr.wozniak@gmail.com>
+From: MedyMa <aneylovemzy@gmail.com>
 Date: Thu, 22 May 2026 14:00:00 +0200
 Subject: [PATCH 6.6] net: sfp: add 1G multi-speed reprobe watchdog for
  RTL8261BE
@@ -44,10 +44,10 @@ already applied.  The sfp_sm_main() hunk is designed to apply
 AFTER padavanonly's 999-2764 (which changed the phy_probe path
 from "ret == -ENODEV" to "ret == -ENODEV || ret == -EINVAL").
 
-Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+Signed-off-by: MedyMa <aneylovemzy@gmail.com>
 ---
  drivers/net/phy/sfp.c | 67 +++++++++++++++++++++++++++++++++++++++++--
- 1 file changed, 72 insertions(+), 2 deletions(-)
+ 1 file changed, 69 insertions(+), 2 deletions(-)
 
 --- a/drivers/net/phy/sfp.c
 +++ b/drivers/net/phy/sfp.c
