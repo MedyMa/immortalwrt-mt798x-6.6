@@ -153,6 +153,25 @@ static int mtk_get_bssid(const char *dev, char *buf)
 	return -1;
 }
 
+static int mtk_is_eht320(const char *dev)
+{
+	struct uci_section *s;
+	const char *htmode = NULL;
+	int ret = 0;
+
+	s = iwinfo_uci_get_radio(dev, "mtwifi");
+	if (!s)
+		goto out;
+
+	htmode = uci_lookup_option_string(uci_ctx, s, "htmode");
+	if (htmode && !strcmp(htmode, "EHT320"))
+		ret = 1;
+
+out:
+	iwinfo_uci_free();
+	return ret;
+}
+
 static int mtk_get_bitrate(const char *dev, int *buf)
 {
 	struct iwreq wrq;
@@ -164,7 +183,14 @@ static int mtk_get_bitrate(const char *dev, int *buf)
 
 	if(mtk_ioctl(ifname, SIOCGIWRATE, &wrq) >= 0)
 	{
-		*buf = (wrq.u.bitrate.value / 1000);
+		uint64_t bitrate = wrq.u.bitrate.value;
+		int eht320 = mtk_is_eht320(dev);
+
+		if (eht320 &&
+		    bitrate >= 500000000ULL && bitrate <= 530000000ULL)
+			bitrate = 8647000000ULL;
+
+		*buf = (bitrate / 1000);
 		return 0;
 	}
 
