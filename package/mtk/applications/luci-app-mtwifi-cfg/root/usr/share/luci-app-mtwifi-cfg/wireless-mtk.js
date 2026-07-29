@@ -13,6 +13,12 @@
 
 var isReadonlyView = !L.hasViewPermission();
 
+var callWifiStationHints = rpc.declare({
+	object: 'luci',
+	method: 'getWifiStationHints',
+	expect: { '': {} }
+});
+
 function count_changes(section_id) {
 	var changes = ui.changes.changes, n = 0;
 
@@ -261,6 +267,43 @@ function format_wifirate(rate) {
 	].filter(Boolean).join('');
 
 	return s;
+}
+
+function normalizeStationHint(value) {
+	return (value == '?') ? null : value;
+}
+
+function getStationHint(hosts, stationhints, mac) {
+	var alias = stationhints[(mac || '').toUpperCase()] || stationhints[mac] || null,
+	    source_mac = alias ? alias.source_mac : null,
+	    name = normalizeStationHint(hosts.getHostnameByMACAddr(mac)),
+	    ipv4 = normalizeStationHint(hosts.getIPAddrByMACAddr(mac)),
+	    ipv6 = normalizeStationHint(hosts.getIP6AddrByMACAddr(mac));
+
+	if (!name && alias) {
+		name = normalizeStationHint(alias.name);
+		if (!name && source_mac)
+			name = normalizeStationHint(hosts.getHostnameByMACAddr(source_mac));
+	}
+
+	if (!ipv4 && alias) {
+		ipv4 = normalizeStationHint(L.toArray(alias.ipaddrs || alias.ipv4)[0]);
+		if (!ipv4 && source_mac)
+			ipv4 = normalizeStationHint(hosts.getIPAddrByMACAddr(source_mac));
+	}
+
+	if (!ipv6 && alias) {
+		ipv6 = normalizeStationHint(L.toArray(alias.ip6addrs || alias.ipv6)[0]);
+		if (!ipv6 && source_mac)
+			ipv6 = normalizeStationHint(hosts.getIP6AddrByMACAddr(source_mac));
+	}
+
+	return {
+		name: name,
+		ipv4: ipv4,
+		ipv6: ipv6,
+		source_mac: source_mac
+	};
 }
 
 function radio_restart(id, ev) {
@@ -791,8 +834,8 @@ return view.extend({
 
 		for (var i = 0; i < rows.length; i++) {
 			var section_id = rows[i].getAttribute('data-sid'),
-			    radioDev = data[1].filter(function(d) { return d.getName() == section_id })[0],
-			    radioNet = data[2].filter(function(n) { return n.getName() == section_id })[0],
+			    radioDev = data[2].filter(function(d) { return d.getName() == section_id })[0],
+			    radioNet = data[3].filter(function(n) { return n.getName() == section_id })[0],
 			    badge = rows[i].querySelector('[data-name="_badge"] > div'),
 			    stat = rows[i].querySelector('[data-name="_stat"]'),
 			    btns = rows[i].querySelectorAll('.cbi-section-actions button'),
@@ -800,7 +843,7 @@ return view.extend({
 
 			if (radioDev) {
 				dom.content(badge, render_radio_badge(radioDev));
-				dom.content(stat, render_radio_status(radioDev, data[2].filter(function(n) { return n.getWifiDeviceName() == radioDev.getName() })));
+				dom.content(stat, render_radio_status(radioDev, data[3].filter(function(n) { return n.getWifiDeviceName() == radioDev.getName() })));
 			}
 			else {
 				dom.content(badge, render_network_badge(radioNet));
@@ -817,27 +860,22 @@ return view.extend({
 
 		var table = document.querySelector('#wifi_assoclist_table'),
 		    hosts = data[0],
+		    stationhints = data[1],
 		    trows = [];
 
-		for (var i = 0; i < data[3].length; i++) {
-			var bss = data[3][i],
-			    name = hosts.getHostnameByMACAddr(bss.mac),
-			    ipv4 = hosts.getIPAddrByMACAddr(bss.mac),
-			    ipv6 = hosts.getIP6AddrByMACAddr(bss.mac);
+		for (var i = 0; i < data[4].length; i++) {
+			var bss = data[4][i],
+			    host = getStationHint(hosts, stationhints, bss.mac),
+			    name = host.name,
+			    ipv4 = host.ipv4,
+			    ipv6 = host.ipv6;
 
 			var hint = '-';
 			if (bss.network.getMode() == 'ap')
 			{
-				/* Some host-hint implementations return '?' as a placeholder
-				 * for unresolved entries instead of null.  Normalise them so
-				 * the '?' literal never leaks into the hint via || short-circuit. */
-				if (name == '?') name = null;
-				if (ipv4 == '?') ipv4 = null;
-				if (ipv6 == '?') ipv6 = null;
-
-				/* For Wi-Fi 7 MLO stations the assoclist MAC (MLD address) may
-				 * differ from the per-link MAC used for DHCP, so host lookups
-				 * can fail.  Fall back to showing the MAC rather than '?'. */
+				/* For Wi-Fi 7 MLO stations the assoclist link MAC may differ
+				 * from the MLD MAC used for DHCP.  The station hint RPC resolves
+				 * that alias; retain the link MAC as the final fallback. */
 				var station_mac = (bss.mac && bss.mac != '?') ? bss.mac : '-';
 
 				if (name && ipv4 && ipv6)
@@ -2593,7 +2631,11 @@ return view.extend({
 		return m.render().then(L.bind(function(m, nodes) {
 			poll.add(L.bind(function() {
 				var section_ids = m.children[0].cfgsections(),
-				    tasks = [ network.getHostHints(), network.getWifiDevices() ];
+				    tasks = [
+					network.getHostHints(),
+					L.resolveDefault(callWifiStationHints(), {}),
+					network.getWifiDevices()
+				    ];
 
 				for (var i = 0; i < section_ids.length; i++) {
 					var row = nodes.querySelector('.cbi-section-table-row[data-sid="%s"]'.format(section_ids[i])),
@@ -2614,39 +2656,39 @@ return view.extend({
 				}
 
 				return Promise.all(tasks)
-					.then(L.bind(function(hosts_radios) {
+					.then(L.bind(function(hosts_stationhints_radios) {
 						var tasks = [];
 
-						for (var i = 0; i < hosts_radios[1].length; i++)
-							tasks.push(hosts_radios[1][i].getWifiNetworks());
+						for (var i = 0; i < hosts_stationhints_radios[2].length; i++)
+							tasks.push(hosts_stationhints_radios[2][i].getWifiNetworks());
 
 						return Promise.all(tasks).then(function(data) {
-							hosts_radios[2] = [];
+							hosts_stationhints_radios[3] = [];
 
 							for (var i = 0; i < data.length; i++)
-								hosts_radios[2].push.apply(hosts_radios[2], data[i]);
+								hosts_stationhints_radios[3].push.apply(hosts_stationhints_radios[3], data[i]);
 
-							return hosts_radios;
+							return hosts_stationhints_radios;
 						});
 					}, network))
-					.then(L.bind(function(hosts_radios_wifis) {
+					.then(L.bind(function(hosts_stationhints_radios_wifis) {
 						var tasks = [];
 
-						for (var i = 0; i < hosts_radios_wifis[2].length; i++)
-							tasks.push(hosts_radios_wifis[2][i].getAssocList());
+						for (var i = 0; i < hosts_stationhints_radios_wifis[3].length; i++)
+							tasks.push(hosts_stationhints_radios_wifis[3][i].getAssocList());
 
 						return Promise.all(tasks).then(function(data) {
-							hosts_radios_wifis[3] = [];
+							hosts_stationhints_radios_wifis[4] = [];
 
 							for (var i = 0; i < data.length; i++) {
-								var wifiNetwork = hosts_radios_wifis[2][i],
-								    radioDev = hosts_radios_wifis[1].filter(function(d) { return d.getName() == wifiNetwork.getWifiDeviceName() })[0];
+								var wifiNetwork = hosts_stationhints_radios_wifis[3][i],
+								    radioDev = hosts_stationhints_radios_wifis[2].filter(function(d) { return d.getName() == wifiNetwork.getWifiDeviceName() })[0];
 
 								for (var j = 0; j < data[i].length; j++)
-									hosts_radios_wifis[3].push(Object.assign({ radio: radioDev, network: wifiNetwork }, data[i][j]));
+									hosts_stationhints_radios_wifis[4].push(Object.assign({ radio: radioDev, network: wifiNetwork }, data[i][j]));
 							}
 
-							return hosts_radios_wifis;
+							return hosts_stationhints_radios_wifis;
 						});
 					}, network))
 					.then(L.bind(this.poll_status, this, nodes));
