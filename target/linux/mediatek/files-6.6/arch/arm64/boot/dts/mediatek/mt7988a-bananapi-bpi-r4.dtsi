@@ -46,6 +46,14 @@
 		tx-fault-gpios = <&pio 69 GPIO_ACTIVE_HIGH>;
 		rate-select0-gpios = <&pio 21 GPIO_ACTIVE_LOW>;
 		maximum-power-milliwatt = <3000>;
+		/* Copper modules stay powered across a warm reboot but can stop
+		 * answering I2C.  This opts the cage into the driver's recovery
+		 * (EEPROM wait, TX_DISABLE pulse, I2C bus recovery).  It has to be
+		 * here, in the tree's overlay, because that is what the kernel is
+		 * built from - a patch that adds it to the kernel's own copy of
+		 * this board file is shadowed by this one and silently does
+		 * nothing. */
+		warm-boot-recovery;
 	};
 
 	gpio-keys {
