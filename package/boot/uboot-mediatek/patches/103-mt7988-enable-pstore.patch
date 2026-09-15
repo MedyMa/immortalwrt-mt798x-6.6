@@ -1,6 +1,6 @@
 --- a/arch/arm/dts/mt7988.dtsi
 +++ b/arch/arm/dts/mt7988.dtsi
-@@ -63,6 +63,30 @@
+@@ -63,6 +63,31 @@
  		#clock-cells = <0>;
  	};
  
@@ -18,7 +18,8 @@
 +		ramoops@42ff0000 {
 +			compatible = "ramoops";
 +			reg = <0 0x42ff0000 0 0x10000>;
-+			record-size = <0x1000>;
++			console-size = <0x8000>;
++			record-size = <0x2000>;
 +		};
 +
 +		/* 320 KiB reserved for ARM Trusted Firmware (BL31+BL32) */
