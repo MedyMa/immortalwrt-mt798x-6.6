@@ -102,9 +102,6 @@
 		mod-def0-gpios = <&pio 4 GPIO_ACTIVE_LOW>;
 		tx-disable-gpios = <&pio 21 GPIO_ACTIVE_HIGH>;
 		maximum-power-milliwatt = <3000>;
-		/* Opt into the driver's warm-reboot recovery; see the comment in
-		 * mt7988a-bananapi-bpi-r4.dtsi for why it belongs in the overlay. */
-		warm-boot-recovery;
 	};
 
 	/* SFP2 cage (WAN) */
@@ -115,7 +112,6 @@
 		mod-def0-gpios = <&pio 1 GPIO_ACTIVE_LOW>;
 		tx-disable-gpios = <&pio 0 GPIO_ACTIVE_HIGH>;
 		maximum-power-milliwatt = <3000>;
-		warm-boot-recovery;
 	};
 };
 
