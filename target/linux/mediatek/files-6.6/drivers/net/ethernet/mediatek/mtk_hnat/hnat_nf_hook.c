@@ -3036,9 +3036,10 @@ static unsigned int mtk_hnat_nf_post_routing(
 	trace_printk("[%s] case hit, %x-->%s, reason=%x\n", __func__,
 		     skb_hnat_iface(skb), out->name, skb_hnat_reason(skb));
 
+	/* Invalid hardware metadata must not drop otherwise forwardable packets. */
 	if (skb_hnat_entry(skb) >= hnat_priv->foe_etry_num ||
 	    skb_hnat_ppe(skb) >= CFG_PPE_NUM)
-		return -1;
+		return 0;
 
 	entry = &hnat_priv->foe_table_cpu[skb_hnat_ppe(skb)][skb_hnat_entry(skb)];
 
