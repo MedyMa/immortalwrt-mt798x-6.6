@@ -11,6 +11,7 @@
  *   Copyright (C) 2016-2017 John Crispin <blogic@openwrt.org>
  */
 
+#include <linux/atomic.h>
 #include <linux/debugfs.h>
 #include <linux/string.h>
 #include <linux/if.h>
@@ -959,6 +960,10 @@ struct mtk_hnat {
 	struct ppe_mcast_table *pmcast;
 
 	u32 foe_etry_num;
+	/* Postrouting bounds fallbacks; reason counters may overlap. */
+	atomic64_t invalid_foe;
+	atomic64_t invalid_ppe;
+	atomic64_t software_fallback;
 	u32 etry_num_cfg;
 	struct net_device *g_ppdev;
 	struct net_device *g_wandev;

@@ -771,6 +771,9 @@ static int hnat_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	hnat_priv->foe_etry_num = DEF_ETRY_NUM;
+	atomic64_set(&hnat_priv->invalid_foe, 0);
+	atomic64_set(&hnat_priv->invalid_ppe, 0);
+	atomic64_set(&hnat_priv->software_fallback, 0);
 
 	match = of_match_device(of_hnat_match, &pdev->dev);
 	if (unlikely(!match))

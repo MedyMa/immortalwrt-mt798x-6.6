@@ -3094,6 +3094,19 @@ static const struct debugfs_reg32 hnat_regs[] = {
 	dump_register(CAH_RDATA),
 };
 
+static int hnat_fallback_show(struct seq_file *m, void *private)
+{
+	struct mtk_hnat *h = m->private;
+
+	/* Independent lifetime counters; reading never queries or clears MIB. */
+	seq_printf(m, "invalid_foe %lld\n", atomic64_read(&h->invalid_foe));
+	seq_printf(m, "invalid_ppe %lld\n", atomic64_read(&h->invalid_ppe));
+	seq_printf(m, "software_fallback %lld\n",
+		   atomic64_read(&h->software_fallback));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hnat_fallback);
+
 int hnat_init_debugfs(struct mtk_hnat *h)
 {
 	int ret = 0;
@@ -3130,6 +3143,7 @@ int hnat_init_debugfs(struct mtk_hnat *h)
 	}
 
 	debugfs_create_file("all_entry", 0444, root, h, &hnat_debug_fops);
+	debugfs_create_file("fallback_stats", 0444, root, h, &hnat_fallback_fops);
 	debugfs_create_file("external_interface", 0444, root, h,
 			    &hnat_ext_fops);
 	debugfs_create_file("whnat_interface", 0444, root, h,

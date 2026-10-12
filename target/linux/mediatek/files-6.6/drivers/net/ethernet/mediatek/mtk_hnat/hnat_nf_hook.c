@@ -2991,6 +2991,35 @@ int mtk_464xlat_post_process(struct sk_buff *skb, const struct net_device *out)
 	return 0;
 }
 
+static inline void hnat_mark_unbindable(struct sk_buff *skb)
+{
+	/* A clone may share this descriptor with a different packet. */
+	if (skb_cow_head(skb, 0))
+		return; /* Existing downstream bounds checks still prevent binding. */
+
+	/* Invalidate only HNAT eligibility, preserving headroom and skb->cb. */
+	skb_hnat_alg(skb) = 1;
+	skb_hnat_magic_tag(skb) = 0;
+}
+
+static bool hnat_invalid_index_fallback(struct sk_buff *skb)
+{
+	bool invalid_foe = skb_hnat_entry(skb) >= hnat_priv->foe_etry_num;
+	bool invalid_ppe = skb_hnat_ppe(skb) >= CFG_PPE_NUM;
+
+	if (likely(!invalid_foe && !invalid_ppe))
+		return false;
+
+	if (invalid_foe)
+		atomic64_inc(&hnat_priv->invalid_foe);
+	if (invalid_ppe)
+		atomic64_inc(&hnat_priv->invalid_ppe);
+	atomic64_inc(&hnat_priv->software_fallback);
+	hnat_mark_unbindable(skb);
+
+	return true;
+}
+
 static unsigned int mtk_hnat_nf_post_routing(
 	struct sk_buff *skb, const struct net_device *out,
 	unsigned int (*fn)(struct sk_buff *, const struct net_device *,
@@ -3008,6 +3037,10 @@ static unsigned int mtk_hnat_nf_post_routing(
 
 	if (skb_hnat_alg(skb) || unlikely(!is_magic_tag_valid(skb) ||
 					  !IS_SPACE_AVAILABLE_HEAD(skb)))
+		return 0;
+
+	/* Check before is_hashed(), which itself filters invalid FOE indices. */
+	if (unlikely(hnat_invalid_index_fallback(skb)))
 		return 0;
 
 	if (unlikely(!skb_mac_header_was_set(skb)))
@@ -3035,11 +3068,6 @@ static unsigned int mtk_hnat_nf_post_routing(
 
 	trace_printk("[%s] case hit, %x-->%s, reason=%x\n", __func__,
 		     skb_hnat_iface(skb), out->name, skb_hnat_reason(skb));
-
-	/* Invalid hardware metadata must not drop otherwise forwardable packets. */
-	if (skb_hnat_entry(skb) >= hnat_priv->foe_etry_num ||
-	    skb_hnat_ppe(skb) >= CFG_PPE_NUM)
-		return 0;
 
 	entry = &hnat_priv->foe_table_cpu[skb_hnat_ppe(skb)][skb_hnat_entry(skb)];
 
