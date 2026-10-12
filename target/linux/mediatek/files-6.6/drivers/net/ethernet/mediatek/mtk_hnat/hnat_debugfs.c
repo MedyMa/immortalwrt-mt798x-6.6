@@ -966,7 +966,9 @@ int read_mib(struct mtk_hnat *h, u32 ppe_id,
 	int ret;
 	u32 val, cnt_r0, cnt_r1, cnt_r2, cnt_r3;
 
-	if (ppe_id >= CFG_PPE_NUM)
+	if (!h || !h->data || !bytes || !packets ||
+	    ppe_id >= MAX_PPE_NUM || ppe_id >= h->ppe_num ||
+	    index >= h->foe_etry_num || !h->ppe_base[ppe_id])
 		return -EINVAL;
 
 	writel(index | (1 << 16), h->ppe_base[ppe_id] + PPE_MIB_SER_CR);
@@ -974,14 +976,14 @@ int read_mib(struct mtk_hnat *h, u32 ppe_id,
 					!(val & BIT_MIB_BUSY), 20, 10000);
 
 	if (ret < 0) {
-		pr_notice("mib busy, please check later\n");
+		pr_notice_ratelimited("mib busy, please check later\n");
 		return ret;
 	}
 	cnt_r0 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R0);
 	cnt_r1 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R1);
 	cnt_r2 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R2);
 
-	if (hnat_priv->data->version == MTK_HNAT_V3) {
+	if (h->data->version == MTK_HNAT_V3) {
 		cnt_r3 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R3);
 		*bytes = cnt_r0 + ((u64)cnt_r1 << 32);
 		*packets = cnt_r2 + ((u64)cnt_r3 << 32);

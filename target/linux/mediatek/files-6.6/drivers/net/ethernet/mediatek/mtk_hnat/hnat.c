@@ -456,8 +456,6 @@ static int hnat_hw_init(u32 ppe_id)
 
 	dev_info(hnat_priv->dev, "PPE%d hwnat start\n", ppe_id);
 
-	spin_lock_init(&hnat_priv->cah_lock);
-	spin_lock_init(&hnat_priv->entry_lock);
 	return 0;
 }
 
@@ -771,6 +769,9 @@ static int hnat_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	hnat_priv->foe_etry_num = DEF_ETRY_NUM;
+	/* Warm initialization must not reinitialize locks held by live hooks. */
+	spin_lock_init(&hnat_priv->cah_lock);
+	spin_lock_init(&hnat_priv->entry_lock);
 	atomic64_set(&hnat_priv->invalid_foe, 0);
 	atomic64_set(&hnat_priv->invalid_ppe, 0);
 	atomic64_set(&hnat_priv->software_fallback, 0);
