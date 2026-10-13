@@ -444,11 +444,6 @@ endif
 endif
 
 ifeq ($(CONFIG_MTK_HWIFI_MT7990),y)
-ifneq ($(CONFIG_MTK_HWIFI_FW_PATH_BE19000),)
-	$(INSTALL_BIN) ./files/$$(CONFIG_MTK_HWIFI_FW_PATH_BE19000)/* $(1)/lib/firmware/
-else ifneq ($(CONFIG_MTK_HWIFI_FW_PATH_BE14000),)
-	$(INSTALL_BIN) ./files/$$(CONFIG_MTK_HWIFI_FW_PATH_BE14000)/* $(1)/lib/firmware/
-endif
 ifeq ($(CONFIG_MTK_WIFI7_CCN34_SPLIT_MAC_SUPPORT),y)
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/mt7990/rebb/ccn34/WIFI_MT7990_WACPU_RAM_CODE_1_1.bin $(1)/lib/firmware/WIFI_MT7990_WACPU_RAM_CODE_1_1.bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/mt7990/rebb/ccn34/WIFI_RAM_CODE_MT7990_1_1.bin $(1)/lib/firmware/WIFI_RAM_CODE_MT7990_1_1.bin
@@ -487,6 +482,11 @@ else
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/mt7990/rebb/WIFI_RAM_CODE_MT7990_1_1_TESTMODE.bin $(1)/lib/firmware/WIFI_RAM_CODE_MT7990_1_1_TESTMODE.bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/mt7990/rebb/WIFI_MT7990_PHY_RAM_CODE_1_1.bin $(1)/lib/firmware/WIFI_MT7990_PHY_RAM_CODE_1_1.bin
 endif
+endif
+ifneq ($(CONFIG_MTK_HWIFI_FW_PATH_BE19000),)
+	$(INSTALL_BIN) ./files/$$(CONFIG_MTK_HWIFI_FW_PATH_BE19000)/* $(1)/lib/firmware/
+else ifneq ($(CONFIG_MTK_HWIFI_FW_PATH_BE14000),)
+	$(INSTALL_BIN) ./files/$$(CONFIG_MTK_HWIFI_FW_PATH_BE14000)/* $(1)/lib/firmware/
 endif
 endif
 
