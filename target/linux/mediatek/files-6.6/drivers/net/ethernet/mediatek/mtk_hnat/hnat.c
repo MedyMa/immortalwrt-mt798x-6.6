@@ -819,6 +819,11 @@ static int __hnat_disable_hook(void)
 			     SMA, SMA_ONLY_FWD_CPU);
 
 		for (hash_index = 0; hash_index < hnat_priv->foe_etry_num; hash_index++) {
+			if (hnat_account_enabled(hnat_priv)) {
+				/* Paused readers still inspect descriptors under the PPE lock. */
+				hnat_account_stop_entry(hnat_priv, i, hash_index);
+				continue;
+			}
 			entry = hnat_priv->foe_table_cpu[i] + hash_index;
 			if (entry->bfib1.state == BIND) {
 				entry->ipv4_hnapt.udib1.state = INVALID;

@@ -17,6 +17,7 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			 struct sk_buff *skb, const struct foe_entry *entry,
 			 bool prefill, bool confirm, u64 expected_generation);
 void hnat_account_invalidate(struct mtk_hnat *h, u32 ppe, u32 slot);
+bool hnat_account_stop_entry(struct mtk_hnat *h, u32 ppe, u32 slot);
 bool hnat_account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase);
 /* True includes a stale token already handled without descriptor mutation. */
 bool hnat_account_clear_if_generation(struct mtk_hnat *h, u32 ppe, u32 slot,

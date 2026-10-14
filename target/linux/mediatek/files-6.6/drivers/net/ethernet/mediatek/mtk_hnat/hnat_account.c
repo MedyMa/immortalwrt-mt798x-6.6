@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Owner-scoped read-clear accounting with a bounded MIB poller. */
 #include <linux/module.h>
+#include <linux/atomic.h>
 #include <linux/slab.h>
 #include <linux/rcupdate.h>
 #include <linux/mutex.h>
@@ -86,6 +87,7 @@ struct hnat_account_ctx {
 	u32 ppe_num; /* allocation bounds, immutable until cleanup */
 	u32 slot_count;
 	struct hnat_account_ppe ppe[MAX_PPE_NUM];
+	atomic64_t poll_lock_skips[MAX_PPE_NUM];
 	struct delayed_work gc;
 	struct delayed_work poll;
 	u32 poll_ppe, poll_slot;
@@ -479,7 +481,7 @@ void hnat_account_invalidate(struct mtk_hnat *h, u32 ppe, u32 slot)
 }
 
 static bool account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase,
-			  bool conditional, u64 generation)
+			  bool conditional, u64 generation, bool stopping)
 {
 	struct hnat_account_ppe *p;
 	if (!account_valid(h, ppe, slot))
@@ -488,6 +490,10 @@ static bool account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase,
 	spin_lock_bh(&p->lock);
 	/* A stale request is handled: never fall back to an unguarded clear. */
 	if (conditional && p->slots[slot].generation != generation) {
+		spin_unlock_bh(&p->lock);
+		return true;
+	}
+	if (stopping && h->foe_table_cpu[ppe][slot].bfib1.state != BIND) {
 		spin_unlock_bh(&p->lock);
 		return true;
 	}
@@ -501,25 +507,34 @@ static bool account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase,
 		entry->bfib1.state = INVALID;
 		if (h->fe_base)
 			entry->bfib1.time_stamp = readl(h->fe_base + 0x0010) & 0xff;
-		if (IS_IPV4_GRP(entry))
-			entry->ipv4_hnapt.act_dp &= ~UDF_PINGPONG_IFIDX;
-		else
-			entry->ipv6_5t_route.act_dp &= ~UDF_PINGPONG_IFIDX;
+		/* Hook stop preserves the pingpong interface field. */
+		if (!stopping) {
+			if (IS_IPV4_GRP(entry))
+				entry->ipv4_hnapt.act_dp &= ~UDF_PINGPONG_IFIDX;
+			else
+				entry->ipv6_5t_route.act_dp &= ~UDF_PINGPONG_IFIDX;
+		}
 	}
 	dma_wmb();
 	spin_unlock_bh(&p->lock);
 	return true;
 }
 
+/* Caller has paused the PPE; only INVALID + timestamp change on hook stop. */
+bool hnat_account_stop_entry(struct mtk_hnat *h, u32 ppe, u32 slot)
+{
+	return account_clear(h, ppe, slot, false, false, 0, true);
+}
+
 bool hnat_account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase)
 {
-	return account_clear(h, ppe, slot, erase, false, 0);
+	return account_clear(h, ppe, slot, erase, false, 0, false);
 }
 
 bool hnat_account_clear_if_generation(struct mtk_hnat *h, u32 ppe, u32 slot,
 				      bool erase, u64 generation)
 {
-	return account_clear(h, ppe, slot, erase, true, generation);
+	return account_clear(h, ppe, slot, erase, true, generation, false);
 }
 
 bool hnat_account_clear_entry(struct mtk_hnat *h, struct foe_entry *entry)
@@ -610,18 +625,25 @@ static void account_gc(struct work_struct *work)
 	for (ppe = 0; ppe < min_t(u32, h->ppe_num,
 		min_t(u32, h->account->ppe_num, min_t(u32, MAX_PPE_NUM, CFG_PPE_NUM))); ppe++) {
 		struct hnat_account_ppe *p = &ctx->ppe[ppe];
-		spin_lock_bh(&p->lock);
-		if (!p->paused) {
-			for (n = 0; n < min_t(u32, 64, min(h->foe_etry_num, ctx->slot_count)); n++) {
-				u32 slot = p->cursor++ % min(h->foe_etry_num, ctx->slot_count);
-				struct hnat_owner *o = p->slots[slot].owner;
-				if (o && !owner_live(h, ppe, slot)) {
-					p->unknown_loss++;
-					retire_locked(p, &p->slots[slot]);
-				}
+		for (n = 0; n < min_t(u32, 64, min(h->foe_etry_num, ctx->slot_count)); n++) {
+			struct hnat_owner *o;
+			u32 slot;
+
+			/* Defer GC on contention; leave its cursor for the next pass. */
+			if (READ_ONCE(ctx->stopping) || !spin_trylock_bh(&p->lock))
+				break;
+			if (p->paused) {
+				spin_unlock_bh(&p->lock);
+				break;
 			}
+			slot = p->cursor++ % min(h->foe_etry_num, ctx->slot_count);
+			o = p->slots[slot].owner;
+			if (o && !owner_live(h, ppe, slot)) {
+				p->unknown_loss++;
+				retire_locked(p, &p->slots[slot]);
+			}
+			spin_unlock_bh(&p->lock);
 		}
-		spin_unlock_bh(&p->lock);
 	}
 	if (!READ_ONCE(ctx->stopping))
 		schedule_delayed_work(&ctx->gc, HZ);
@@ -666,8 +688,17 @@ static void account_poll(struct work_struct *work)
 			continue;
 		p = &ctx->ppe[ppe];
 		s = &p->slots[slot];
-		/* Release BH/lock after each slot; never take admin or entry_lock. */
-		spin_lock_bh(&p->lock);
+		/* Background sampling must not wait for a forwarding-path reader. */
+		if (!spin_trylock_bh(&p->lock)) {
+			atomic64_inc(&ctx->poll_lock_skips[ppe]);
+			continue;
+		}
+		/* Check again after acquisition; never start a late SER transaction. */
+		if (READ_ONCE(ctx->stopping) ||
+		    ktime_get_ns() - started >= HNAT_ACCOUNT_POLL_TIME_NS) {
+			spin_unlock_bh(&p->lock);
+			break;
+		}
 		p->poll_scanned++;
 		if (!p->paused && s->owner && !s->owner->prefill) {
 			if (!owner_live(h, ppe, slot)) {
@@ -751,6 +782,7 @@ int hnat_account_init(struct mtk_hnat *h)
 	for (ppe = 0; ppe < ctx->ppe_num; ppe++) {
 		ctx->ppe[ppe].h = h;
 		spin_lock_init(&ctx->ppe[ppe].lock);
+		atomic64_set(&ctx->poll_lock_skips[ppe], 0);
 		ctx->ppe[ppe].slots = kvcalloc(h->foe_etry_num,
 					     sizeof(struct hnat_slot), GFP_KERNEL);
 		if (!ctx->ppe[ppe].slots) {
@@ -840,8 +872,9 @@ int hnat_account_show(struct seq_file *m, void *unused)
 			   snap.mismatch, snap.retired, snap.no_acct,
 			   snap.discarded_bytes, snap.discarded_packets,
 			   snap.retire_rule_bytes, snap.retire_rule_packets);
-		seq_printf(m, "ppe=%u poll_scanned=%llu poll_reads=%llu poll_errors=%llu ct_written_bytes=%llu ct_written_packets=%llu\n",
+		seq_printf(m, "ppe=%u poll_scanned=%llu poll_reads=%llu poll_errors=%llu poll_lock_skips=%llu ct_written_bytes=%llu ct_written_packets=%llu\n",
 			   ppe, snap.poll_scanned, snap.poll_reads, snap.poll_errors,
+			   (unsigned long long)atomic64_read(&h->account->poll_lock_skips[ppe]),
 			   snap.ct_written_bytes, snap.ct_written_packets);
 	}
 	return 0;
