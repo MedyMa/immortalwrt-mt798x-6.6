@@ -44,6 +44,11 @@ config MTK_HWIFI_MEM_SHRINK
 	depends on PACKAGE_kmod-mt_hwifi
 	default n
 
+config MTK_HWIFI_TDMA_SW_ACK_SUPPORT
+	bool "TDMA SW ACK Support"
+	depends on PACKAGE_kmod-mt_hwifi
+	default n
+
 config MTK_HWIFI_FW_HDR_SUPPORT
 	bool "Built in firmware"
 	depends on PACKAGE_kmod-mt_hwifi
@@ -102,7 +107,7 @@ config MTK_HWIFI_FW_BE7200
 if MTK_HWIFI_FW_BE7200
 choice
 	prompt "BE7200 firmware version"
-	default MTK_HWIFI_FW_BE7200_20260310
+	default MTK_HWIFI_FW_BE7200_20260720
 
 	config MTK_HWIFI_FW_BE7200_20260310
 	bool "BE7200-20260310"
