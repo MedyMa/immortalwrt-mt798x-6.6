@@ -18,6 +18,7 @@
 #include "wdma.h"
 #include <linux/version.h>
 #include <linux/pci.h>
+#include <linux/vmalloc.h>
 
 static void
 wed_rx_bm_dma_cb_exit(struct wed_entry *wed, struct warp_dma_cb *dma_cb)

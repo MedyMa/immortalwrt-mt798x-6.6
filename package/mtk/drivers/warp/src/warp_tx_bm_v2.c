@@ -18,6 +18,7 @@
 #include "wdma.h"
 #include <linux/version.h>
 #include <linux/pci.h>
+#include <linux/vmalloc.h>
 
 void
 dump_pkt_info(struct wed_buf_res *res)

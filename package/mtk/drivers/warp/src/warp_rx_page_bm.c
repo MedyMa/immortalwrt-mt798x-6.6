@@ -19,6 +19,7 @@
 #include "warp_utility.h"
 #include <linux/version.h>
 #include <linux/pci.h>
+#include <linux/vmalloc.h>
 
 static u32
 wed_msdu_page_hash(dma_addr_t pa)
