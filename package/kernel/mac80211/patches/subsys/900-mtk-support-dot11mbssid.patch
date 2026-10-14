@@ -1,0 +1,54 @@
+# --- LOCAL REBASE NOTE (phase 5b) ---------------------------------------
+# This file is a locally regenerated (exact-context) version of the upstream
+# benboguan/immortalwrt-mt798x-6.6@mt799x-6.6-mtwifi patch of the same name.
+# The +/- payload is BYTE-IDENTICAL to the upstream patch; only the hunk
+# context and offsets were regenerated against backports-6.12.61, in the
+# order enforced by package/kernel/mac80211/Makefile Build/Patch.
+# Reason: upstream's version required GNU patch fuzz (1 or 2 lines), i.e. it
+# did not apply at fuzz 0. See Test/driver-8312-sync/phase-5b.md section 4.
+# -----------------------------------------------------------------------
+--- a/include/uapi/linux/nl80211.h
++++ b/include/uapi/linux/nl80211.h
+@@ -3422,6 +3422,7 @@
+ 	NL80211_ATTR_VIF_RADIO_MASK,
+ 
+ 	/* add attributes here, update the policy in nl80211.c */
++	NL80211_ATTR_DOT11VMBSSID = NL80211_ATTR_MBSSID_ELEMS + 120,
+ 
+ 	__NL80211_ATTR_AFTER_LAST,
+ 	NUM_NL80211_ATTR = __NL80211_ATTR_AFTER_LAST,
+@@ -8031,6 +8032,7 @@
+ enum nl80211_ap_settings_flags {
+ 	NL80211_AP_SETTINGS_EXTERNAL_AUTH_SUPPORT	= 1 << 0,
+ 	NL80211_AP_SETTINGS_SA_QUERY_OFFLOAD_SUPPORT	= 1 << 1,
++	NL80211_AP_SETTINGS_DOT11VMBSSID_SUPPORT	= 1 << 16,
+ };
+ 
+ /**
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -809,6 +809,7 @@
+ 	[NL80211_ATTR_MBSSID_ELEMS] = { .type = NLA_NESTED },
+ 	[NL80211_ATTR_RADAR_BACKGROUND] = { .type = NLA_FLAG },
+ 	[NL80211_ATTR_AP_SETTINGS_FLAGS] = { .type = NLA_U32 },
++	[NL80211_ATTR_DOT11VMBSSID] = { .type = NLA_U8 },
+ 	[NL80211_ATTR_EHT_CAPABILITY] =
+ 		NLA_POLICY_RANGE(NLA_BINARY,
+ 				 NL80211_EHT_MIN_CAPABILITY_LEN,
+@@ -6384,6 +6385,16 @@
+ 	else if (info->attrs[NL80211_ATTR_EXTERNAL_AUTH_SUPPORT])
+ 		params->flags |= NL80211_AP_SETTINGS_EXTERNAL_AUTH_SUPPORT;
+ 
++	if (info->attrs[NL80211_ATTR_DOT11VMBSSID]) {
++		if (nla_get_u8(info->attrs[NL80211_ATTR_DOT11VMBSSID]) != 0) {
++			params->flags |= NL80211_AP_SETTINGS_DOT11VMBSSID_SUPPORT;
++		} else {
++			params->flags &= ~NL80211_AP_SETTINGS_DOT11VMBSSID_SUPPORT;
++		}
++	} else {
++		params->flags &= ~NL80211_AP_SETTINGS_DOT11VMBSSID_SUPPORT;
++	}
++
+ 	if (wdev->conn_owner_nlportid &&
+ 	    info->attrs[NL80211_ATTR_SOCKET_OWNER] &&
+ 	    wdev->conn_owner_nlportid != info->snd_portid) {
