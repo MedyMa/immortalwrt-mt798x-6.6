@@ -1,12 +1,3 @@
-# --- LOCAL REBASE NOTE (phase 5b) ---------------------------------------
-# This file is a locally regenerated (exact-context) version of the upstream
-# benboguan/immortalwrt-mt798x-6.6@mt799x-6.6-mtwifi patch of the same name.
-# The +/- payload is BYTE-IDENTICAL to the upstream patch; only the hunk
-# context and offsets were regenerated against backports-6.12.61, in the
-# order enforced by package/kernel/mac80211/Makefile Build/Patch.
-# Reason: upstream's version required GNU patch fuzz (1 or 2 lines), i.e. it
-# did not apply at fuzz 0. See Test/driver-8312-sync/phase-5b.md section 4.
-# -----------------------------------------------------------------------
 --- a/include/uapi/linux/nl80211.h
 +++ b/include/uapi/linux/nl80211.h
 @@ -3422,6 +3422,7 @@

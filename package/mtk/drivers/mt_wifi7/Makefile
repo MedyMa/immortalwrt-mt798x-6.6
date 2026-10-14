@@ -14,19 +14,8 @@ PKG_SOURCE_URL:=
 PKG_BIN_SOURCE:=mt799x_20250613-415824-bin.tar.xz
 PKG_BIN_SOURCE_URL:=
 
-# --- LOCAL ADDITION, NOT present in upstream benboguan@mt799x-6.6-mtwifi ---
-# Upstream distributes these tarballs through the repository's own dl/ git tree and
-# therefore declares no hashes at all. The two values below are the sha256 of the
-# tarballs, which were proven byte-identical to the upstream git blobs (git blob sha1
-# a37ec5750cbc682e68deed43e3e515a1113cb00c / e4965b1f85d139755364255ee77ab073df573123).
-# PKG_HASH is enforced by include/download.mk (check_download_integrity).
-# PKG_BIN_HASH is INERT: neither the build system nor this Makefile consumes it
-# (PKG_BIN_SOURCE is only used by the manual $(TAR) call in Build/Prepare below);
-# it is kept for symmetry only. Delete this whole block to restore the verbatim
-# upstream form. See Test/driver-8312-sync/phase-0-2.md section 4.2.
 PKG_HASH:=1019dcf2c9f6c4f8408d4c20c77b3e02c818bd5a85b3423e0e6d0454ae364fb5
 PKG_BIN_HASH:=d4ef78c6f66c00a64b44c13bf69764d64b1a23469721d621e890c8872254ffed
-# --- end local addition ---
 
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
 
