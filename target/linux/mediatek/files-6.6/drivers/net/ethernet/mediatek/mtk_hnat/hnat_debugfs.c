@@ -32,8 +32,16 @@ int qos_toggle;
 int qos_dl_toggle = 1;
 int qos_ul_toggle = 1;
 int xlat_toggle;
+/* Optional software inspection before binding a flow. Disabled by default. */
+int dpi_using;
+u64 dpi_limit_bytes = 1500 * 30;
 struct hnat_desc headroom[DEF_ETRY_NUM];
 unsigned int dbg_cpu_reason_cnt[MAX_CRSN_NUM];
+/* Updated as a complete list; packet readers never see a partial write. */
+#define HNAT_MAX_SKIP_VIDS 17
+static int skip_vids[HNAT_MAX_SKIP_VIDS];
+static int skip_vid_count;
+static DEFINE_SPINLOCK(skip_vid_lock);
 
 static const char * const entry_state[] = { "INVALID", "UNBIND", "BIND", "FIN" };
 
@@ -2506,6 +2514,85 @@ static const struct file_operations hnat_xlat_cfg_fops = {
 	.release = single_release,
 };
 
+//// DPI + HWNAT workaround
+static int hnat_dpi_using_read(struct seq_file *m, void *private)
+{
+	seq_printf(m, "%d\n", !!READ_ONCE(dpi_using));
+
+	return 0;
+}
+
+static int hnat_dpi_using_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hnat_dpi_using_read, file->private_data);
+}
+
+static ssize_t hnat_dpi_using_write(struct file *file, const char __user *buffer,
+				      size_t count, loff_t *data)
+{
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool_from_user(buffer, count, &enabled);
+	if (ret)
+		return ret;
+	WRITE_ONCE(dpi_using, enabled);
+	return count;
+}
+
+static const struct file_operations hnat_dpi_using_fops = {
+	.open = hnat_dpi_using_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.write = hnat_dpi_using_write,
+	.release = single_release,
+};
+//// end of DPI+HWNAT workaround
+
+//// DPI + HWNAT workaround limit bytes
+static int hnat_dpi_limit_read(struct seq_file *m, void *private)
+{
+	seq_printf(m, "%llu\n", (unsigned long long)READ_ONCE(dpi_limit_bytes));
+	return 0;
+}
+
+static int hnat_dpi_limit_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hnat_dpi_limit_read, file->private_data);
+}
+
+static ssize_t hnat_dpi_limit_write(struct file *file, const char __user *buffer,
+				      size_t count, loff_t *data)
+{
+	char buf[32] = {0};
+	int ret;
+	unsigned long long val;
+
+	if (count >= sizeof(buf)-1)
+		return -EINVAL;
+	if (copy_from_user(buf, buffer, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	ret = kstrtoull(strim(buf), 10, &val);
+	if (ret)
+		return -EINVAL;
+	/* 4 KiB ~ 100 MiB */
+	if (val < 4096 || val > 100*1024*1024)
+		return -EINVAL;
+	WRITE_ONCE(dpi_limit_bytes, val);
+	pr_info("hnat: dpi_limit_bytes set to %llu bytes\n", val);
+	return count;
+}
+
+static const struct file_operations hnat_dpi_limit_fops = {
+	.open = hnat_dpi_limit_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.write = hnat_dpi_limit_write,
+	.release = single_release,
+};
+//// end of DPI limit bytes
+
 static void hnat_qos_toggle_usage(void)
 {
 	pr_info("\nHQoS toggle Command Usage:\n");
@@ -3007,6 +3094,100 @@ static const struct file_operations hnat_static_fops = {
 	.release = single_release,
 };
 
+bool hnat_skip_vid(u16 vid)
+{
+	bool skip = false;
+	int i;
+
+	if (!vid || !READ_ONCE(skip_vid_count))
+		return false;
+	spin_lock_bh(&skip_vid_lock);
+	for (i = 0; i < skip_vid_count; i++) {
+		if (vid == skip_vids[i]) {
+			skip = true;
+			break;
+		}
+	}
+	spin_unlock_bh(&skip_vid_lock);
+	return skip;
+}
+
+static int hnat_skip_vid_read(struct seq_file *m, void *private)
+{
+	int vids[HNAT_MAX_SKIP_VIDS];
+	int i, count;
+
+	spin_lock_bh(&skip_vid_lock);
+	count = skip_vid_count;
+	memcpy(vids, skip_vids, sizeof(vids));
+	spin_unlock_bh(&skip_vid_lock);
+	for (i = 0; i < count; i++)
+		seq_printf(m, "%s%d", i ? ">" : "", vids[i]);
+	seq_putc(m, '\n');
+	return 0;
+}
+
+static int hnat_skip_vid_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hnat_skip_vid_read, file->private_data);
+}
+
+/* Parse into temporary storage. Invalid input preserves the active policy. */
+static int parse_vids(char *ids, int *vids)
+{
+	char *ptr = strim(ids), *token;
+	unsigned int vid;
+	int count = 0, i, ret;
+
+	if (!*ptr)
+		return 0;
+	while ((token = strsep(&ptr, ">"))) {
+		if (count == HNAT_MAX_SKIP_VIDS)
+			return -E2BIG;
+		ret = kstrtouint(strim(token), 0, &vid);
+		if (ret)
+			return ret;
+		if (!vid || vid >= VLAN_VID_MASK)
+			return -EINVAL;
+		for (i = 0; i < count; i++) {
+			if (vids[i] == vid)
+				return -EEXIST;
+		}
+		vids[count++] = vid;
+	}
+	return count;
+}
+
+static ssize_t hnat_skip_vid_write(struct file *file, const char __user *buffer,
+				   size_t count, loff_t *data)
+{
+	int vids[HNAT_MAX_SKIP_VIDS] = {0};
+	char tmp[128];
+	int n;
+
+	if (count >= sizeof(tmp))
+		return -E2BIG;
+	if (copy_from_user(tmp, buffer, count))
+		return -EFAULT;
+	tmp[count] = '\0';
+	n = parse_vids(tmp, vids);
+	if (n < 0)
+		return n;
+	spin_lock_bh(&skip_vid_lock);
+	memcpy(skip_vids, vids, sizeof(skip_vids));
+	WRITE_ONCE(skip_vid_count, n);
+	spin_unlock_bh(&skip_vid_lock);
+	return count;
+}
+
+static const struct file_operations hnat_skip_vid_fops = {
+	.open = hnat_skip_vid_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.write = hnat_skip_vid_write,
+	.release = single_release,
+};
+
 int get_ppe_mib(u32 ppe_id, int index, u64 *pkt_cnt, u64 *byte_cnt)
 {
 	struct mtk_hnat *h = hnat_priv;
@@ -3162,6 +3343,10 @@ int hnat_init_debugfs(struct mtk_hnat *h)
 			    &hnat_mcast_fops);
 	debugfs_create_file("hook_toggle", 0444, root, h,
 			    &hnat_hook_toggle_fops);
+	debugfs_create_file("dpi_using", 0600, root, h,
+			    &hnat_dpi_using_fops);
+	debugfs_create_file("dpi_limit_bytes", 0600, root, h,
+			    &hnat_dpi_limit_fops);
 	debugfs_create_file("mape_toggle", 0444, root, h,
 			    &hnat_mape_toggle_fops);
 	debugfs_create_file("qos_toggle", 0444, root, h,
@@ -3176,6 +3361,8 @@ int hnat_init_debugfs(struct mtk_hnat *h)
 			    &hnat_xlat_toggle_fops);
 	debugfs_create_file("xlat_cfg", 0444, root, h,
 			    &hnat_xlat_cfg_fops);
+	debugfs_create_file("skip_vid", 0600, root, h,
+			    &hnat_skip_vid_fops);
 
 	for (i = 0; i < hnat_priv->data->num_of_sch; i++) {
 		ret = snprintf(name, sizeof(name), "qdma_sch%ld", i);

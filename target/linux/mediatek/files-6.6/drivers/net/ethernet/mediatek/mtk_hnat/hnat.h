@@ -1318,6 +1318,9 @@ extern int qos_ul_toggle;
 extern int hook_toggle;
 extern int mape_toggle;
 extern int qos_toggle;
+extern int dpi_using;
+extern u64 dpi_limit_bytes;
+bool hnat_skip_vid(u16 vid);
 
 int ext_if_add(struct extdev_entry *ext_entry);
 int ext_if_del(struct extdev_entry *ext_entry);

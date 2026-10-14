@@ -3082,6 +3082,28 @@ static unsigned int mtk_hnat_nf_post_routing(
 		if (fn && fn(skb, arp_dev, &hw_path))
 			break;
 
+		if (hnat_skip_vid(hw_path.vlan_id) ||
+		    hnat_skip_vid(skb->vlan_tci & VLAN_VID_MASK))
+			break;
+
+		/* Keep early packets in software only when inspection is enabled. */
+		if (READ_ONCE(dpi_using)) {
+			const struct nf_conn_acct *acct;
+			const struct nf_conn *ct;
+			enum ip_conntrack_info ctinfo;
+			u64 limit = READ_ONCE(dpi_limit_bytes);
+
+			ct = nf_ct_get(skb, &ctinfo);
+			if (!ct)
+				break;
+			acct = nf_conn_acct_find(ct);
+			if (!acct)
+				break;
+			if (atomic64_read(&acct->counter[IP_CT_DIR_ORIGINAL].bytes) < limit &&
+			    atomic64_read(&acct->counter[IP_CT_DIR_REPLY].bytes) < limit)
+				break;
+		}
+
 		spin_lock(&hnat_priv->entry_lock);
 		skb_to_hnat_info(skb, out, entry, &hw_path);
 		spin_unlock(&hnat_priv->entry_lock);
