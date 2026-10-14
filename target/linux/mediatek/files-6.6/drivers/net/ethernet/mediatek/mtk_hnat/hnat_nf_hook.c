@@ -401,7 +401,8 @@ int nf_hnat_netdevice_event(struct notifier_block *unused, unsigned long event,
 	case NETDEV_UP:
 		ppd_dev_setting();		
 		if (!hnat_priv->guest_en) {
-			if (!strcmp(dev->name, "ra1") || !strcmp(dev->name, "rax1"))
+			if (!strcmp(dev->name, "ra1") || !strcmp(dev->name, "rai1") || !strcmp(dev->name, "rax1") ||
+				!strcmp(dev->name, "phy0-ap1") || !strcmp(dev->name, "phy1-ap1") || !strcmp(dev->name, "phy2-ap1"))
 				break;
 		}
 		
@@ -2582,7 +2583,8 @@ void mtk_ppe_dev_register_hook(struct net_device *dev)
 
 
 	if (!hnat_priv->guest_en ) {
-		if (!strcmp(dev->name, "ra1") || !strcmp(dev->name, "rax1"))
+		if (!strcmp(dev->name, "ra1") || !strcmp(dev->name, "rai1") || !strcmp(dev->name, "rax1") ||
+			!strcmp(dev->name, "phy0-ap1") || !strcmp(dev->name, "phy1-ap1") || !strcmp(dev->name, "phy2-ap1"))
 			return;
 	}
 	for (i = 1; i < MAX_IF_NUM; i++) {
@@ -2623,7 +2625,7 @@ add_wifi_hook_if:
 			break;
 		}
 	}
-	pr_info("%s : ineterface %s register (%d)\n", __func__, dev->name, i);
+	pr_info("%s : interface %s register (%d)\n", __func__, dev->name, i);
 }
 
 void mtk_ppe_dev_unregister_hook(struct net_device *dev)
@@ -2640,7 +2642,7 @@ void mtk_ppe_dev_unregister_hook(struct net_device *dev)
 	}
 
 	extif_put_dev(dev);
-	pr_info("%s : ineterface %s set null (%d)\n", __func__, dev->name, i);
+	pr_info("%s : interface %s set null (%d)\n", __func__, dev->name, i);
 }
 
 static unsigned int mtk_hnat_accel_type(struct sk_buff *skb)
