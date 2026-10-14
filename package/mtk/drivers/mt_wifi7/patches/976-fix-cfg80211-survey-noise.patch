@@ -1,0 +1,25 @@
+diff --git a/mt_wifi/os/linux/cfg80211/cfg80211.c b/mt_wifi/os/linux/cfg80211/cfg80211.c
+index 24ff562..445dd15 100644
+--- a/mt_wifi/os/linux/cfg80211/cfg80211.c
++++ b/mt_wifi/os/linux/cfg80211/cfg80211.c
+@@ -1355,9 +1355,9 @@ static int CFG80211_OpsSurveyGet(
+ 	survey->filled |= SURVEY_INFO_TIME_BUSY;
+ 	survey->filled |= SURVEY_INFO_NOISE_DBM;
+ #if defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(6, 1, 0) <= CFG_CFG80211_VERSION)
+-	survey->filled |= SURVEY_INFO_TIME_BSS_RX;
++	survey->filled |= SURVEY_INFO_TIME_BSS_RX | SURVEY_INFO_TIME;
+ #endif
+-	survey->filled |=  SURVEY_INFO_TIME_TX | SURVEY_INFO_TIME_RX | SURVEY_INFO_TIME;
++	survey->filled |= SURVEY_INFO_TIME_TX | SURVEY_INFO_TIME_RX;
+ 
+ 	survey->channel = chan;
+ 	survey->time_busy = div_u64(pAd->ScanCtrl.busytime[idx], 1000);
+@@ -1366,7 +1366,7 @@ static int CFG80211_OpsSurveyGet(
+ 	survey->time_bss_rx = div_u64(pAd->ScanCtrl.bss_rx_time[idx], 1000);
+ #endif
+ 	survey->time_tx = div_u64(pAd->ScanCtrl.tx_time[idx], 1000);
+-	survey->noise = pAd->ScanCtrl.ch_AvgNF[idx];
++	survey->noise = (s8)pAd->ScanCtrl.ch_AvgNF[idx];
+ #if defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(6, 1, 0) <= CFG_CFG80211_VERSION)
+ 	survey->time = div_u64(pAd->ScanCtrl.active_time[idx], 1000);
+ #endif
