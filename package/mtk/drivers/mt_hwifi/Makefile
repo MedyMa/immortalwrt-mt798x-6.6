@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mt_hwifi
-WIFI_DRIVER_NAME:=mt_wifi7
+WIFI_DRIVER_NAME:=mt_hwifi
 P4REV:=
 PKG_VERSION:=8.3.1.2
 #PATCH_DIR:=patches
