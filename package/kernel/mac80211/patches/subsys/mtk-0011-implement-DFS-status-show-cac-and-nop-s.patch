@@ -10,14 +10,15 @@ Refactor DFS debugfs command for MLO
 
 Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 ---
- include/net/cfg80211.h  |   1 +
- net/mac80211/cfg.c      |  25 +++
- net/wireless/core.h     |   3 +
- net/wireless/debugfs.c  | 326 +++++++++++++++++++++++++++++++++++++++-
- net/wireless/mlme.c     |   6 +
- net/wireless/rdev-ops.h |  14 ++
- net/wireless/trace.h    |  13 ++
- 7 files changed, 381 insertions(+), 7 deletions(-)
+ include/net/cfg80211.h   |    1 +
+ net/mac80211/cfg.c       |   25 +++++++++++++++++++++++++
+ net/wireless/core.h      |    3 +++
+ net/wireless/debugfs.c   |  348 ++++++++++++++++++++++++++++++++++++++++
+ net/wireless/mlme.c      |    8 +++++++-
+ net/wireless/rdev-ops.h  |   14 ++++++++++++++
+ net/wireless/trace.h     |   13 +++++++++++++
+ 7 files changed, 404 insertions, 8 deletions
+
 
 --- a/include/net/cfg80211.h
 +++ b/include/net/cfg80211.h
@@ -90,7 +91,7 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
  
  #define DEBUGFS_READONLY_FILE(name, buflen, fmt, value...)		\
  static ssize_t name## _read(struct file *file, char __user *userbuf,	\
-@@ -97,18 +98,329 @@ static const struct file_operations ht40
+@@ -97,18 +98,351 @@
  	.llseek = default_llseek,
  };
  
@@ -145,8 +146,9 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
 +	struct cfg80211_chan_def *chandef;
 +	struct cfg80211_chan_def *background_chandef = &rdev->background_radar_chandef;
++	struct cfg80211_chan_def sta_chandef;
 +	enum nl80211_band band;
-+	struct ieee80211_supported_band *sband;
++	struct ieee80211_supported_band *sband = NULL;
 +	struct ieee80211_channel *chan;
 +	unsigned long jiffies_passed;
 +	unsigned int link_id;
@@ -165,8 +167,13 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +
 +	for_each_valid_link(wdev, link_id) {
 +		chandef = wdev_chandef(wdev, link_id);
-+		if (!chandef || !chandef->chan ||
-+		    chandef->chan->band != NL80211_BAND_5GHZ)
++		if (!chandef) {
++			if (!wdev_sta_chandef(wdev, link_id, &sta_chandef))
++				continue;
++			chandef = &sta_chandef;
++		}
++
++		if (!chandef->chan || chandef->chan->band != NL80211_BAND_5GHZ)
 +			continue;
 +
 +		offset += scnprintf(buf + offset, buf_size - offset,
@@ -248,6 +255,8 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +	if (!buf)
 +		return -ENOMEM;
 +
++	wiphy_lock(wiphy);
++
 +	list_for_each_entry(wdev, &wiphy->wdev_list, list) {
 +		offset += scnprintf(buf + offset, buf_size - offset,
 +				    "wdev 0x%x\n"
@@ -255,6 +264,8 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +				    wdev->identifier, iftype_str[wdev->iftype]);
 +		offset = dfs_status_read_wdev(wiphy, wdev, buf, buf_size, offset);
 +	}
++
++	wiphy_unlock(wiphy);
 +
 +	r = simple_read_from_buffer(user_buf, count, ppos, buf, offset);
 +
@@ -284,6 +295,8 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +	if (!en)
 +		return 0;
 +
++	wiphy_lock(wiphy);
++
 +	for (band = 0; band < NUM_NL80211_BANDS; band++) {
 +		sband = wiphy->bands[band];
 +		if (!sband)
@@ -303,6 +316,8 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +	}
 +
 +	cfg80211_sched_dfs_chan_update(rdev);
++
++	wiphy_unlock(wiphy);
 +
 +	return 0;
 +}
@@ -324,6 +339,8 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +
 +	if (!skip_mode || skip_mode > (CAC_SKIP_MASK | CAC_SKIP_BACKGROUND_MASK))
 +		return 0;
++
++	wiphy_lock(wiphy);
 +
 +	list_for_each_entry(wdev, &wiphy->wdev_list, list) {
 +		if (skip_mode & CAC_SKIP_MASK) {
@@ -358,6 +375,8 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +		}
 +	}
 +
++	wiphy_unlock(wiphy);
++
 +	return 0;
 +}
 +
@@ -378,6 +397,8 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +	if (!en)
 +		return 0;
 +
++	wiphy_lock(wiphy);
++
 +	for (band = 0; band < NUM_NL80211_BANDS; band++) {
 +		sband = wiphy->bands[band];
 +		if (!sband)
@@ -396,6 +417,8 @@ Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 +	}
 +
 +	cfg80211_sched_dfs_chan_update(rdev);
++
++	wiphy_unlock(wiphy);
 +
 +	return 0;
 +}
