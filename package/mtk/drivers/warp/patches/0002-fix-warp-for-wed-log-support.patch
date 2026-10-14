@@ -1,6 +1,6 @@
 --- a/wed.c
 +++ b/wed.c
-@@ -1305,12 +1305,19 @@ wed_get_entry_num(void)
+@@ -1317,12 +1317,19 @@ wed_get_entry_num(void)
  	u32 num = 0;
  
  	node = of_find_compatible_node(NULL, NULL, WED_DEV_NODE);
@@ -20,7 +20,7 @@
  	return num;
  }
  
-@@ -1324,16 +1331,28 @@ wed_get_slot_map(unsigned int idx)
+@@ -1336,16 +1343,28 @@ wed_get_slot_map(unsigned int idx)
  	u32 num = 0;
  
  	node = of_find_compatible_node(NULL, NULL, TO_NODE(idx));

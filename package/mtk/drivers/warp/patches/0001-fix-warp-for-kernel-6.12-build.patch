@@ -1,6 +1,6 @@
 --- a/warp_tx_bm_v2.c
 +++ b/warp_tx_bm_v2.c
-@@ -7,6 +7,7 @@
+@@ -18,6 +18,7 @@
  #include "wdma.h"
  #include <linux/version.h>
  #include <linux/pci.h>
@@ -10,7 +10,7 @@
  dump_pkt_info(struct wed_buf_res *res)
 --- a/warp_rx_bm.c
 +++ b/warp_rx_bm.c
-@@ -7,6 +7,7 @@
+@@ -18,6 +18,7 @@
  #include "wdma.h"
  #include <linux/version.h>
  #include <linux/pci.h>
@@ -20,7 +20,7 @@
  wed_rx_bm_dma_cb_exit(struct wed_entry *wed, struct warp_dma_cb *dma_cb)
 --- a/warp_rx_page_bm.c
 +++ b/warp_rx_page_bm.c
-@@ -8,6 +8,7 @@
+@@ -19,6 +19,7 @@
  #include "warp_utility.h"
  #include <linux/version.h>
  #include <linux/pci.h>
