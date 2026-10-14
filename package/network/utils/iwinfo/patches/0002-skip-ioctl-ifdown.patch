@@ -2,9 +2,9 @@ diff --git a/iwinfo_mtk.c b/iwinfo_mtk.c
 index bbc7f004c3..bf2d6ea46d 100644
 --- a/iwinfo_mtk.c
 +++ b/iwinfo_mtk.c
-@@ -5,9 +5,13 @@
- 
- #include "iwinfo_mtk_ccode.c"
+@@ -10,9 +10,13 @@
+ static int mtk_get_assoclist(const char *dev, char *buf, int *len);
+ static int mtk_get_assoc_bitrate(const char *dev, int *buf);
  
 +static int mtk_is_ifup(const char *ifname);
  static inline int mtk_ioctl(const char *ifname, int cmd, struct iwreq *wrq)
