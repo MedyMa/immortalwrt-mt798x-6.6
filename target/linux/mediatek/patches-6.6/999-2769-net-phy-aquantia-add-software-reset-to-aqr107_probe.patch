@@ -48,12 +48,14 @@ Subject: [PATCH] net: phy: aquantia: add software reset to aqr107_probe
  static int aqr107_probe(struct phy_device *phydev)
  {
  	int ret;
-@@ -815,6 +840,8 @@ static int aqr107_probe(struct phy_devic
+@@ -815,8 +840,10 @@ static int aqr107_probe(struct phy_devic
  	if (ret)
  		return ret;
  
 +	aqr107_phy_reset(phydev);
 +
- 	aqr_mib_probe(phydev);
+ 	ret = aqr_mib_probe(phydev);
+ 	if (ret)
+ 		return ret;
  
  	return aqr_hwmon_probe(phydev);
