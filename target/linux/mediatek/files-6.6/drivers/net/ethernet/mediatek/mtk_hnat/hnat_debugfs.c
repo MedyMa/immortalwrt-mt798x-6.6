@@ -682,7 +682,7 @@ int wrapped_ppe2_entry_delete(int index)
 	return 0;
 }
 
-int entry_delete(u32 ppe_id, int index)
+static int __entry_delete(u32 ppe_id, int index)
 {
 	struct foe_entry *entry;
 	struct mtk_hnat *h = hnat_priv;
@@ -696,12 +696,20 @@ int entry_delete(u32 ppe_id, int index)
 	}
 
 	if (index == -1) {
-		memset(h->foe_table_cpu[ppe_id], 0, h->foe_etry_num * sizeof(struct foe_entry));
+		hnat_account_pause(h, ppe_id);
+		if (!hnat_account_reset_table(h, ppe_id))
+			memset(h->foe_table_cpu[ppe_id], 0, h->foe_etry_num * sizeof(struct foe_entry));
+		/* Bulk reset and enable/disable share the admin mutex, so this is the
+		 * pre-reset active state. A disabled PPE must remain paused.
+		 */
+		if (hook_toggle)
+			hnat_account_resume(h, ppe_id);
 		pr_info("clear all foe entry\n");
 	} else {
 
 		entry = h->foe_table_cpu[ppe_id] + index;
-		memset(entry, 0, sizeof(struct foe_entry));
+		if (!hnat_account_clear(h, ppe_id, index, true))
+			memset(entry, 0, sizeof(struct foe_entry));
 		pr_info("delete ppe id = %d, entry idx = %d\n", ppe_id, index);
 	}
 
@@ -710,6 +718,18 @@ int entry_delete(u32 ppe_id, int index)
 
 	return 0;
 }
+
+int entry_delete(u32 ppe_id, int index)
+{
+	int err;
+	if (index == -1)
+		hnat_account_admin_lock();
+	err = __entry_delete(ppe_id, index);
+	if (index == -1)
+		hnat_account_admin_unlock();
+	return err;
+}
+
 EXPORT_SYMBOL(entry_delete);
 
 int cr_set_usage(int level)
@@ -971,7 +991,7 @@ static const debugfs_write_func cr_set_func[] = {
 	[12] = set_macvlan_support,
 };
 
-int read_mib(struct mtk_hnat *h, u32 ppe_id,
+static int read_mib(struct mtk_hnat *h, u32 ppe_id,
 	     u32 index, u64 *bytes, u64 *packets)
 {
 	int ret;
@@ -1015,6 +1035,16 @@ struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
 {
 	u64 bytes, packets;
 
+	if (hnat_account_enabled(h)) {
+		if (hnat_account_drain(h, ppe_id, index, NULL, diff))
+			return NULL;
+		return &h->acct[ppe_id][index]; /* legacy pointer ABI, not a snapshot */
+	}
+	if (!h || !h->data || ppe_id >= MAX_PPE_NUM ||
+	    ppe_id >= h->ppe_num || index >= h->foe_etry_num ||
+	    !h->acct[ppe_id] || !h->ppe_base[ppe_id])
+		return NULL;
+
 	if (ppe_id >= CFG_PPE_NUM)
 		return NULL;
 
@@ -1034,6 +1064,7 @@ struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
 		diff->bytes = bytes;
 		diff->packets = packets;
 	}
+
 	return &h->acct[ppe_id][index];
 }
 EXPORT_SYMBOL(hnat_get_count);
@@ -1047,10 +1078,11 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 	struct foe_entry *entry, *end;
 	unsigned char h_dest[ETH_ALEN];
 	unsigned char h_source[ETH_ALEN];
-	struct hnat_accounting *acct;
+	struct hnat_accounting *acct, snapshot;
 	u32 entry_index = 0;
 
-	if (ppe_id >= CFG_PPE_NUM)
+	if (!h || !h->data || ppe_id >= MAX_PPE_NUM ||
+	    ppe_id >= h->ppe_num || !h->foe_table_cpu[ppe_id])
 		return -EINVAL;
 
 	entry = h->foe_table_cpu[ppe_id];
@@ -1061,7 +1093,10 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 			entry_index++;
 			continue;
 		}
-		acct = hnat_get_count(h, ppe_id, entry_index, NULL);
+		if (hnat_account_enabled(h))
+			acct = hnat_account_drain(h, ppe_id, entry_index, &snapshot, NULL) ? NULL : &snapshot;
+		else
+			acct = hnat_get_count(h, ppe_id, entry_index, NULL);
 		if (IS_IPV4_HNAPT(entry)) {
 			__be32 saddr = htonl(entry->ipv4_hnapt.sip);
 			__be32 daddr = htonl(entry->ipv4_hnapt.dip);
@@ -3086,7 +3121,8 @@ static ssize_t hnat_static_entry_write(struct file *file,
 
 	/* We must ensure all info has been updated before set to hw */
 	wmb();
-	memcpy(foe, &entry, sizeof(entry));
+	if (!hnat_account_commit(hnat_priv, ppe_id, hash, NULL, &entry, false, false, 0))
+		memcpy(foe, &entry, sizeof(entry));
 
 	debug_level = 7;
 	entry_detail(ppe_id, hash);
@@ -3199,10 +3235,12 @@ static const struct file_operations hnat_skip_vid_fops = {
 int get_ppe_mib(u32 ppe_id, int index, u64 *pkt_cnt, u64 *byte_cnt)
 {
 	struct mtk_hnat *h = hnat_priv;
-	struct hnat_accounting *acct;
+	struct hnat_accounting *acct, snapshot;
 	struct foe_entry *entry;
 
-	if (ppe_id >= CFG_PPE_NUM)
+	if (!h || !h->data || !pkt_cnt || !byte_cnt ||
+	    ppe_id >= MAX_PPE_NUM || ppe_id >= h->ppe_num ||
+	    !h->foe_table_cpu[ppe_id])
 		return -EINVAL;
 
 	if (index < 0 || index >= h->foe_etry_num) {
@@ -3210,7 +3248,10 @@ int get_ppe_mib(u32 ppe_id, int index, u64 *pkt_cnt, u64 *byte_cnt)
 		return -EINVAL;
 	}
 
-	acct = hnat_get_count(h, ppe_id, index, NULL);
+	if (hnat_account_enabled(h))
+		acct = hnat_account_drain(h, ppe_id, index, &snapshot, NULL) ? NULL : &snapshot;
+	else
+		acct = hnat_get_count(h, ppe_id, index, NULL);
 	entry = hnat_priv->foe_table_cpu[ppe_id] + index;
 
 	if (!acct)
@@ -3298,6 +3339,8 @@ static int hnat_fallback_show(struct seq_file *m, void *private)
 }
 DEFINE_SHOW_ATTRIBUTE(hnat_fallback);
 
+DEFINE_SHOW_ATTRIBUTE(hnat_account);
+
 int hnat_init_debugfs(struct mtk_hnat *h)
 {
 	int ret = 0;
@@ -3334,6 +3377,7 @@ int hnat_init_debugfs(struct mtk_hnat *h)
 	}
 
 	debugfs_create_file("all_entry", 0444, root, h, &hnat_debug_fops);
+	debugfs_create_file("accounting", 0444, root, h, &hnat_account_fops);
 	debugfs_create_file("fallback_stats", 0444, root, h, &hnat_fallback_fops);
 	debugfs_create_file("external_interface", 0444, root, h,
 			    &hnat_ext_fops);
@@ -3416,6 +3460,8 @@ void hnat_deinit_debugfs(struct mtk_hnat *h)
 	debugfs_remove_recursive(h->root);
 	h->root = NULL;
 
-	for (i = 0; i < CFG_PPE_NUM; i++)
+	for (i = 0; i < CFG_PPE_NUM && i < MAX_PPE_NUM; i++) {
 		kfree(h->regset[i]);
+		h->regset[i] = NULL;
+	}
 }

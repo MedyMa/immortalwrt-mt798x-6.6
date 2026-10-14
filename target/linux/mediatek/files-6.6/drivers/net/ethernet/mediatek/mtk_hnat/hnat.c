@@ -12,6 +12,7 @@
  *   Copyright (C) 2016-2017 John Crispin <blogic@openwrt.org>
  */
 
+#include <linux/atomic.h>
 #include <linux/dma-mapping.h>
 #include <linux/delay.h>
 #include <linux/if.h>
@@ -21,6 +22,8 @@
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/rtnetlink.h>
+#include <linux/spinlock.h>
+#include <linux/wait.h>
 #include <net/netlink.h>
 
 #include "nf_hnat_mtk.h"
@@ -28,7 +31,59 @@
 
 struct mtk_hnat *hnat_priv;
 static struct socket *_hnat_roam_sock;
-static struct work_struct _hnat_roam_work;
+static struct delayed_work _hnat_roam_work;
+static bool _hnat_roam_stopping;
+static bool hnat_pack_registered;
+static bool hnat_netdevice_registered;
+static bool hnat_netevent_registered;
+
+/* Process callbacks can sleep (device registration uses GFP_KERNEL). The
+ * admission lock is never held while running a callback or draining it.
+ * Stable exported pointers also avoid vendor check-then-call NULL races.
+ * Symbol consumers pin module text; this gate protects platform context.
+ */
+static DEFINE_SPINLOCK(hnat_callback_lock);
+static DECLARE_WAIT_QUEUE_HEAD(hnat_callback_wait);
+static atomic_t hnat_callback_users = ATOMIC_INIT(0);
+static bool hnat_callbacks_live;
+
+bool hnat_external_callback_enter(void)
+{
+	unsigned long flags;
+	bool live;
+
+	spin_lock_irqsave(&hnat_callback_lock, flags);
+	live = hnat_callbacks_live && hnat_priv;
+	if (live)
+		atomic_inc(&hnat_callback_users);
+	spin_unlock_irqrestore(&hnat_callback_lock, flags);
+	return live;
+}
+
+void hnat_external_callback_exit(void)
+{
+	if (atomic_dec_and_test(&hnat_callback_users))
+		wake_up_all(&hnat_callback_wait);
+}
+
+static void hnat_external_callbacks_start(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hnat_callback_lock, flags);
+	hnat_callbacks_live = true;
+	spin_unlock_irqrestore(&hnat_callback_lock, flags);
+}
+
+static void hnat_external_callbacks_stop(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hnat_callback_lock, flags);
+	hnat_callbacks_live = false;
+	spin_unlock_irqrestore(&hnat_callback_lock, flags);
+	wait_event(hnat_callback_wait, !atomic_read(&hnat_callback_users));
+}
 
 int (*ra_sw_nat_hook_rx)(struct sk_buff *skb) = NULL;
 EXPORT_SYMBOL(ra_sw_nat_hook_rx);
@@ -165,7 +220,7 @@ static int mtk_get_wdma_rx_port(u32 wdma_idx)
 	return -EINVAL;
 }
 
-static int mtk_set_wdma_pse_port_state(u32 wdma_idx, bool up)
+static int mtk_set_wdma_pse_port_state_body(u32 wdma_idx, bool up)
 {
         int port;
         port = mtk_get_wdma_rx_port(wdma_idx);
@@ -174,6 +229,18 @@ static int mtk_set_wdma_pse_port_state(u32 wdma_idx, bool up)
         cr_set_field(hnat_priv->fe_base + MTK_FE_GLO_CFG(port),
                      MTK_FE_LINK_DOWN1((u32)port), !up);
         return 0;
+}
+
+static int mtk_set_wdma_pse_port_state(u32 wdma_idx, bool up)
+{
+	int ret;
+
+	if (!hnat_external_callback_enter())
+		return -ENODEV;
+	ret = hnat_priv->data->whnat ?
+		mtk_set_wdma_pse_port_state_body(wdma_idx, up) : -ENODEV;
+	hnat_external_callback_exit();
+	return ret;
 }
 
 void set_gmac_ppe_fwd(int id, int enable)
@@ -239,16 +306,26 @@ static int entry_mac_cmp(struct foe_entry *entry, u8 *mac)
 	return ret;
 }
 
-int entry_delete_by_mac(u8 *mac)
+static int entry_delete_by_mac_body(u8 *mac)
 {
-	struct foe_entry *entry = NULL;
+	struct foe_entry *entry = NULL, *match, snapshot;
+	u64 account_generation = 0;
 	int index, i, ret = 0;
 
 	for (i = 0; i < CFG_PPE_NUM; i++) {
 		entry = hnat_priv->foe_table_cpu[i];
 		for (index = 0; index < DEF_ETRY_NUM; entry++, index++) {
-			if(entry->bfib1.state == BIND && entry_mac_cmp(entry, mac)) {
-				memset(entry, 0, sizeof(*entry));
+			if (hnat_account_enabled(hnat_priv)) {
+				if (!hnat_account_clear_snapshot(hnat_priv, i, index,
+							 &snapshot, &account_generation))
+					continue;
+				match = &snapshot;
+			} else
+				match = entry;
+			if (match->bfib1.state == BIND && entry_mac_cmp(match, mac)) {
+				if (!hnat_account_clear_if_generation(hnat_priv, i, index,
+							      true, account_generation))
+					memset(entry, 0, sizeof(*entry));
 				hnat_cache_ebl(1);
 				if (debug_level >= 2)
 					pr_info("delete entry idx = %d\n", index);
@@ -263,6 +340,17 @@ int entry_delete_by_mac(u8 *mac)
 	return ret;
 }
 
+int entry_delete_by_mac(u8 *mac)
+{
+	int ret;
+
+	if (!hnat_external_callback_enter())
+		return 0;
+	ret = entry_delete_by_mac_body(mac);
+	hnat_external_callback_exit();
+	return ret;
+}
+
 static void hnat_roam_handler(struct work_struct *work)
 {
 	struct kvec iov;
@@ -273,7 +361,7 @@ static void hnat_roam_handler(struct work_struct *work)
 	u8 rcv_buf[512];
 	int len;
 
-	if (!_hnat_roam_sock)
+	if (READ_ONCE(_hnat_roam_stopping) || !_hnat_roam_sock)
 		return;
 
 	iov.iov_base = rcv_buf;
@@ -281,7 +369,7 @@ static void hnat_roam_handler(struct work_struct *work)
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_namelen = sizeof(struct sockaddr_nl);
 
-	len = kernel_recvmsg(_hnat_roam_sock, &msg, &iov, 1, iov.iov_len, 0);
+	len = kernel_recvmsg(_hnat_roam_sock, &msg, &iov, 1, iov.iov_len, MSG_DONTWAIT);
 	if (len <= 0)
 		goto out;
 
@@ -304,7 +392,9 @@ static void hnat_roam_handler(struct work_struct *work)
 	}
 
 out:
-	schedule_work(&_hnat_roam_work);
+	if (!READ_ONCE(_hnat_roam_stopping))
+		schedule_delayed_work(&_hnat_roam_work,
+				      len > 0 ? 0 : msecs_to_jiffies(100));
 }
 
 static int hnat_roaming_enable(void)
@@ -313,7 +403,8 @@ static int hnat_roaming_enable(void)
 	struct sockaddr_nl addr;
 	int ret;
 
-	INIT_WORK(&_hnat_roam_work, hnat_roam_handler);
+	INIT_DELAYED_WORK(&_hnat_roam_work, hnat_roam_handler);
+	WRITE_ONCE(_hnat_roam_stopping, false);
 
 	ret = sock_create_kern(&init_net, AF_NETLINK, SOCK_RAW, NETLINK_ROUTE, &sock);
 	if (ret < 0)
@@ -329,11 +420,14 @@ static int hnat_roaming_enable(void)
 	if (ret < 0)
 		goto out;
 
-	schedule_work(&_hnat_roam_work);
+	if (!READ_ONCE(_hnat_roam_stopping))
+		schedule_delayed_work(&_hnat_roam_work, msecs_to_jiffies(100));
 	pr_info("hnat roaming work enable\n");
 
 	return 0;
 out:
+	WRITE_ONCE(_hnat_roam_stopping, true);
+	_hnat_roam_sock = NULL;
 	if (sock)
 		sock_release(sock);
 
@@ -342,6 +436,8 @@ out:
 
 static void hnat_roaming_disable(void)
 {
+	WRITE_ONCE(_hnat_roam_stopping, true);
+	cancel_delayed_work_sync(&_hnat_roam_work);
 	if (_hnat_roam_sock)
 		sock_release(_hnat_roam_sock);
 	_hnat_roam_sock = NULL;
@@ -547,6 +643,8 @@ static void hnat_stop(u32 ppe_id)
 	if (ppe_id >= CFG_PPE_NUM)
 		return;
 
+	hnat_account_pause(hnat_priv, ppe_id);
+
 	/* send all traffic back to the DMA engine */
 	set_gmac_ppe_fwd(NR_GMAC1_PORT, 0);
 	set_gmac_ppe_fwd(NR_GMAC2_PORT, 0);
@@ -646,8 +744,28 @@ static struct notifier_block nf_hnat_netevent_nb __read_mostly = {
 	.notifier_call = nf_hnat_netevent_handler,
 };
 
-int hnat_enable_hook(void)
+static int __hnat_enable_hook(void)
 {
+	int i;
+
+	if (hook_toggle)
+		return 0;
+	for (i = 0; i < CFG_PPE_NUM; i++)
+		hnat_account_resume(hnat_priv, i);
+	/* Registration rolls back partial NF publication on error; drain readers
+	 * before callers may release this platform context. Publish vendor raw
+	 * hooks only after the fallible registration succeeds.
+	 */
+	if (hnat_register_nf_hooks()) {
+		hnat_external_callbacks_stop();
+		ra_sw_nat_hook_rx = NULL;
+		ra_sw_nat_hook_tx = NULL;
+		synchronize_net();
+		for (i = 0; i < CFG_PPE_NUM; i++)
+			hnat_account_pause(hnat_priv, i);
+		hook_toggle = 0;
+		return -1;
+	}
 	/* register hook functions used by WHNAT module.
 	 */
 	if (hnat_priv->data->whnat) {
@@ -664,27 +782,37 @@ int hnat_enable_hook(void)
 		hnat_set_wdma_pse_port_state = mtk_set_wdma_pse_port_state;
 	}
 
-	if (hnat_register_nf_hooks())
-		return -1;
-
 	ppe_del_entry_by_mac = entry_delete_by_mac;
+	hnat_external_callbacks_start();
 	hook_toggle = 1;
 
 	return 0;
 }
 
-int hnat_disable_hook(void)
+int hnat_enable_hook(void)
+{
+	int err;
+	hnat_account_admin_lock();
+	err = __hnat_enable_hook();
+	hnat_account_admin_unlock();
+	return err;
+}
+
+static int __hnat_disable_hook(void)
 {
 	int i, hash_index;
 	struct foe_entry *entry;
 
+	if (!hook_toggle)
+		return 0;
+	hnat_external_callbacks_stop();
 	ra_sw_nat_hook_tx = NULL;
 	ra_sw_nat_hook_rx = NULL;
-	ra_sw_nat_clear_bind_entries = NULL;
-	hnat_get_wdma_tx_port = NULL;
-	hnat_get_wdma_rx_port = NULL;
-	hnat_set_wdma_pse_port_state = NULL;
-	hnat_unregister_nf_hooks();
+	if (hook_toggle)
+		hnat_unregister_nf_hooks();
+	synchronize_net(); /* wait networking users of the cleared raw hooks */
+	for (i = 0; i < CFG_PPE_NUM; i++)
+		hnat_account_pause(hnat_priv, i);
 
 	for (i = 0; i < CFG_PPE_NUM; i++) {
 		cr_set_field(hnat_priv->ppe_base[i] + PPE_TB_CFG,
@@ -704,24 +832,51 @@ int hnat_disable_hook(void)
 	hnat_cache_ebl(1);
 
 	mod_timer(&hnat_priv->hnat_sma_build_entry_timer, jiffies + 3 * HZ);
-	ppe_del_entry_by_mac = NULL;
 	hook_toggle = 0;
 
 	return 0;
 }
 
-int hnat_warm_init(void)
+int hnat_disable_hook(void)
+{
+	int err;
+	hnat_account_admin_lock();
+	err = __hnat_disable_hook();
+	hnat_account_admin_unlock();
+	return err;
+}
+
+static int __hnat_warm_init(void)
 {
 	u32 foe_table_sz, foe_mib_tb_sz, ppe_id = 0;
+	bool was_enabled = hook_toggle;
+	bool had_netevent = hnat_netevent_registered;
+	int err = 0;
 
-	unregister_netevent_notifier(&nf_hnat_netevent_nb);
+	/* Paused accounting permits conditional clears. Drain their process
+	 * and NF producers before the table-wide reset outside PPE locks.
+	 */
+	hnat_external_callbacks_stop();
+	ra_sw_nat_hook_tx = NULL;
+	ra_sw_nat_hook_rx = NULL;
+	if (was_enabled)
+		hnat_unregister_nf_hooks();
+	synchronize_net();
+	hook_toggle = 0;
+
+	if (had_netevent) {
+		unregister_netevent_notifier(&nf_hnat_netevent_nb);
+		hnat_netevent_registered = false;
+	}
 
 	for (ppe_id = 0; ppe_id < CFG_PPE_NUM; ppe_id++) {
+		hnat_account_pause(hnat_priv, ppe_id);
 		foe_table_sz =
 			hnat_priv->foe_etry_num * sizeof(struct foe_entry);
 		writel(hnat_priv->foe_table_dev[ppe_id],
 		       hnat_priv->ppe_base[ppe_id] + PPE_TB_BASE);
-		memset(hnat_priv->foe_table_cpu[ppe_id], 0, foe_table_sz);
+		if (!hnat_account_reset_table(hnat_priv, ppe_id))
+			memset(hnat_priv->foe_table_cpu[ppe_id], 0, foe_table_sz);
 
 		if (hnat_priv->data->version == MTK_HNAT_V1_1)
 			exclude_boundary_entry(hnat_priv->foe_table_cpu[ppe_id]);
@@ -741,9 +896,25 @@ int hnat_warm_init(void)
 	set_gmac_ppe_fwd(NR_GMAC1_PORT, 1);
 	set_gmac_ppe_fwd(NR_GMAC2_PORT, 1);
 	set_gmac_ppe_fwd(NR_GMAC3_PORT, 1);
-	register_netevent_notifier(&nf_hnat_netevent_nb);
+	if (had_netevent) {
+		err = register_netevent_notifier(&nf_hnat_netevent_nb);
+		if (err)
+			return err;
+		hnat_netevent_registered = true;
+	}
+	if (was_enabled)
+		err = __hnat_enable_hook();
 
-	return 0;
+	return err;
+}
+
+int hnat_warm_init(void)
+{
+	int err;
+	hnat_account_admin_lock();
+	err = __hnat_warm_init();
+	hnat_account_admin_unlock();
+	return err;
 }
 
 static struct packet_type mtk_pack_type __read_mostly = {
@@ -909,6 +1080,10 @@ static int hnat_probe(struct platform_device *pdev)
 			goto err_out;
 	}
 
+	err = hnat_account_init(hnat_priv);
+	if (err)
+		goto err_out;
+
 	if (hnat_priv->data->whnat) {
 		err = whnat_adjust_nf_hooks();
 		if (err)
@@ -919,8 +1094,14 @@ static int hnat_probe(struct platform_device *pdev)
 	if (err)
 		goto err_out;
 
-	register_netdevice_notifier(&nf_hnat_netdevice_nb);
-	register_netevent_notifier(&nf_hnat_netevent_nb);
+	err = register_netdevice_notifier(&nf_hnat_netdevice_nb);
+	if (err)
+		goto err_out;
+	hnat_netdevice_registered = true;
+	err = register_netevent_notifier(&nf_hnat_netevent_nb);
+	if (err)
+		goto err_out;
+	hnat_netevent_registered = true;
 
 	if (hnat_priv->data->mcast) {
 		for (i = 0; i < CFG_PPE_NUM; i++)
@@ -934,8 +1115,10 @@ static int hnat_probe(struct platform_device *pdev)
 		add_timer(&hnat_priv->hnat_reset_timestamp_timer);
 	}
 
-	if (IS_HQOS_MODE && IS_GMAC1_MODE)
+	if (IS_HQOS_MODE && IS_GMAC1_MODE) {
 		dev_add_pack(&mtk_pack_type);
+		hnat_pack_registered = true;
+	}
 
 	err = hnat_roaming_enable();
 	if (err)
@@ -946,6 +1129,23 @@ static int hnat_probe(struct platform_device *pdev)
 	return 0;
 
 err_out:
+	hnat_deinit_debugfs(hnat_priv);
+	if (hnat_netdevice_registered) {
+		unregister_netdevice_notifier(&nf_hnat_netdevice_nb);
+		hnat_netdevice_registered = false;
+	}
+	if (hnat_netevent_registered) {
+		unregister_netevent_notifier(&nf_hnat_netevent_nb);
+		hnat_netevent_registered = false;
+	}
+	hnat_external_callbacks_stop();
+	ra_sw_nat_hook_rx = NULL;
+	ra_sw_nat_hook_tx = NULL;
+	if (hook_toggle)
+		hnat_unregister_nf_hooks();
+	synchronize_net();
+	hook_toggle = 0;
+	hnat_account_cleanup(hnat_priv);
 	for (i = 0; i < CFG_PPE_NUM; i++)
 		hnat_stop(i);
 err_out1:
@@ -962,25 +1162,35 @@ static int hnat_remove(struct platform_device *pdev)
 {
 	int i;
 
+	hnat_deinit_debugfs(hnat_priv);
 	hnat_roaming_disable();
-	unregister_netdevice_notifier(&nf_hnat_netdevice_nb);
-	unregister_netevent_notifier(&nf_hnat_netevent_nb);
+	if (hnat_netdevice_registered) {
+		unregister_netdevice_notifier(&nf_hnat_netdevice_nb);
+		hnat_netdevice_registered = false;
+	}
+	if (hnat_netevent_registered) {
+		unregister_netevent_notifier(&nf_hnat_netevent_nb);
+		hnat_netevent_registered = false;
+	}
 	hnat_disable_hook();
-
+	timer_shutdown_sync(&hnat_priv->hnat_sma_build_entry_timer);
+	if (hnat_priv->data->version == MTK_HNAT_V1_3)
+		timer_shutdown_sync(&hnat_priv->hnat_reset_timestamp_timer);
 	if (hnat_priv->data->mcast)
 		hnat_mcast_disable();
+	if (hnat_pack_registered) {
+		dev_remove_pack(&mtk_pack_type);
+		hnat_pack_registered = false;
+	}
+	hnat_account_cleanup(hnat_priv);
 
 	for (i = 0; i < CFG_PPE_NUM; i++)
 		hnat_stop(i);
 
-	hnat_deinit_debugfs(hnat_priv);
 	hnat_release_netdev();
-	del_timer_sync(&hnat_priv->hnat_sma_build_entry_timer);
-	if (hnat_priv->data->version == MTK_HNAT_V1_3)
-		del_timer_sync(&hnat_priv->hnat_reset_timestamp_timer);
 
-	if (IS_HQOS_MODE && IS_GMAC1_MODE)
-		dev_remove_pack(&mtk_pack_type);
+
+
 
 	return 0;
 }
