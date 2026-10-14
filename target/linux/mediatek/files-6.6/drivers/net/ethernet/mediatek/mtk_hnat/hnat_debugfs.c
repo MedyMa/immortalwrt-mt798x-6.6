@@ -18,6 +18,7 @@
 #include <linux/iopoll.h>
 #include <linux/inet.h>
 #include <net/ipv6.h>
+#include <net/netfilter/nf_conntrack_acct.h>
 #include "hnat.h"
 #include "nf_hnat_mtk.h"
 #include "../mtk_eth_soc.h"
@@ -2538,6 +2539,11 @@ static ssize_t hnat_dpi_using_write(struct file *file, const char __user *buffer
 	ret = kstrtobool_from_user(buffer, count, &enabled);
 	if (ret)
 		return ret;
+	/* The HNAT device lookup and control plane use init_net. */
+	if (enabled && !nf_ct_acct_enabled(&init_net)) {
+		pr_warn_ratelimited("hnat: enable net.netfilter.nf_conntrack_acct before DPI gating\n");
+		return -EOPNOTSUPP;
+	}
 	WRITE_ONCE(dpi_using, enabled);
 	return count;
 }
