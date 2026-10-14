@@ -84,8 +84,7 @@
  	mt_priv_chan_survey_info->active_time = pAd->ScanCtrl.active_time[idx];
  	return 0;
  #else /* !CFG80211_FULL_OPS_SUPPORT */
-@@ -4506,12 +4560,26 @@ static int CFG80211DRV_OpsStaChg
- 				"80211> STA("MACSTR") ==> PortSecured\n",
+@@ -4507,11 +4561,25 @@ static int CFG80211DRV_OpsStaChg
  				MAC2STR(mt_priv_info->mac_addr));
  			CFG80211_StaPortSecured(pAd, mt_priv_info->mac_addr, 1);
 +			if (!pAd->noise_floor) {

@@ -1,7 +1,6 @@
 --- a/mt_wifi/common/cmm_cfg.c
 +++ b/mt_wifi/common/cmm_cfg.c
-@@ -5330,15 +5330,24 @@ INT SetPowerDropCtrl(RTMP
- 	/* parameter parsing */
+@@ -5331,14 +5331,23 @@ INT SetPowerDropCtrl(RTMP
  	for (i = 0, value = rstrtok(arg, ":"); value; value = rstrtok(NULL, ":"), i++) {
  		switch (i) {
 -		case 0:
