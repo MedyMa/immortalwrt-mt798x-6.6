@@ -642,27 +642,6 @@ endef
 define Build/Compile/mt7992
 #Copy Kite FW header for differnet SKUs
 ifeq ($(CONFIG_MTK_WIFI7_CHIP_MT7992),y)
-ifeq ($(CONFIG_MTK_WIFI7_SKU_TYPE),"BE7200")
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_PATCH_MCU_1_1_hdr_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_PATCH_MCU_1_1_hdr.h
-ifeq ($(CONFIG_MTK_WIFI7_FW_LOG_TYPE),"idx_log")
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_idx_1_1_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1.h
-else
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1.h
-endif
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1_TESTMODE_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1_TESTMODE.h
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_WACPU_RAM_CODE_1_1_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_WACPU_RAM_CODE_1_1.h
-endif
-
-ifeq ($(CONFIG_MTK_WIFI7_SKU_TYPE),"AX6000")
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_PATCH_MCU_1_1_hdr_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_PATCH_MCU_1_1_hdr.h
-ifeq ($(CONFIG_MTK_WIFI7_FW_LOG_TYPE),"idx_log")
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_idx_1_1_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1.h
-else
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1.h
-endif
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1_TESTMODE_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_RAM_CODE_MT7992_1_1_TESTMODE.h
-	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_WACPU_RAM_CODE_1_1_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_WACPU_RAM_CODE_1_1.h
-endif
 
 ifeq ($(CONFIG_MTK_WIFI7_SKU_TYPE),"BE5040")
 	cp -rf $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_PATCH_MCU_2_1_hdr_.h $(PKG_BUILD_DIR)/mt_wifi/include/hw_ctrl/mcu_hdr/WIFI_MT7992_PATCH_MCU_1_1_hdr.h
