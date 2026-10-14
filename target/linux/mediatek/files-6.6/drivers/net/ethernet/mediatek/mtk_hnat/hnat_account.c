@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Experimental read-clear accounting with an opt-in bounded MIB poller. */
+/* Owner-scoped read-clear accounting with a bounded MIB poller. */
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/rcupdate.h>
@@ -20,7 +20,14 @@
 #include "hnat.h"
 #include "hnat_account_ledger.h"
 
+#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
+static bool experimental_accounting = true;
+static unsigned int account_poll_interval_ms = 100;
+#else
+/* Targets without the matching kernel helpers retain the legacy path. */
 static bool experimental_accounting;
+static unsigned int account_poll_interval_ms;
+#endif
 static DEFINE_MUTEX(account_admin_mutex);
 void hnat_account_admin_lock(void)
 {
@@ -33,9 +40,8 @@ void hnat_account_admin_unlock(void)
 		mutex_unlock(&account_admin_mutex);
 }
 module_param(experimental_accounting, bool, 0444);
-MODULE_PARM_DESC(experimental_accounting, "Experimental HNAT accounting (default off)");
-static unsigned int account_poll_interval_ms;
-static unsigned int account_poll_budget = 16;
+MODULE_PARM_DESC(experimental_accounting, "HNAT owner accounting (default on with packet accounting built)");
+static unsigned int account_poll_budget = 64;
 module_param(account_poll_interval_ms, uint, 0444);
 module_param(account_poll_budget, uint, 0444);
 MODULE_PARM_DESC(account_poll_interval_ms, "MIB polling interval, 0=off or 100..60000 ms");
