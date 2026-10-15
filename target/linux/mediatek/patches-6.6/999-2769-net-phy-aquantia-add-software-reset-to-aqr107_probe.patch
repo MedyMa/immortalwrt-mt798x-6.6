@@ -56,6 +56,6 @@ Subject: [PATCH] net: phy: aquantia: add software reset to aqr107_probe
 +
  	ret = aqr_mib_probe(phydev);
  	if (ret)
- 		return ret;
+ 		phydev_warn(phydev, "MIB setup failed: %d\n", ret);
  
  	return aqr_hwmon_probe(phydev);

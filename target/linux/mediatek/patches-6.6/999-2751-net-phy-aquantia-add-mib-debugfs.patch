@@ -78,7 +78,7 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  
 +	ret = aqr_mib_probe(phydev);
 +	if (ret)
-+		return ret;
++		phydev_warn(phydev, "MIB setup failed: %d\n", ret);
 +
  	return aqr_hwmon_probe(phydev);
  }
