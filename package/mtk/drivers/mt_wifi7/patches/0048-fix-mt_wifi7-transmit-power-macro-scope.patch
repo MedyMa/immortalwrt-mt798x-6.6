@@ -1,0 +1,17 @@
+--- a/mt_wifi/include/rt_config.h
++++ b/mt_wifi/include/rt_config.h
+@@ -36,1 +36,5 @@
++#ifndef MAX_TRANSMIT_POWER
++#define MAX_TRANSMIT_POWER 30
++#endif
++
+ #include "rtmp_def.h"
+--- a/mt_wifi/common/bcn.c
++++ b/mt_wifi/common/bcn.c
+@@ -31,5 +31,3 @@
+ #include "rt_config.h"
+-
+-#define MAX_TRANSMIT_POWER 30
+-
++
+ typedef NTSTATUS (*BCN_BPCC_CMDHdlr)(RTMP_ADAPTER*, PCmdQElmt);
