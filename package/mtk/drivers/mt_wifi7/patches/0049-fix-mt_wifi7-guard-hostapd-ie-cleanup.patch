@@ -1,0 +1,15 @@
+--- a/mt_wifi/common/mgmt/mgmt_entrytb.c
++++ b/mt_wifi/common/mgmt/mgmt_entrytb.c
+@@ -1917,10 +1917,12 @@
+ 			/* clean delay queue */
+ 			APCleanupQueue(pAd, &tr_entry->delay_queue, &tr_entry->delay_queue_lock);
+ 			TRTableResetEntry(pAd, wcid);
++#if defined(HOSTAPD_11R_SUPPORT) || defined(HOSTAPD_WPA3_SUPPORT)
+ 			if (pEntry->ie_list && !pEntry->res_enable) {
+ 				os_free_mem(pEntry->ie_list);
+ 				pEntry->ie_list = NULL;
+ 			}
++#endif
+ #ifdef MAC_REPEATER_SUPPORT
+ 			pEntry->pReptCli = NULL;
+ #endif
