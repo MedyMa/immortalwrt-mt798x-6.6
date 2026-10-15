@@ -61,7 +61,6 @@ endef
 define PatchDir/Default
 	@if [ -d "$(2)" ] && [ "$$$$(ls $(2) | wc -l)" -gt 0 ]; then \
 		export PATCH="$(PATCH)"; \
-		$(if $(filter unset,$(4)),unset PATCHFUZZ;,export PATCHFUZZ="$(if $(strip $(4)),$(strip $(4)),0)";) \
 		if [ -s "$(2)/series" ]; then \
 			$(call filter_series,$(2)/series) | xargs -n1 \
 				$(KPATCH) "$(1)" "$(2)"; \
@@ -72,11 +71,11 @@ define PatchDir/Default
 endef
 
 define PatchDir
-$(call PatchDir/$(if $(strip $(QUILT)),Quilt,Default),$(strip $(1)),$(strip $(2)),$(strip $(3)),$(strip $(4)))
+$(call PatchDir/$(if $(strip $(QUILT)),Quilt,Default),$(strip $(1)),$(strip $(2)),$(strip $(3)))
 endef
 
 define HostPatchDir
-$(call PatchDir/$(if $(strip $(HOST_QUILT)),Quilt,Default),$(strip $(1)),$(strip $(2)),$(strip $(3)),unset)
+$(call PatchDir/$(if $(strip $(HOST_QUILT)),Quilt,Default),$(strip $(1)),$(strip $(2)),$(strip $(3)))
 endef
 
 define Host/Patch/Default
@@ -87,7 +86,7 @@ endef
 
 define Build/Patch/Default
 	$(if $(QUILT),rm -rf $(PKG_BUILD_DIR)/patches; mkdir -p $(PKG_BUILD_DIR)/patches)
-	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR),,0)
+	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR),)
 	$(if $(QUILT),touch $(PKG_BUILD_DIR)/.quilt_used)
 endef
 
@@ -100,10 +99,10 @@ define Kernel/Patch/Default
 		echo "generic patches directory is present. please move your patches to the pending directory" ; \
 		exit 1; \
 	fi
-	$(call PatchDir,$(LINUX_DIR),$(GENERIC_BACKPORT_DIR),generic-backport/,unset)
-	$(call PatchDir,$(LINUX_DIR),$(GENERIC_PATCH_DIR),generic/,unset)
-	$(call PatchDir,$(LINUX_DIR),$(GENERIC_HACK_DIR),generic-hack/,unset)
-	$(call PatchDir,$(LINUX_DIR),$(PATCH_DIR),platform/,unset)
+	$(call PatchDir,$(LINUX_DIR),$(GENERIC_BACKPORT_DIR),generic-backport/)
+	$(call PatchDir,$(LINUX_DIR),$(GENERIC_PATCH_DIR),generic/)
+	$(call PatchDir,$(LINUX_DIR),$(GENERIC_HACK_DIR),generic-hack/)
+	$(call PatchDir,$(LINUX_DIR),$(PATCH_DIR),platform/)
 endef
 
 define Quilt/RefreshDir
