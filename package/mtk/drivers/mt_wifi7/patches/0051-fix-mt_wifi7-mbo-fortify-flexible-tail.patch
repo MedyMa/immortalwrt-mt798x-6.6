@@ -1,0 +1,12 @@
+diff --git a/mt_wifi/feature/mbo/mbo.c b/mt_wifi/feature/mbo/mbo.c
+--- a/mt_wifi/feature/mbo/mbo.c
++++ b/mt_wifi/feature/mbo/mbo.c
+@@ -533,1 +533,1 @@
+-	/* 8 = sizeof(neighbor_list_data->ifindex) + sizeof(neighbor_list_data->neighbor_list_len) */
++	/* The request payload follows the fixed header. */
+@@ -534,1 +534,1 @@
+-	buflen = 8 + report_buf_len;
++	buflen = sizeof(*neighbor_list_data) + report_buf_len;
+@@ -540,1 +540,1 @@
+-	memcpy(neighbor_list_data->neighbor_list_req, NeighborRepList, report_buf_len);
++	memcpy(buf + sizeof(*neighbor_list_data), NeighborRepList, report_buf_len);
