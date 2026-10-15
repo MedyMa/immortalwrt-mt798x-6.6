@@ -1,6 +1,14 @@
 --- a/mt_wifi/common/cmm_sanity.c
 +++ b/mt_wifi/common/cmm_sanity.c
-@@ -2319,11 +2319,31 @@ BOOLEAN PeerProbeReqSanity(
+@@ -2273,6 +2273,7 @@
+ {
+ 	PFRAME_802_11 Fr = (PFRAME_802_11)Msg;
+ 	UCHAR		*Ptr;
++	UCHAR *ssid_ie = NULL;
+ 	UCHAR		eid = 0, eid_len = 0, *eid_data;
+ #ifdef CONFIG_AP_SUPPORT
+ #if defined(WSC_INCLUDED) || defined(EASY_CONFIG_SETUP)
+@@ -2319,10 +2320,29 @@
  	COPY_MAC_ADDR(ProbeReqParam->Addr1, &Fr->Hdr.Addr1);
  #endif
  
@@ -8,9 +16,7 @@
 -		MTWF_DBG(NULL, DBG_CAT_TEST, CATTEST_SANITY, DBG_LVL_INFO,
 -			"sanity fail - wrong SSID IE\n");
 -		return FALSE;
--	}
 +	{
-+		UCHAR *ssid_ie = NULL;
 +		UCHAR *ie_scan = Fr->Octet;
 +		UINT scan_rem = MsgLen - LENGTH_802_11;
 +		UINT ie_len;
@@ -33,10 +39,20 @@
 +				"sanity fail - wrong SSID IE\n");
 +			return FALSE;
 +		}
-+	}
+ 	}
  #ifdef EM_PLUS_SUPPORT
  	if (IS_BROADCAST_MAC_ADDR(ProbeReqParam->Addr1)) {
- 		int apidx;
+@@ -2373,8 +2393,8 @@
+ 	 * call that in certification case. Correct apidex passed in below API.
+ 	 */
+ 
+-	ProbeReqParam->SsidLen = Fr->Octet[1];
+-	NdisMoveMemory(ProbeReqParam->Ssid, &Fr->Octet[2], ProbeReqParam->SsidLen);
++	ProbeReqParam->SsidLen = ssid_ie[1];
++	NdisMoveMemory(ProbeReqParam->Ssid, ssid_ie + 2, ProbeReqParam->SsidLen);
+ #ifdef CONFIG_AP_SUPPORT
+ 	COPY_MAC_ADDR(Addr1, &Fr->Hdr.Addr1);
+ #ifdef WSC_AP_SUPPORT
 --- a/mt_wifi/common/fsm/fsm_sync.c
 +++ b/mt_wifi/common/fsm/fsm_sync.c
 @@ -2318,5 +2318,5 @@

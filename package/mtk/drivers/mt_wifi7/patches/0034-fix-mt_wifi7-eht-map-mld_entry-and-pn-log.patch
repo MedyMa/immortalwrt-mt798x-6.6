@@ -1,8 +1,9 @@
 --- a/mt_wifi/feature/map/map.c
 +++ b/mt_wifi/feature/map/map.c
-@@ -483,6 +483,12 @@ INT map_send_bh_sta_wps_done_event
+@@ -483,6 +483,13 @@ INT map_send_bh_sta_wps_done_event
  #if (defined(MTK_MLO_MAP_SUPPORT) && defined(DOT11_EHT_BE))
  			wdev = mac_entry->wdev;
++			mt_os_lockless_enter(os_lockless_ctx_get());
  			entry = get_bss_entry_by_netdev(wdev->if_dev);
 +			if (!mac_entry->mlo.mlo_en || !BMGR_VALID_MLO_BSS_ENTRY(entry)) {
 +				if (send_event == TRUE && is_ap == 0)
@@ -13,3 +14,11 @@
  			if (BMGR_VALID_MLO_BSS_ENTRY(entry)) {
  				if (!BMGR_VALID_MLO_DEV(entry->mld_ptr)) {
  					MTWF_DBG(pAd, DBG_CAT_PROTO, CATPROTO_MAP, DBG_LVL_WARN,
+@@ -494,7 +501,6 @@ INT map_send_bh_sta_wps_done_event
+ 				}
+ 			}
+ 
+-			mt_os_lockless_enter(os_lockless_ctx_get());
+ 			mld_entry = get_mld_entry_by_mac(mac_entry->mlo.mld_addr);
+ 
+ 			if (!mld_entry) {
