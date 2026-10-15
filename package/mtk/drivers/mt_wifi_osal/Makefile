@@ -2,9 +2,10 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mt_wifi_osal
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)/wifi_osal
 PKG_SOURCE:=mt_wifi_osal-a53418.tar.xz
+PKG_HASH:=dfa4b178f198504a707dec957242f8ede1a732823e940faa6304c723ac3224ad
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -22,7 +23,7 @@ BACKPORT_VERSION := $(shell \
     xargs basename | \
     awk -F'-' '/backports-/ {print $2}' \
 )
-EXTRA_KCONFIG += CFG_CFG80211_VERSION:=$(word 2,$(subst -, ,$(BACKPORT_VERSION)))
+EXTRA_KCONFIG += CFG_CFG80211_VERSION:=$(BACKPORT_VERSION)
 
 PKG_EXTRA_CFLAGS:= $(if $(CONFIG_MTK_WIFI_OSAL_CFG80211_SUPPORT), -DCFG80211_SUPPORT) \
 		$(if $(CONFIG_MTK_WIFI_OSAL_DEBUG), -DMT_DEBUG) \
