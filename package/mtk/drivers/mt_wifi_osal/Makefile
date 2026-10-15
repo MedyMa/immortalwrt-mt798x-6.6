@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mt_wifi_osal
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)/wifi_osal
 PKG_SOURCE:=mt_wifi_osal-a53418.tar.xz
 PKG_HASH:=dfa4b178f198504a707dec957242f8ede1a732823e940faa6304c723ac3224ad
@@ -21,7 +21,7 @@ endef
 BACKPORT_VERSION := $(shell \
     find $(KERNEL_BUILD_DIR) $(KERNEL_BUILD_DIR)/mac80211-regular -maxdepth 1 -type d -name 'backports-*' | \
     xargs basename | \
-    awk -F'-' '/backports-/ {print $2}' \
+    awk -F'-' '/backports-/ {print $$2}' \
 )
 EXTRA_KCONFIG += CFG_CFG80211_VERSION:=$(BACKPORT_VERSION)
 
