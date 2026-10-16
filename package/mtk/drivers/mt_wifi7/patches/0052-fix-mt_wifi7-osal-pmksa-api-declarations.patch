@@ -1,22 +1,14 @@
-From: Codex <codex@openai.com>
-Subject: [PATCH] mt_wifi7: include OSAL PMKSA API declarations
+From: medyma <medyma@users.noreply.github.com>
+Subject: [PATCH] mt_wifi7: include the shared OSAL PMKSA declarations
 
-The PMKSA handler uses the structure and command IDs exported by the OSAL
-cfg80211 header. Keep CFG80211_SUPPORT local to that header so this declaration
-does not enable the legacy cfg80211 implementation across the whole driver.
+Do not toggle CFG80211_SUPPORT after rt_config.h has already included the
+OSAL cfg80211 header. Its include guard makes that second include a no-op.
+Use the shared PMKSA header without enabling legacy cfg80211 code.
 
-diff --git a/mt_wifi/sta/sta_cfg.c b/mt_wifi/sta/sta_cfg.c
 --- a/mt_wifi/sta/sta_cfg.c
 +++ b/mt_wifi/sta/sta_cfg.c
-@@ -28,0 +29,11 @@
+@@ -28 +28,4 @@
+ #include	"rt_config.h"
 +#ifdef MT_WIFI_OSAL_SUPPORT
-+#ifndef CFG80211_SUPPORT
-+#define MT_WIFI7_UNDEF_CFG80211_SUPPORT
-+#define CFG80211_SUPPORT
-+#endif
-+#include <mt_osal_cfg80211.h>
-+#ifdef MT_WIFI7_UNDEF_CFG80211_SUPPORT
-+#undef CFG80211_SUPPORT
-+#undef MT_WIFI7_UNDEF_CFG80211_SUPPORT
-+#endif
++#include <mt_osal_pmksa.h>
 +#endif

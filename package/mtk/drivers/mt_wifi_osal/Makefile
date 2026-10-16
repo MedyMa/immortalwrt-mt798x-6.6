@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mt_wifi_osal
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)/wifi_osal
 PKG_SOURCE:=mt_wifi_osal-a53418.tar.xz
 PKG_HASH:=dfa4b178f198504a707dec957242f8ede1a732823e940faa6304c723ac3224ad
