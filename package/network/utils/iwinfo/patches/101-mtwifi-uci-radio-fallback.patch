@@ -1,0 +1,18 @@
+From: BPI-R4 firmware maintenance
+Subject: [PATCH] iwinfo: recognize mtwifi UCI radio sections as a fallback
+
+Adapt the mtwifi lookup from benboguan openwrt-25.12 while preserving
+mac80211 priority. Reuse the existing path, MAC and phy resolution and
+cleanup; this does not change vendor structures or synthesize a phy index.
+
+--- a/iwinfo_nl80211.c
++++ b/iwinfo_nl80211.c
+@@ -413,6 +413,8 @@
+ 	int idx = -1;
+ 
+ 	s = iwinfo_uci_get_radio(name, "mac80211");
++	if (!s)
++		s = iwinfo_uci_get_radio(name, "mtwifi");
+ 	if (!s)
+ 		goto out;
+ 

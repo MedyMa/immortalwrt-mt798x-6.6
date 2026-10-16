@@ -50,7 +50,7 @@ msgid "driver default (%s)"
 msgstr "驱动默认（%s）"
 
 msgid "no override"
-msgstr "非绕过"
+msgstr "不覆盖"
 
 msgid "Override default MAC address - the range of usable addresses might be limited by the driver"
 msgstr "覆盖默认 MAC 地址 - 可用地址的范围可能受限于驱动"
