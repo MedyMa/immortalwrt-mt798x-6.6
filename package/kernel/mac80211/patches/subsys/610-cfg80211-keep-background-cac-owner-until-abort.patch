@@ -1,0 +1,22 @@
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Subject: [PATCH] cfg80211: keep background radar ownership until CAC abort
+
+The abort helper checks background_radar_wdev before cancelling delayed
+work and reporting the event. Release ownership only after that helper
+returns, while still holding the existing wiphy lock.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -1282,9 +1282,9 @@
+ 		return;
+ 
+ 	rdev_set_radar_background(rdev, NULL);
+-	rdev->background_radar_wdev = NULL; /* Release offchain ownership */
+ 
+ 	__cfg80211_background_cac_event(rdev, wdev,
+ 					&rdev->background_radar_chandef,
+ 					NL80211_RADAR_CAC_ABORTED);
++	rdev->background_radar_wdev = NULL; /* Release offchain ownership */
+ }
