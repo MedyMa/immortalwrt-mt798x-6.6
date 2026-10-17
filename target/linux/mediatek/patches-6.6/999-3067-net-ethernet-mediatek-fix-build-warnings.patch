@@ -19,9 +19,11 @@ The RBUS Wi-Fi utility copies a constant pinctrl state name into a local
 buffer.  Use strscpy() with the destination buffer size so the compiler
 does not warn about using the source string size as the strncpy() bound.
 
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_dbg.c b/drivers/net/ethernet/mediatek/mtk_eth_dbg.c
+index 504de80..61683e1 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_dbg.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_dbg.c
-@@ -69,7 +69,7 @@ static int qdma_pppq_show(struct seq_fil
+@@ -69,7 +69,7 @@ static int qdma_pppq_show(struct seq_file *m, void *v)
  	int i;
  
  	seq_puts(m, "Usage of the QDMA PPPQ for the HW path:\n");
@@ -30,17 +32,19 @@ does not warn about using the source string size as the strncpy() bound.
  		seq_printf(m, "qdma_txq%d:	%5d Mbps %8d refcnt\n",
  			   i, eth->qdma_shaper.speed[i],
  			   atomic_read(&eth->qdma_shaper.refcnt[i]));
+diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
+index 3c265f9..6d45922 100644
 --- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
 +++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
-@@ -25,6 +25,7 @@
+@@ -27,6 +27,7 @@
  #include <net/udp.h>
  #include <net/netfilter/nf_conntrack.h>
  #include <net/netfilter/nf_conntrack_acct.h>
 +#include <linux/stddef.h>
- 
- #include "nf_hnat_mtk.h"
- #include "hnat.h"
-@@ -1529,6 +1530,15 @@ static struct ethhdr *get_ipv6_ipip_ethh
+ #ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
+ #include <net/netfilter/nf_hnat_packet_accounting.h>
+ #endif
+@@ -1621,6 +1622,15 @@ static struct ethhdr *get_ipv6_ipip_ethhdr(struct sk_buff *skb,
  	return eth;
  }
  
@@ -56,29 +60,33 @@ does not warn about using the source string size as the strncpy() bound.
  static unsigned int skb_to_hnat_info(struct sk_buff *skb,
  				     const struct net_device *dev,
  				     struct foe_entry *foe,
-@@ -2209,8 +2219,7 @@ static unsigned int skb_to_hnat_info(str
- 	/* Before entry enter BIND state, write other fields first,
- 	 * prevent racing with hardware accesses.
- 	 */
--	memcpy(&(foe->ipv6_hnapt.ipv6_sip0), &(entry.ipv6_hnapt.ipv6_sip0),
--		       sizeof(struct foe_entry) - sizeof(entry.bfib1));
-+	hnat_copy_foe_info(foe, &entry);
- 	/* We must ensure all info has been updated before set to hw */
- 	wmb();
- 	/* After other fields have been written, write info1 to BIND the entry */
-@@ -2490,8 +2499,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *s
- 	/* Before entry enter BIND state, write other fields first,
-          * prevent racing with hardware accesses.
-          */
--	memcpy(&(hw_entry->ipv6_hnapt.ipv6_sip0), &(entry.ipv6_hnapt.ipv6_sip0),
--		       sizeof(struct foe_entry) - sizeof(entry.bfib1));
-+	hnat_copy_foe_info(hw_entry, &entry);
-         /* We must ensure all info has been updated before set to hw */
-         wmb();
-         /* After other fields have been writtefn, write info1 to BIND the entry */
+@@ -2305,9 +2315,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
+ 		    hnat_priv->acct[skb_hnat_ppe(skb)])
+ 			memset(&hnat_priv->acct[skb_hnat_ppe(skb)][skb_hnat_entry(skb)],
+ 			       0, sizeof(struct hnat_accounting));
+-		memcpy((u8 *)foe + sizeof(entry.bfib1),
+-		       (u8 *)&entry + sizeof(entry.bfib1),
+-		       sizeof(entry) - sizeof(entry.bfib1));
++		hnat_copy_foe_info(foe, &entry);
+ 		wmb();
+ 		memcpy(&foe->bfib1, &entry.bfib1, sizeof(entry.bfib1));
+ 		dma_wmb();
+@@ -2581,9 +2589,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
+ 		entry.ipv6_5t_route.act_dp &= ~UDF_HNAT_PRE_FILLED;
+ 	if (!hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
+ 				 skb_hnat_entry(skb), skb, &entry, false, true, account_generation)) {
+-		memcpy((u8 *)hw_entry + sizeof(entry.bfib1),
+-		       (u8 *)&entry + sizeof(entry.bfib1),
+-		       sizeof(entry) - sizeof(entry.bfib1));
++		hnat_copy_foe_info(hw_entry, &entry);
+ 		wmb();
+ 		memcpy(&hw_entry->bfib1, &entry.bfib1, sizeof(entry.bfib1));
+ 		dma_wmb();
+diff --git a/drivers/net/wireless/wifi_utility/pci_mediatek_rbus.c b/drivers/net/wireless/wifi_utility/pci_mediatek_rbus.c
+index 840834d..515a3ab 100644
 --- a/drivers/net/wireless/wifi_utility/pci_mediatek_rbus.c
 +++ b/drivers/net/wireless/wifi_utility/pci_mediatek_rbus.c
-@@ -150,7 +150,7 @@ rbus_pa_lan_config(struct platform_devic
+@@ -150,7 +150,7 @@ rbus_pa_lan_config(struct platform_device *pdev, unsigned int devfn, unsigned ch
  		return ret;
  	}
  

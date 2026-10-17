@@ -1,0 +1,499 @@
+From: Local experimental HNAT accounting
+Subject: [PATCH] netfilter: keep HNAT rule deltas on synthetic skb
+
+Default n; requires matching early-mark/late-publish HNAT producer.
+
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -921,6 +921,11 @@
+ 	__u8			active_extensions;
+ #endif
+ 
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	/* Ordinary=0, pending=1, published=2, terminal synthetic zero=3. */
++	__u8 hnat_accounting_state;
++#endif
++
+ 	/* Fields enclosed in headers group are copied
+ 	 * using a single memcpy() in __copy_skb_header()
+ 	 */
+@@ -4658,9 +4663,22 @@
+ #endif
+ }
+ 
++/* Revoke before releasing/replacing the skb's CT reference. No CT cookie
++ * is required: a published snapshot cannot survive reference replacement.
++ */
++static inline void skb_hnat_accounting_revoke(struct sk_buff *skb)
++{
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	if (skb->hnat_accounting_state == 2)
++		skb->hnat_accounting_state = 3;
++#endif
++}
++
+ static inline void skb_set_nfct(struct sk_buff *skb, unsigned long nfct)
+ {
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
++	if (skb->_nfct != nfct)
++		skb_hnat_accounting_revoke(skb);
+ 	skb->slow_gro |= !!nfct;
+ 	skb->_nfct = nfct;
+ #endif
+@@ -4682,6 +4700,9 @@
+ #endif
+ #if IS_ENABLED(CONFIG_MCTP_FLOWS)
+ 	SKB_EXT_MCTP,
++#endif
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	SKB_EXT_HNAT_ACCOUNTING,
+ #endif
+ 	SKB_EXT_NUM, /* must be last */
+ };
+@@ -4720,6 +4741,9 @@
+ 				  const struct sk_buff *src)
+ {
+ 	dst->active_extensions = src->active_extensions;
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	dst->hnat_accounting_state = src->hnat_accounting_state ? 3 : 0;
++#endif
+ 
+ 	if (src->active_extensions) {
+ 		struct skb_ext *ext = src->extensions;
+@@ -4764,6 +4788,7 @@
+ 
+ static inline void skb_ext_reset(struct sk_buff *skb)
+ {
++	skb_hnat_accounting_revoke(skb);
+ 	if (unlikely(skb->active_extensions)) {
+ 		__skb_ext_put(skb->extensions);
+ 		skb->active_extensions = 0;
+@@ -4786,6 +4811,7 @@
+ static inline void nf_reset_ct(struct sk_buff *skb)
+ {
+ #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
++	skb_hnat_accounting_revoke(skb);
+ 	nf_conntrack_put(skb_nfct(skb));
+ 	skb->_nfct = 0;
+ #endif
+@@ -4810,6 +4836,7 @@
+ 			     bool copy)
+ {
+ #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
++	skb_hnat_accounting_revoke(dst);
+ 	dst->_nfct = src->_nfct;
+ 	nf_conntrack_get(skb_nfct(src));
+ #endif
+@@ -4822,6 +4849,7 @@
+ static inline void nf_copy(struct sk_buff *dst, const struct sk_buff *src)
+ {
+ #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
++	skb_hnat_accounting_revoke(dst);
+ 	nf_conntrack_put(skb_nfct(dst));
+ #endif
+ 	dst->slow_gro = src->slow_gro;
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -77,6 +77,9 @@
+ #include <net/page_pool/helpers.h>
+ #include <net/dropreason.h>
+ #include <net/ra_nat.h>
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++#include <net/netfilter/nf_hnat_packet_accounting.h>
++#endif
+ 
+ #include <linux/uaccess.h>
+ #include <trace/events/skb.h>
+@@ -4812,6 +4815,9 @@
+ #define SKB_EXT_CHUNKSIZEOF(x)	(ALIGN((sizeof(x)), SKB_EXT_ALIGN_VALUE) / SKB_EXT_ALIGN_VALUE)
+ 
+ static const u8 skb_ext_type_len[] = {
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	[SKB_EXT_HNAT_ACCOUNTING] = SKB_EXT_CHUNKSIZEOF(struct nf_hnat_packet_accounting),
++#endif
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	[SKB_EXT_BRIDGE_NF] = SKB_EXT_CHUNKSIZEOF(struct nf_bridge_info),
+ #endif
+@@ -6719,6 +6725,7 @@
+ {
+ 	unsigned int newlen, newoff = SKB_EXT_CHUNKSIZEOF(*ext);
+ 
++	skb_hnat_accounting_revoke(skb);
+ 	skb_ext_put(skb);
+ 	newlen = newoff + skb_ext_type_len[id];
+ 	ext->chunks = newlen;
+@@ -6800,6 +6807,10 @@
+ 	struct skb_ext *ext = skb->extensions;
+ 
+ 	skb->active_extensions &= ~(1 << id);
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	if (id == SKB_EXT_HNAT_ACCOUNTING)
++		skb_hnat_accounting_revoke(skb);
++#endif
+ 	if (skb->active_extensions == 0) {
+ 		skb->extensions = NULL;
+ 		__skb_ext_put(ext);
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -1,6 +1,16 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ menu "Core Netfilter Configuration"
+ 	depends on INET && NETFILTER
++
++config NF_HNAT_PACKET_ACCOUNTING
++	bool "MediaTek HNAT packet delta accounting (experimental)"
++	depends on NF_CONNTRACK=y
++	select SKB_EXTENSIONS
++	default n
++	help
++	  Matching HNAT producer marks synthetic keepalives before software
++	  accounting and publishes immutable per-packet hardware deltas.
++	  Unmarked packets retain the vendor legacy accounting path.
+ 
+ config NETFILTER_INGRESS
+ 	bool "Netfilter ingress support"
+--- a/net/netfilter/nft_counter.c
++++ b/net/netfilter/nft_counter.c
+@@ -17,6 +17,9 @@
+ #include <net/netfilter/nf_tables_offload.h>
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++#include <net/netfilter/nf_hnat_packet_accounting.h>
++#endif
+ static struct __attribute__((__packed__)) hnat_desc {
+        u32 entry : 18;
+        #if defined(CONFIG_MEDIATEK_NETSYS_RX_V2)
+@@ -67,6 +70,10 @@
+ 	s64 bytes = 0;
+         s64 packets = 0;
+ 
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	bool packet_delta = nf_hnat_packet_accounting_get(pkt->skb, (u64 *)&bytes, (u64 *)&packets);
++	if (!packet_delta)
++#endif
+ 	if (unlikely(skb_hnat_reason(pkt->skb) == HIT_BIND_KEEPALIVE_DUP_OLD_HDR)){
+                ct = nf_ct_get(pkt->skb, &ctinfo);
+                if (ct) {
+@@ -84,8 +91,14 @@
+ 	nft_sync = this_cpu_ptr(&nft_counter_sync);
+ 
+ 	u64_stats_update_begin(nft_sync);
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	if (!packet_delta) {
++#endif
+ 	u64_stats_add(&this_cpu->bytes, pkt->skb->len);
+ 	u64_stats_inc(&this_cpu->packets);
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	}
++#endif
+ 	u64_stats_add(&this_cpu->bytes, bytes);
+ 	u64_stats_add(&this_cpu->packets, packets);
+ 	u64_stats_update_end(nft_sync);
+--- a/net/ipv4/netfilter/ip_tables.c
++++ b/net/ipv4/netfilter/ip_tables.c
+@@ -28,6 +28,9 @@
+ #include "../../netfilter/xt_repldata.h"
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++#include <net/netfilter/nf_hnat_packet_accounting.h>
++#endif
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
+@@ -328,6 +331,13 @@
+ 	if (ipt_handle_default_rule(e, &verdict)) {
+ 		struct xt_counters *counter;
+ 		counter = xt_get_this_cpu_counter(&e->counters);
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++		{
++			u64 delta_bytes, delta_packets;
++			if (nf_hnat_packet_accounting_get(skb, &delta_bytes, &delta_packets))
++				ADD_COUNTER(*counter, delta_bytes, delta_packets);
++			else {
++#endif
+ 		ADD_COUNTER(*counter, skb->len, 1);
+ 		
+ 		if (unlikely(skb_hnat_reason(skb) == HIT_BIND_KEEPALIVE_DUP_OLD_HDR)){
+@@ -341,6 +351,10 @@
+ 				  }
+ 			}
+ 		}
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++			}
++		}
++#endif
+ 
+ 			
+ 		local_bh_enable();
+@@ -397,6 +411,13 @@
+ 		}
+ 
+ 		counter = xt_get_this_cpu_counter(&e->counters);
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++		{
++			u64 delta_bytes, delta_packets;
++			if (nf_hnat_packet_accounting_get(skb, &delta_bytes, &delta_packets))
++				ADD_COUNTER(*counter, delta_bytes, delta_packets);
++			else {
++#endif
+ 		ADD_COUNTER(*counter, skb->len, 1);
+ 		if (unlikely(skb_hnat_reason(skb) == HIT_BIND_KEEPALIVE_DUP_OLD_HDR)){
+ 		ct = nf_ct_get(skb, &ctinfo);
+@@ -409,6 +430,10 @@
+ 				  }
+ 			}
+ 		}
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++			}
++		}
++#endif
+ 
+ 		t = ipt_get_target_c(e);
+ 		WARN_ON(!t->u.kernel.target);
+--- a/net/ipv6/netfilter/ip6_tables.c
++++ b/net/ipv6/netfilter/ip6_tables.c
+@@ -32,6 +32,9 @@
+ #include "../../netfilter/xt_repldata.h"
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++#include <net/netfilter/nf_hnat_packet_accounting.h>
++#endif
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
+@@ -345,6 +348,13 @@
+ 		}
+ 
+ 		counter = xt_get_this_cpu_counter(&e->counters);
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++		{
++			u64 delta_bytes, delta_packets;
++			if (nf_hnat_packet_accounting_get(skb, &delta_bytes, &delta_packets))
++				ADD_COUNTER(*counter, delta_bytes, delta_packets);
++			else {
++#endif
+ 		ADD_COUNTER(*counter, skb->len, 1);
+ 		
+ 		if (unlikely(skb_hnat_reason(skb) == HIT_BIND_KEEPALIVE_DUP_OLD_HDR)){
+@@ -358,6 +368,10 @@
+ 				  }
+ 			}
+ 		}
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++			}
++		}
++#endif
+ 
+ 			
+ 		t = ip6t_get_target_c(e);
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -41,6 +41,9 @@
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++#include <net/netfilter/nf_hnat_packet_accounting.h>
++#endif
+ #include <net/netfilter/nf_conntrack_qos.h>
+ #include <net/netfilter/nf_conntrack_ecache.h>
+ #include <net/netfilter/nf_conntrack_zones.h>
+@@ -1975,7 +1978,7 @@
+ 		if ((tmpl && !nf_ct_is_template(tmpl)) ||
+ 		     ctinfo == IP_CT_UNTRACKED)
+ 			return NF_ACCEPT;
+-		skb->_nfct = 0;
++		skb_set_nfct(skb, 0);
+ 	}
+ 
+ 	/* rcu_read_lock()ed by nf_hook_thresh */
+@@ -2019,8 +2022,8 @@
+ 	if (ret <= 0) {
+ 		/* Invalid: inverse of the return code tells
+ 		 * the netfilter core what to do */
++		skb_set_nfct(skb, 0);
+ 		nf_ct_put(ct);
+-		skb->_nfct = 0;
+ 		/* Special case: TCP tracker reports an attempt to reopen a
+ 		 * closed/aborted connection. We have to go back and create a
+ 		 * fresh conntrack.
+@@ -2066,6 +2069,28 @@
+ EXPORT_SYMBOL_GPL(nf_conntrack_alter_reply);
+ 
+ /* Refresh conntrack for this many jiffies and do accounting if do_acct is 1 */
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++static atomic_t hnat_packet_accounting_users = ATOMIC_INIT(0);
++
++void nf_hnat_packet_accounting_enable(void)
++{
++	atomic_inc(&hnat_packet_accounting_users);
++}
++EXPORT_SYMBOL_GPL(nf_hnat_packet_accounting_enable);
++
++void nf_hnat_packet_accounting_disable(void)
++{
++	WARN_ON_ONCE(atomic_dec_if_positive(&hnat_packet_accounting_users) < 0);
++}
++EXPORT_SYMBOL_GPL(nf_hnat_packet_accounting_disable);
++
++bool nf_hnat_packet_accounting_active(void)
++{
++	return atomic_read(&hnat_packet_accounting_users) > 0;
++}
++EXPORT_SYMBOL_GPL(nf_hnat_packet_accounting_active);
++#endif
++
+ void __nf_ct_refresh_acct(struct nf_conn *ct,
+ 			  enum ip_conntrack_info ctinfo,
+ 			  const struct sk_buff *skb,
+@@ -2083,6 +2108,10 @@
+ 	if (READ_ONCE(ct->timeout) != extra_jiffies)
+ 		WRITE_ONCE(ct->timeout, extra_jiffies);
+ acct:
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	if (nf_hnat_packet_accounting_is_synthetic(skb))
++		do_acct = false;
++#endif
+ 	if (do_acct)
+ 		nf_ct_acct_update(ct, CTINFO2DIR(ctinfo), skb->len);
+ }
+@@ -2092,7 +2121,10 @@
+ 		     enum ip_conntrack_info ctinfo,
+ 		     const struct sk_buff *skb)
+ {
+-	nf_ct_acct_update(ct, CTINFO2DIR(ctinfo), skb->len);
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	if (!nf_hnat_packet_accounting_is_synthetic(skb))
++#endif
++		nf_ct_acct_update(ct, CTINFO2DIR(ctinfo), skb->len);
+ 
+ 	return nf_ct_delete(ct, 0, 0);
+ }
+--- a/net/bridge/br_netfilter_hooks.c
++++ b/net/bridge/br_netfilter_hooks.c
+@@ -633,7 +633,7 @@
+ 	 */
+ 	ct_hook = rcu_dereference(nf_ct_hook);
+ 	if (!ct_hook) {
+-		skb->_nfct = 0ul;
++		skb_set_nfct(skb, 0);
+ 		nf_conntrack_put(nfct);
+ 		return NF_ACCEPT;
+ 	}
+--- /dev/null
++++ b/include/net/netfilter/nf_hnat_packet_accounting.h
+@@ -0,0 +1,111 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NF_HNAT_PACKET_ACCOUNTING_H
++#define _NF_HNAT_PACKET_ACCOUNTING_H
++#include <linux/skbuff.h>
++
++struct nf_hnat_packet_accounting {
++	u64 bytes;
++	u64 packets;
++	unsigned long nfct;
++};
++
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++/* Module lifetime references: native ordinary counters while any producer is
++ * enabled. Synthetic skb state remains authoritative after producer shutdown.
++ */
++void nf_hnat_packet_accounting_enable(void);
++void nf_hnat_packet_accounting_disable(void);
++bool nf_hnat_packet_accounting_active(void);
++
++/* First visit only. Copies and terminal zero never become producers again. */
++static inline bool nf_hnat_packet_accounting_mark(struct sk_buff *skb)
++{
++	if (skb->hnat_accounting_state)
++		return false;
++	skb->hnat_accounting_state = 1;
++	return true;
++}
++
++static inline bool nf_hnat_packet_accounting_is_synthetic(const struct sk_buff *skb)
++{
++	return skb->hnat_accounting_state != 0;
++}
++
++static inline void nf_hnat_packet_accounting_finish_zero(struct sk_buff *skb)
++{
++	if (skb->hnat_accounting_state == 1)
++		skb->hnat_accounting_state = 3;
++}
++
++/* Reserve before consuming ledger. Only this helper may obtain writable COW
++ * storage. Failure leaves pending data in the producer's ledger.
++ */
++static inline bool nf_hnat_packet_accounting_prepare(struct sk_buff *skb)
++{
++	struct nf_hnat_packet_accounting *acct;
++
++	if (skb->hnat_accounting_state != 1 || !skb_get_nfct(skb))
++		return false;
++	acct = skb_ext_add(skb, SKB_EXT_HNAT_ACCOUNTING);
++	if (!acct) {
++		nf_hnat_packet_accounting_finish_zero(skb);
++		return false;
++	}
++	acct->bytes = 0;
++	acct->packets = 0;
++	acct->nfct = skb_get_nfct(skb);
++	return true;
++}
++
++/* Caller serializes this skb, calls prepare before taking its ledger and
++ * changes neither extensions nor CT identity between prepare and publish.
++ * Identity holds via skb's existing CT reference; reset/copy/set revoke.
++ */
++static inline bool nf_hnat_packet_accounting_publish(struct sk_buff *skb,
++						   u64 bytes, u64 packets)
++{
++	struct nf_hnat_packet_accounting *acct;
++
++	if (skb->hnat_accounting_state != 1 || !skb_get_nfct(skb))
++		return false;
++	acct = skb_ext_find(skb, SKB_EXT_HNAT_ACCOUNTING);
++	if (!acct || acct->nfct != skb_get_nfct(skb))
++		return false;
++	/* prepare reserved exclusive storage; never publish to a shared ext. */
++	if (refcount_read(&skb->extensions->refcnt) != 1)
++		return false;
++	acct->bytes = bytes;
++	acct->packets = packets;
++	acct->nfct = skb_get_nfct(skb);
++	skb->hnat_accounting_state = 2;
++	return true;
++}
++
++/* false: execute unchanged vendor legacy path. true: replace len/1 with
++ * complete immutable pair, including zero. Reading never consumes totals.
++ */
++static inline bool nf_hnat_packet_accounting_get(const struct sk_buff *skb,
++					       u64 *bytes, u64 *packets)
++{
++	const struct nf_hnat_packet_accounting *acct;
++
++	if (!nf_hnat_packet_accounting_is_synthetic(skb)) {
++		if (!nf_hnat_packet_accounting_active())
++			return false;
++		*bytes = skb->len;
++		*packets = 1;
++		return true;
++	}
++	*bytes = 0;
++	*packets = 0;
++	if (skb->hnat_accounting_state != 2)
++		return true;
++	acct = skb_ext_find(skb, SKB_EXT_HNAT_ACCOUNTING);
++	if (acct && acct->nfct == skb_get_nfct(skb)) {
++		*bytes = acct->bytes;
++		*packets = acct->packets;
++	}
++	return true;
++}
++#endif
++#endif

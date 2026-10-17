@@ -928,7 +928,9 @@ struct xlat_conf {
 	int prefix_len;
 };
 
+struct hnat_account_ctx;
 struct mtk_hnat {
+	struct hnat_account_ctx *account;
 	struct device *dev;
 	void __iomem *fe_base;
 	void __iomem *ppe_base[MAX_PPE_NUM];
@@ -1327,6 +1329,8 @@ int mtk_sw_nat_hook_rx(struct sk_buff *skb);
 void foe_clear_all_bind_entries(void);
 void mtk_ppe_dev_register_hook(struct net_device *dev);
 void mtk_ppe_dev_unregister_hook(struct net_device *dev);
+bool hnat_external_callback_enter(void);
+void hnat_external_callback_exit(void);
 int nf_hnat_netdevice_event(struct notifier_block *unused, unsigned long event,
 			    void *ptr);
 int nf_hnat_netevent_handler(struct notifier_block *unused, unsigned long event,
@@ -1349,6 +1353,9 @@ int mtk_ppe_get_xlat_v6_by_v4(u32 *ipv4, struct in6_addr *ipv6,
 
 struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
 				       u32 index, struct hnat_accounting *diff);
+
+/* Experimental accounting declarations require the structs above. */
+#include "hnat_account.h"
 
 static inline u16 foe_timestamp(struct mtk_hnat *h)
 {

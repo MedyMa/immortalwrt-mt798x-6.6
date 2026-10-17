@@ -21,10 +21,15 @@
 #include <net/ipv6.h>
 #include <net/ip6_route.h>
 #include <net/ip.h>
+#include <net/route.h>
+#include <net/addrconf.h>
 #include <net/tcp.h>
 #include <net/udp.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_acct.h>
+#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
+#include <net/netfilter/nf_hnat_packet_accounting.h>
+#endif
 
 #include "nf_hnat_mtk.h"
 #include "hnat.h"
@@ -47,6 +52,7 @@
 		 get_wandev_from_index(skb->vlan_tci & VLAN_VID_MASK)))
 #define do_mape_w2l_fast(dev, skb)                                          \
 		(mape_toggle && IS_WAN(dev) && (!is_from_mape(skb)))
+
 extern struct net_device *ppd_dev;
 static struct ipv6hdr mape_l2w_v6h;
 static struct ipv6hdr mape_w2l_v6h;
@@ -228,7 +234,8 @@ static void foe_clear_ethdev_bind_entries(struct net_device *dev)
 {
 	struct net_device *master_dev = dev;
 	const struct dsa_port *dp;
-	struct foe_entry *entry;
+	struct foe_entry *entry, snapshot;
+	u64 account_generation = 0;
 	struct mtk_mac *mac;
 	bool match_dev = false;
 	int port_id, gmac;
@@ -253,6 +260,12 @@ static void foe_clear_ethdev_bind_entries(struct net_device *dev)
 	for (i = 0; i < CFG_PPE_NUM; i++) {
 		for (hash_index = 0; hash_index < hnat_priv->foe_etry_num; hash_index++) {
 			entry = hnat_priv->foe_table_cpu[i] + hash_index;
+			if (hnat_account_enabled(hnat_priv)) {
+				if (!hnat_account_clear_snapshot(hnat_priv, i, hash_index,
+							 &snapshot, &account_generation))
+					continue;
+				entry = &snapshot;
+			}
 			if (!entry_hnat_is_bound(entry))
 				continue;
 			match_dev = (IS_IPV4_GRP(entry)) ? entry->ipv4_hnapt.iblk2.dp == gmac :
@@ -269,9 +282,12 @@ static void foe_clear_ethdev_bind_entries(struct net_device *dev)
 				}
 			}
 			if (match_dev) {
-				entry->bfib1.state = INVALID;
-				entry->bfib1.time_stamp =
+				if (!hnat_account_clear_if_generation(hnat_priv, i, hash_index,
+							 false, account_generation)) {
+					entry->bfib1.state = INVALID;
+					entry->bfib1.time_stamp =
 					readl((hnat_priv->fe_base + 0x0010)) & 0xFF;
+				}
 				total++;
 			}
 		}
@@ -296,10 +312,11 @@ int ext_if_del(struct extdev_entry *ext_entry)
 	return i;
 }
 
-void foe_clear_all_bind_entries(void)
+static void foe_clear_all_bind_entries_body(void)
 {
 	int i, hash_index;
-	struct foe_entry *entry;
+	struct foe_entry *entry, snapshot;
+	u64 account_generation = 0;
 
 	for (i = 0; i < CFG_PPE_NUM; i++) {
 		cr_set_field(hnat_priv->ppe_base[i] + PPE_TB_CFG,
@@ -307,10 +324,19 @@ void foe_clear_all_bind_entries(void)
 
 		for (hash_index = 0; hash_index < hnat_priv->foe_etry_num; hash_index++) {
 			entry = hnat_priv->foe_table_cpu[i] + hash_index;
+			if (hnat_account_enabled(hnat_priv)) {
+				if (!hnat_account_clear_snapshot(hnat_priv, i, hash_index,
+							 &snapshot, &account_generation))
+					continue;
+				entry = &snapshot;
+			}
 			if (entry->bfib1.state == BIND) {
-				entry->ipv4_hnapt.udib1.state = INVALID;
-				entry->ipv4_hnapt.udib1.time_stamp =
+				if (!hnat_account_clear_if_generation(hnat_priv, i, hash_index,
+							 false, account_generation)) {
+					entry->ipv4_hnapt.udib1.state = INVALID;
+					entry->ipv4_hnapt.udib1.time_stamp =
 					readl((hnat_priv->fe_base + 0x0010)) & 0xFF;
+				}
 			}
 		}
 	}
@@ -319,6 +345,14 @@ void foe_clear_all_bind_entries(void)
 	hnat_cache_ebl(1);
 
 	mod_timer(&hnat_priv->hnat_sma_build_entry_timer, jiffies + 3 * HZ);
+}
+
+void foe_clear_all_bind_entries(void)
+{
+	if (!hnat_external_callback_enter())
+		return;
+	foe_clear_all_bind_entries_body();
+	hnat_external_callback_exit();
 }
 
 static void gmac_ppe_fwd_enable(struct net_device *dev)
@@ -470,7 +504,8 @@ void foe_clear_entry(struct neighbour *neigh)
 {
 	u32 *daddr = (u32 *)neigh->primary_key;
 	unsigned char h_dest[ETH_ALEN];
-	struct foe_entry *entry;
+	struct foe_entry *entry, snapshot;
+	u64 account_generation = 0;
 	int i, hash_index;
 	u32 dip;
 
@@ -482,6 +517,12 @@ void foe_clear_entry(struct neighbour *neigh)
 
 		for (hash_index = 0; hash_index < hnat_priv->foe_etry_num; hash_index++) {
 			entry = hnat_priv->foe_table_cpu[i] + hash_index;
+			if (hnat_account_enabled(hnat_priv)) {
+				if (!hnat_account_clear_snapshot(hnat_priv, i, hash_index,
+							 &snapshot, &account_generation))
+					continue;
+				entry = &snapshot;
+			}
 			if (entry->bfib1.state == BIND &&
 			    entry->ipv4_hnapt.new_dip == ntohl(dip) &&
 			    IS_IPV4_HNAPT(entry)) {
@@ -492,9 +533,12 @@ void foe_clear_entry(struct neighbour *neigh)
 					cr_set_field(hnat_priv->ppe_base[i] + PPE_TB_CFG,
 						     SMA, SMA_ONLY_FWD_CPU);
 
-					entry->ipv4_hnapt.udib1.state = INVALID;
-					entry->ipv4_hnapt.udib1.time_stamp =
-						readl((hnat_priv->fe_base + 0x0010)) & 0xFF;
+					if (!hnat_account_clear_if_generation(hnat_priv, i, hash_index,
+							 false, account_generation)) {
+						entry->ipv4_hnapt.udib1.state = INVALID;
+						entry->ipv4_hnapt.udib1.time_stamp =
+							readl((hnat_priv->fe_base + 0x0010)) & 0xFF;
+					}
 
 					/* clear HWNAT cache */
 					hnat_cache_ebl(1);
@@ -675,7 +719,8 @@ unsigned int do_hnat_ge_to_ext(struct sk_buff *skb, const char *func)
 {
 	/*set where we to go*/
 	u8 index;
-	struct foe_entry *entry;
+	struct foe_entry *entry, snapshot;
+	u64 account_generation = 0;
 	struct net_device *dev;
 
 	if (skb_hnat_entry(skb) >= hnat_priv->foe_etry_num ||
@@ -683,6 +728,12 @@ unsigned int do_hnat_ge_to_ext(struct sk_buff *skb, const char *func)
 		return -1;
 
 	entry = &hnat_priv->foe_table_cpu[skb_hnat_ppe(skb)][skb_hnat_entry(skb)];
+	if (hnat_account_enabled(hnat_priv)) {
+		if (!hnat_account_clear_snapshot(hnat_priv, skb_hnat_ppe(skb),
+					 skb_hnat_entry(skb), &snapshot, &account_generation))
+			return -1;
+		entry = &snapshot;
+	}
 
 	if (IS_IPV4_GRP(entry))
 		index = entry->ipv4_hnapt.act_dp & UDF_PINGPONG_IFIDX;
@@ -740,11 +791,14 @@ unsigned int do_hnat_ge_to_ext(struct sk_buff *skb, const char *func)
 	}
 	/*if external devices is down, invalidate related ppe entry*/
 	if (entry_hnat_is_bound(entry)) {
-		entry->bfib1.state = INVALID;
-		if (IS_IPV4_GRP(entry))
-			entry->ipv4_hnapt.act_dp &= ~UDF_PINGPONG_IFIDX;
-		else
-			entry->ipv6_5t_route.act_dp &= ~UDF_PINGPONG_IFIDX;
+		if (!hnat_account_clear_if_generation(hnat_priv, skb_hnat_ppe(skb),
+						      skb_hnat_entry(skb), false, account_generation)) {
+			entry->bfib1.state = INVALID;
+			if (IS_IPV4_GRP(entry))
+				entry->ipv4_hnapt.act_dp &= ~UDF_PINGPONG_IFIDX;
+			else
+				entry->ipv6_5t_route.act_dp &= ~UDF_PINGPONG_IFIDX;
+		}
 
 		/* clear HWNAT cache */
 		hnat_cache_ebl(1);
@@ -907,6 +961,7 @@ static unsigned int is_ppe_support_type(struct sk_buff *skb)
 	struct iphdr *iph = NULL;
 	struct ipv6hdr *ip6h = NULL;
 	struct iphdr _iphdr;
+	struct net *net = skb->dev ? dev_net(skb->dev) : &init_net;
 
 	eth = eth_hdr(skb);
 	if (!is_magic_tag_valid(skb) || !IS_SPACE_AVAILABLE_HEAD(skb) ||
@@ -921,6 +976,11 @@ static unsigned int is_ppe_support_type(struct sk_buff *skb)
 		if ((iph->protocol == IPPROTO_TCP) ||
 		    (iph->protocol == IPPROTO_UDP) ||
 		    (iph->protocol == IPPROTO_IPV6)) {
+			/* Keep locally terminated traffic in software, including VRFs. */
+			if ((skb->dev ? inet_addr_type_dev_table(net, skb->dev, iph->daddr) :
+			     inet_addr_type(net, iph->daddr)) == RTN_LOCAL)
+				return 0;
+
 			return 1;
 		}
 
@@ -930,6 +990,11 @@ static unsigned int is_ppe_support_type(struct sk_buff *skb)
 
 		if ((ip6h->nexthdr == NEXTHDR_TCP) ||
 		    (ip6h->nexthdr == NEXTHDR_UDP)) {
+			/* Same local-destination guard as IPv4 above. */
+			if ((ipv6_addr_type(&ip6h->daddr) & IPV6_ADDR_UNICAST) &&
+			    ipv6_chk_addr(net, &ip6h->daddr, NULL, 0))
+				return 0;
+
 			return 1;
 		} else if (ip6h->nexthdr == NEXTHDR_IPIP) {
 			iph = skb_header_pointer(skb, IPV6_HDR_LEN,
@@ -1017,6 +1082,11 @@ static void mtk_hnat_nf_update(struct sk_buff *skb)
  
 	ct = nf_ct_get(skb, &ctinfo);
 	if (ct) {
+		if (hnat_account_enabled(hnat_priv)) {
+			hnat_account_publish_delta(hnat_priv, skb_hnat_ppe(skb),
+						   skb_hnat_entry(skb), skb);
+			return;
+		}
 		if (!hnat_get_count(hnat_priv, skb_hnat_ppe(skb), skb_hnat_entry(skb), &diff))
 			return;
 
@@ -1033,6 +1103,19 @@ static void mtk_hnat_nf_update(struct sk_buff *skb)
 }
 
 
+/* Before conntrack/raw: verified keepalive metadata marks a synthetic packet
+ * without allocation. Runtime-off packets retain the vendor counter contract.
+ */
+static void mtk_hnat_account_mark_keepalive(struct sk_buff *skb)
+{
+#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
+	if (hnat_account_enabled(hnat_priv) && IS_SPACE_AVAILABLE_HEAD(skb) &&
+	    is_magic_tag_valid(skb) &&
+	    skb_hnat_reason(skb) == HIT_BIND_KEEPALIVE_DUP_OLD_HDR)
+		nf_hnat_packet_accounting_mark(skb);
+#endif
+}
+
 /* update hnat count to nf_conntrack and iptables by keepalive */
 static unsigned int
 mtk_hnat_nf_conntrack(void *priv, struct sk_buff *skb,
@@ -1046,6 +1129,12 @@ mtk_hnat_nf_conntrack(void *priv, struct sk_buff *skb,
 		if (hnat_priv->data->per_flow_accounting && hnat_priv->nf_stat_en)
 			mtk_hnat_nf_update(skb);}
 		
+#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
+	/* No CT, disabled statistics, or a rejected owner is still synthetic zero. */
+	if (hnat_account_enabled(hnat_priv))
+		nf_hnat_packet_accounting_finish_zero(skb);
+#endif
+
 	return NF_ACCEPT;
 	
 drop:
@@ -1061,6 +1150,7 @@ mtk_hnat_ipv6_nf_pre_routing(void *priv, struct sk_buff *skb,
 {
 	if (!skb)
 		goto drop;
+	mtk_hnat_account_mark_keepalive(skb);
 	if (!IS_WHNAT(state->in) && IS_EXT(state->in)) {
 		if (unlikely(skb_shinfo(skb)->frag_list))
         	return NF_ACCEPT;
@@ -1138,6 +1228,7 @@ mtk_hnat_ipv4_nf_pre_routing(void *priv, struct sk_buff *skb,
 
 	if (!skb)
 		goto drop;
+	mtk_hnat_account_mark_keepalive(skb);
 		
 	if (!IS_WHNAT(state->in) && IS_EXT(state->in)) {
 		if (unlikely(skb_shinfo(skb)->frag_list))
@@ -2204,29 +2295,29 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 			entry.ipv6_5t_route.act_dp |= UDF_HNAT_PRE_FILLED;
 	}
 
-	/* We must ensure all info has been updated before set to hw */
-	wmb();
-	/* Before entry enter BIND state, write other fields first,
-	 * prevent racing with hardware accesses.
-	 */
-	memcpy(&(foe->ipv6_hnapt.ipv6_sip0), &(entry.ipv6_hnapt.ipv6_sip0),
-		       sizeof(struct foe_entry) - sizeof(entry.bfib1));
-	/* We must ensure all info has been updated before set to hw */
-	wmb();
-	/* After other fields have been written, write info1 to BIND the entry */
-	memcpy(&foe->bfib1, &entry.bfib1, sizeof(entry.bfib1));
-	dma_wmb();
-	/*reset statistic for this entry*/
-	if (hnat_priv->data->per_flow_accounting &&
-	    skb_hnat_entry(skb) < hnat_priv->foe_etry_num &&
-	    skb_hnat_ppe(skb) < CFG_PPE_NUM)
-		memset(&hnat_priv->acct[skb_hnat_ppe(skb)][skb_hnat_entry(skb)],0, sizeof(struct mib_entry));
+	if (!hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
+				 skb_hnat_entry(skb), skb, &entry, whnat, false, 0)) {
+		/* Reset before BIND publication; software object is not mib_entry. */
+		if (hnat_priv->data->per_flow_accounting &&
+		    skb_hnat_entry(skb) < hnat_priv->foe_etry_num &&
+		    skb_hnat_ppe(skb) < CFG_PPE_NUM &&
+		    hnat_priv->acct[skb_hnat_ppe(skb)])
+			memset(&hnat_priv->acct[skb_hnat_ppe(skb)][skb_hnat_entry(skb)],
+			       0, sizeof(struct hnat_accounting));
+		memcpy((u8 *)foe + sizeof(entry.bfib1),
+		       (u8 *)&entry + sizeof(entry.bfib1),
+		       sizeof(entry) - sizeof(entry.bfib1));
+		wmb();
+		memcpy(&foe->bfib1, &entry.bfib1, sizeof(entry.bfib1));
+		dma_wmb();
+	}
 	return 0;
 }
 
 int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 {
 	struct foe_entry *hw_entry, entry;
+	u64 account_generation = 0;
 	struct ethhdr *eth;
 
 	if (skb_hnat_alg(skb) ||
@@ -2254,7 +2345,9 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 		return NF_ACCEPT;
 
 	hw_entry = &hnat_priv->foe_table_cpu[skb_hnat_ppe(skb)][skb_hnat_entry(skb)];
-	memcpy(&entry, hw_entry, sizeof(entry));
+	if (!hnat_account_entry_snapshot(hnat_priv, skb_hnat_ppe(skb),
+					 skb_hnat_entry(skb), &entry, &account_generation))
+		memcpy(&entry, hw_entry, sizeof(entry));
 	if (entry.bfib1.state == BIND)
 		return NF_ACCEPT;
 
@@ -2485,18 +2578,15 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 		entry.ipv4_hnapt.act_dp &= ~UDF_HNAT_PRE_FILLED;
 	else
 		entry.ipv6_5t_route.act_dp &= ~UDF_HNAT_PRE_FILLED;
-	/* We must ensure all info has been updfated before set to hw */
-	wmb();
-	/* Before entry enter BIND state, write other fields first,
-         * prevent racing with hardware accesses.
-         */
-	memcpy(&(hw_entry->ipv6_hnapt.ipv6_sip0), &(entry.ipv6_hnapt.ipv6_sip0),
-		       sizeof(struct foe_entry) - sizeof(entry.bfib1));
-        /* We must ensure all info has been updated before set to hw */
-        wmb();
-        /* After other fields have been writtefn, write info1 to BIND the entry */
-        memcpy(&hw_entry->bfib1, &entry.bfib1, sizeof(entry.bfib1));
-        dma_wmb();
+	if (!hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
+				 skb_hnat_entry(skb), skb, &entry, false, true, account_generation)) {
+		memcpy((u8 *)hw_entry + sizeof(entry.bfib1),
+		       (u8 *)&entry + sizeof(entry.bfib1),
+		       sizeof(entry) - sizeof(entry.bfib1));
+		wmb();
+		memcpy(&hw_entry->bfib1, &entry.bfib1, sizeof(entry.bfib1));
+		dma_wmb();
+	}
 
 #if defined(CONFIG_MEDIATEK_NETSYS_V3)
 	if (debug_level >= 7) {
@@ -2575,7 +2665,7 @@ int mtk_sw_nat_hook_rx(struct sk_buff *skb)
 	return NF_ACCEPT;
 }
 
-void mtk_ppe_dev_register_hook(struct net_device *dev)
+static void mtk_ppe_dev_register_hook_body(struct net_device *dev)
 {
 	int i, number = 0;
 	struct extdev_entry *ext_entry;
@@ -2626,7 +2716,16 @@ add_wifi_hook_if:
 	pr_info("%s : ineterface %s register (%d)\n", __func__, dev->name, i);
 }
 
-void mtk_ppe_dev_unregister_hook(struct net_device *dev)
+void mtk_ppe_dev_register_hook(struct net_device *dev)
+{
+	if (!hnat_external_callback_enter())
+		return;
+	if (hnat_priv->data->whnat)
+		mtk_ppe_dev_register_hook_body(dev);
+	hnat_external_callback_exit();
+}
+
+static void mtk_ppe_dev_unregister_hook_body(struct net_device *dev)
 {
 	int i;
 
@@ -2641,6 +2740,15 @@ void mtk_ppe_dev_unregister_hook(struct net_device *dev)
 
 	extif_put_dev(dev);
 	pr_info("%s : ineterface %s set null (%d)\n", __func__, dev->name, i);
+}
+
+void mtk_ppe_dev_unregister_hook(struct net_device *dev)
+{
+	if (!hnat_external_callback_enter())
+		return;
+	if (hnat_priv->data->whnat)
+		mtk_ppe_dev_unregister_hook_body(dev);
+	hnat_external_callback_exit();
 }
 
 static unsigned int mtk_hnat_accel_type(struct sk_buff *skb)
@@ -2972,6 +3080,10 @@ int mtk_464xlat_post_process(struct sk_buff *skb, const struct net_device *out)
 	if (headroom[hash].crsn != HIT_UNBIND_RATE_REACH)
 		return -1;
 
+	if (headroom_ppe(headroom[hash]) >= CFG_PPE_NUM ||
+	    headroom_ppe(headroom[hash]) >= MAX_PPE_NUM ||
+	    !hnat_priv->foe_table_cpu[headroom_ppe(headroom[hash])])
+		return -1;
 	foe = &hnat_priv->foe_table_cpu[headroom_ppe(headroom[hash])][hash];
 
 	mtk_464xlat_fill_info1(&entry, skb, l2w);
@@ -2986,7 +3098,9 @@ int mtk_464xlat_post_process(struct sk_buff *skb, const struct net_device *out)
 
 	/* We must ensure all info has been updated before set to hw */
 	wmb();
-	memcpy(foe, &entry, sizeof(struct foe_entry));
+	if (!hnat_account_commit(hnat_priv, headroom_ppe(headroom[hash]),
+				 hash, NULL, &entry, false, false, 0))
+		memcpy(foe, &entry, sizeof(struct foe_entry));
 
 	return 0;
 }
