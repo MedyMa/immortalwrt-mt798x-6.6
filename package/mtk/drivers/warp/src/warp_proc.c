@@ -14,6 +14,7 @@
 	warp_proc.c
 */
 #include <linux/ctype.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/proc_fs.h>
 #include <linux/version.h>
@@ -69,38 +70,6 @@ struct proc_global {
 };
 
 static struct proc_global proc_settings;
-
-/**
- * strtok - Split a string into tokens
- * @s: The string to be searched
- * @ct: The characters to search for
- * * WARNING: strtok is deprecated, use strsep instead. However strsep is not compatible with old architecture.
- */
-char *__strtok;
-char *strtok(char *s, const char *ct)
-{
-	char *sbegin, *send;
-
-	sbegin = (s) ? s : __strtok;
-
-	if (!sbegin)
-		return NULL;
-
-	sbegin += strspn(sbegin, ct);
-
-	if (*sbegin == '\0') {
-		__strtok = NULL;
-		return NULL;
-	}
-
-	send = strpbrk(sbegin, ct);
-
-	if (send && *send != '\0')
-		*send++ = '\0';
-
-	__strtok = send;
-	return sbegin;
-}
 
 /*
 *
@@ -1033,10 +1002,36 @@ wo_proc_open(struct inode *inode, struct file *file)
 	return single_open(file, wo_proc_show, pde_data(file_inode(file)));
 }
 
+static char *warp_wo_next_arg(char **cursor)
+{
+	char *arg;
+
+	while ((arg = strsep(cursor, " ")) != NULL) {
+		if (*arg)
+			return arg;
+	}
+
+	return NULL;
+}
+
+static int warp_wo_parse_args(char *buffer, char **input, int max_args)
+{
+	char *cursor = buffer;
+	char *arg;
+	int count = 0;
+
+	while (count < max_args && (arg = warp_wo_next_arg(&cursor)) != NULL)
+		input[count++] = arg;
+
+	return count;
+}
+
 static ssize_t
 wo_proc_write(struct file *file, const char __user *usr_buff, size_t len1, loff_t *ppos)
 {
-	u8 *buffer = NULL, *type = NULL, *sub_str = NULL, *input[11] = {0};
+	u8 *buffer = NULL;
+	char *type = NULL;
+	char *input[11] = {0};
 	struct warp_entry *warp = (struct warp_entry *)pde_data(file_inode(file));
 	int scan_num = 0, input_idx = 0, input_total = 0;
 	struct warp_msg_cmd cmd = {0};
@@ -1044,18 +1039,22 @@ wo_proc_write(struct file *file, const char __user *usr_buff, size_t len1, loff_
 	struct wo_cmd_query *query = (struct wo_cmd_query *)sendmsg_buf;
 	int ret = -1;
 
+	if (!len1)
+		return 0;
+
 	warp_os_alloc_mem((unsigned char **)&buffer, len1+1, GFP_ATOMIC);
 
 	if (buffer && usr_buff) {
 		memset(buffer, 0, len1+1);
 		if (!copy_from_user(buffer, usr_buff, len1)) {
-			buffer[len1-1] = '\0';		/* forcedly replace "new line" character as termenation character */
+			buffer[len1] = '\0';
+			if (buffer[len1 - 1] == '\n')
+				buffer[len1 - 1] = '\0';
 			warp_dbg(WARP_DBG_INF, "(%s) buffer = %s\n", __func__, buffer);
 
-			for (sub_str = strtok(buffer, " "); sub_str && input_idx < 11; sub_str = strtok(NULL, " "), input_idx++, input_total++) {
-				input[input_idx] = sub_str;
+			input_total = warp_wo_parse_args((char *)buffer, input, (int)ARRAY_SIZE(input));
+			for (input_idx = 0; input_idx < input_total; input_idx++)
 				warp_dbg(WARP_DBG_INF, "(%s) arg[%d] = %s(%d)\n", __func__, input_idx, input[input_idx], (u32)strlen(input[input_idx]));
-			}
 
 			warp_dbg(WARP_DBG_INF, "(%s) argc=%d\n", __func__, input_total);
 			type = input[0];
@@ -1094,12 +1093,19 @@ wo_proc_write(struct file *file, const char __user *usr_buff, size_t len1, loff_
 				cmd.msg_len = sizeof(struct wo_cmd_query);
 
 				for (input_idx = 1 ; input_idx < input_total ; input_idx++) {
-					scan_num = sscanf(input[input_idx], "%d", &query->query_arg0+(input_idx-1));
+					int parsed_arg;
+
+					scan_num = sscanf(input[input_idx], "%d", &parsed_arg);
 
 					if (scan_num < 1) {
 						warp_dbg(WARP_DBG_OFF, "(%s) require more input!\n", __func__);
 						goto error;
 					}
+					if (input_idx == 1)
+						query->query_arg0 = parsed_arg;
+					else if (input_idx == 2)
+						query->query_arg1 = parsed_arg;
+					/* Legacy extra args are checked, but the WO query has two fields. */
 				}
 
 				if (strncmp(type, "devinfo", strlen(type)) == 0) {

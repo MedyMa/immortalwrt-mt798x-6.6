@@ -123,7 +123,7 @@ endif
 
 config MTK_HWIFI_FW_BE19000
 	bool "BE19000 custom firmware support"
-	depends on ! MTK_HWIFI_FW_HDR_SUPPORT
+	depends on ! MTK_HWIFI_FW_HDR_SUPPORT && ! MTK_HWIFI_FW_BE14000
 	default n
 
 if MTK_HWIFI_FW_BE19000
