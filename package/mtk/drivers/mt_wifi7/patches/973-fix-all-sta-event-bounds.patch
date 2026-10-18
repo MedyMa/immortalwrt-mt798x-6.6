@@ -1,0 +1,391 @@
+--- a/mt_wifi/chip/mcu/cmm_fw_uni_event.c
++++ b/mt_wifi/chip/mcu/cmm_fw_uni_event.c
+@@ -7300,6 +7300,11 @@
+ 	}
+ }
+ 
++static UINT16 uni_event_all_sta_record_wcid(const void *record)
++{
++	return le2cpu16(get_unaligned((const UINT16 *)record));
++}
++
+ static VOID uni_event_parse_all_sta_tx_rate(
+ 	struct _RTMP_ADAPTER *pAd,
+ 	UINT8 *Data,
+@@ -7310,6 +7315,7 @@
+ 	struct UNI_EVENT_ALL_STA_TX_RATE_T *prEventResult;
+ 	PMAC_TABLE_ENTRY pEntry = NULL;
+ 	UINT32 Idx;
++	UINT16 wcid;
+ 
+ 	union _HTTRANSMIT_SETTING LastTxRate;
+ 	union _HTTRANSMIT_SETTING LastRxRate;
+@@ -7320,7 +7326,8 @@
+ 	prEventResult = (struct UNI_EVENT_ALL_STA_TX_RATE_T *)Data;
+ 
+ 	for (Idx = 0; Idx < StaNum; Idx++) {
+-		pEntry = entry_get(pAd, prEventResult->arTxRateResult[Idx].u2WlanIdx);
++		wcid = uni_event_all_sta_record_wcid(&prEventResult->arTxRateResult[Idx]);
++		pEntry = entry_get(pAd, wcid);
+ 		if (pEntry && pEntry->wdev &&  IS_ENTRY_CLIENT(pEntry) && pEntry->Sst == SST_ASSOC) {
+ 			/*For TX rate*/
+ 			LastTxRate.word = LastRxRate.word = 0;
+@@ -7446,12 +7453,13 @@
+ 	struct UNI_EVENT_ALL_STA_TX_STAT_T *prEventResult = (struct UNI_EVENT_ALL_STA_TX_STAT_T *)Data;
+ 	PMAC_TABLE_ENTRY pEntry = NULL;
+ 	UINT32 Idx;
++	UINT16 wcid;
+ 
+ 	for (Idx = 0; Idx < StaNum; Idx++) {
+ 		struct UNI_EVENT_ONE_STA_TX_STAT_T *prTxStatResult = (struct UNI_EVENT_ONE_STA_TX_STAT_T *)&prEventResult->arTxStatResult[Idx];
+ 
+-		prTxStatResult->u2WlanIdx = le2cpu16(prTxStatResult->u2WlanIdx);
+-		pEntry = entry_get(pAd, prTxStatResult->u2WlanIdx);
++		wcid = uni_event_all_sta_record_wcid(prTxStatResult);
++		pEntry = entry_get(pAd, wcid);
+ 
+ 		if (pEntry && pEntry->wdev && pEntry->Sst == SST_ASSOC &&
+ 		(IS_ENTRY_CLIENT(pEntry) || IS_ENTRY_PEER_AP(pEntry) || IS_ENTRY_REPEATER(pEntry)))
+@@ -7481,14 +7489,17 @@
+ 			if (IS_ENTRY_PEER_AP(pEntry) || IS_ENTRY_REPEATER(pEntry)) {
+ 				struct _STA_ADMIN_CONFIG *apcli = GetStaCfgByWdev(pAd, pEntry->wdev);
+ 
+-				apcli->StaStatistic.TxErrorCount += le2cpu32(prTxStatResult->u4TotalTxFailCount);
+-				apcli->StaStatistic.TxDropCount = apcli->StaStatistic.TxErrorCount;
++				if (apcli) {
++					apcli->StaStatistic.TxErrorCount += le2cpu32(prTxStatResult->u4TotalTxFailCount);
++					apcli->StaStatistic.TxDropCount = apcli->StaStatistic.TxErrorCount;
++				} else
++					pr_warn_ratelimited("mt_wifi: ALL_STA has no APCLI config for station\n");
+ 			}
+ #endif /*APCLI_SUPPORT*/
+ 
+ 		MTWF_DBG(pAd, DBG_CAT_TX, CATTX_TMAC, DBG_LVL_INFO,
+ 			"wlanidx=%d, TxCount=%d TxFailCount=%d\n",
+-			prTxStatResult->u2WlanIdx, le2cpu32(prTxStatResult->u4TotalTxCount),
++			wcid, le2cpu32(prTxStatResult->u4TotalTxCount),
+ 			le2cpu32(prTxStatResult->u4TotalTxFailCount));
+ 
+ 		}
+@@ -7508,11 +7519,13 @@
+ 	struct _RTMP_ADAPTER *pMacEntrypAd = NULL;
+ 	UINT32 tx_bytes_adm[MAX_ACCESS_CAT_NUM] = {0};
+ 	UINT32 rx_bytes_adm[MAX_ACCESS_CAT_NUM] = {0};
++	UINT16 wcid;
+ 
+ 	prEventResult = (struct UNI_EVENT_ALL_STA_TXRX_ADM_STAT_T *)Data;
+ 
+ 	for (Idx = 0; Idx < StaNum; Idx++) {
+-		pEntry = entry_get(pAd, prEventResult->arTxRxAdmStatResult[Idx].u2WlanIdx);
++		wcid = uni_event_all_sta_record_wcid(&prEventResult->arTxRxAdmStatResult[Idx]);
++		pEntry = entry_get(pAd, wcid);
+ 
+ 		if (pEntry && pEntry->wdev && (IS_ENTRY_CLIENT(pEntry) ||
+ 			IS_ENTRY_PEER_AP(pEntry) || IS_ENTRY_REPEATER(pEntry)) && pEntry->Sst == SST_ASSOC) {
+@@ -7589,8 +7602,11 @@
+ 			if (IS_ENTRY_PEER_AP(pEntry) || IS_ENTRY_REPEATER(pEntry)) {
+ 				struct _STA_ADMIN_CONFIG *apcli = GetStaCfgByWdev(pAd, pEntry->wdev);
+ 
+-				apcli->StaStatistic.TransmittedByteCount += tx_bytes;
+-				apcli->StaStatistic.ReceivedByteCount += rx_bytes;
++				if (apcli) {
++					apcli->StaStatistic.TransmittedByteCount += tx_bytes;
++					apcli->StaStatistic.ReceivedByteCount += rx_bytes;
++				} else
++					pr_warn_ratelimited("mt_wifi: ALL_STA has no APCLI config for station\n");
+ 			}
+ #endif /*APCLI_SUPPORT*/
+ 
+@@ -7617,11 +7633,13 @@
+ 	struct UNI_EVENT_ALL_STA_TXRX_AIR_TIME_T *prEventResult;
+ 	PMAC_TABLE_ENTRY pEntry = NULL;
+ 	UINT32 Idx, k;
++	UINT16 wcid;
+ 
+ 	prEventResult = (struct UNI_EVENT_ALL_STA_TXRX_AIR_TIME_T *)Data;
+ 
+ 	for (Idx = 0; Idx < StaNum; Idx++) {
+-		pEntry = entry_get(pAd, prEventResult->arTxRxAirTimeResult[Idx].u2WlanIdx);
++		wcid = uni_event_all_sta_record_wcid(&prEventResult->arTxRxAirTimeResult[Idx]);
++		pEntry = entry_get(pAd, wcid);
+ 		if (pEntry && pEntry->wdev &&  IS_ENTRY_CLIENT(pEntry) && pEntry->Sst == SST_ASSOC) {
+ 			for (k = 0; k < 4; k++) {
+ 				if (pEntry->TxRxTime[k][0] - pEntry->wrapArTxRxTime[k][0] > prEventResult->arTxRxAirTimeResult[Idx].au4WtblRxTime[k]/1000) {
+@@ -7647,6 +7665,11 @@
+ 	}
+ }
+ 
++static BOOLEAN uni_event_all_sta_mld_idx_valid(UINT16 mld_sta_idx)
++{
++	return BMGR_VALID_MLD_STA(mld_sta_idx);
++}
++
+ static VOID uni_event_parse_all_sta_trx_msdu_count(
+ 	struct _RTMP_ADAPTER *pAd,
+ 	UINT8 *Data,
+@@ -7656,6 +7679,7 @@
+ 	struct UNI_EVENT_ALL_STA_TRX_MSDU_COUNT_T *prEventResult;
+ 	PMAC_TABLE_ENTRY pEntry = NULL;
+ 	UINT32 Idx;
++	UINT16 wcid;
+ 
+ #ifdef TR181_SUPPORT
+ 	struct _RTMP_ADAPTER *pMacEntrypAd = NULL;
+@@ -7665,17 +7689,20 @@
+ 	unsigned long *mldsta_added  = NULL;
+ #endif
+ 
+-	os_alloc_mem(pAd, (UCHAR **)&mldsta_added, (WTBL_MAX_NUM(pAd)/32+1) * sizeof(unsigned long));
++	os_alloc_mem(pAd, (UCHAR **)&mldsta_added,
++		BITS_TO_LONGS(BMGR_MAX_MLD_STA_CNT) * sizeof(*mldsta_added));
+ 
+ 	if (!mldsta_added)
+ 		return;
+ 
+-	os_zero_mem(mldsta_added, (WTBL_MAX_NUM(pAd)/32+1) * sizeof(unsigned long));
++	os_zero_mem(mldsta_added,
++		BITS_TO_LONGS(BMGR_MAX_MLD_STA_CNT) * sizeof(*mldsta_added));
+ 
+ 	prEventResult = (struct UNI_EVENT_ALL_STA_TRX_MSDU_COUNT_T *)Data;
+ 
+ 	for (Idx = 0; Idx < StaNum; Idx++) {
+-		pEntry = entry_get(pAd, prEventResult->arTRxMsduCountResult[Idx].u2WlanIdx);
++		wcid = uni_event_all_sta_record_wcid(&prEventResult->arTRxMsduCountResult[Idx]);
++		pEntry = entry_get(pAd, wcid);
+ 
+ 		if (pEntry && pEntry->wdev && (IS_ENTRY_CLIENT(pEntry) || IS_ENTRY_PEER_AP(pEntry)
+ 			|| IS_ENTRY_REPEATER(pEntry)) && pEntry->Sst == SST_ASSOC) {
+@@ -7712,6 +7739,10 @@
+ 					goto done;
+ 				}
+ 				mt_rcu_read_unlock();
++				if (!uni_event_all_sta_mld_idx_valid(mld_sta_idx)) {
++					pr_warn_ratelimited("mt_wifi: dropping ALL_STA MLD aggregate with invalid index\n");
++					continue;
++				}
+ 
+ 				if (!test_bit(mld_sta_idx, (unsigned long *)mldsta_added)) {
+ #ifdef CONFIG_AP_SUPPORT
+@@ -7750,8 +7781,11 @@
+ 					if (IS_ENTRY_PEER_AP(pEntry) || IS_ENTRY_REPEATER(pEntry)) {
+ 						struct _STA_ADMIN_CONFIG *apcli = GetStaCfgByWdev(pAd, pEntry->wdev);
+ 
+-						apcli->StaStatistic.RxCount += le2cpu32(prTRxMsduCountResult->u4RxMsduCnt);
+-						apcli->StaStatistic.TxCount += le2cpu32(prTRxMsduCountResult->u4TxMsduCnt);
++						if (apcli) {
++							apcli->StaStatistic.RxCount += le2cpu32(prTRxMsduCountResult->u4RxMsduCnt);
++							apcli->StaStatistic.TxCount += le2cpu32(prTRxMsduCountResult->u4TxMsduCnt);
++						} else
++							pr_warn_ratelimited("mt_wifi: ALL_STA has no APCLI config for station\n");
+ 					}
+ #endif /*APCLI_SUPPORT*/
+ 					__set_bit(mld_sta_idx, (unsigned long *)mldsta_added);
+@@ -7793,8 +7827,11 @@
+ 				if (IS_ENTRY_PEER_AP(pEntry) || IS_ENTRY_REPEATER(pEntry)) {
+ 					struct _STA_ADMIN_CONFIG *apcli = GetStaCfgByWdev(pAd, pEntry->wdev);
+ 
+-					apcli->StaStatistic.RxCount += le2cpu32(prTRxMsduCountResult->u4RxMsduCnt);
+-					apcli->StaStatistic.TxCount += le2cpu32(prTRxMsduCountResult->u4TxMsduCnt);
++					if (apcli) {
++						apcli->StaStatistic.RxCount += le2cpu32(prTRxMsduCountResult->u4RxMsduCnt);
++						apcli->StaStatistic.TxCount += le2cpu32(prTRxMsduCountResult->u4TxMsduCnt);
++					} else
++						pr_warn_ratelimited("mt_wifi: ALL_STA has no APCLI config for station\n");
+ 				}
+ #endif /*APCLI_SUPPORT*/
+ 			}
+@@ -7830,8 +7867,11 @@
+ 				if ((IS_ENTRY_PEER_AP(pEntry) || IS_ENTRY_REPEATER(pEntry)) && pEntry->wdev) {
+ 					struct _STA_ADMIN_CONFIG *apcli = GetStaCfgByWdev(pAd, pEntry->wdev);
+ 
+-					apcli->StaStatistic.RxCount += le2cpu32(prTRxMsduCountResult->u4RxMsduCnt);
+-					apcli->StaStatistic.TxCount += le2cpu32(prTRxMsduCountResult->u4TxMsduCnt);
++					if (apcli) {
++						apcli->StaStatistic.RxCount += le2cpu32(prTRxMsduCountResult->u4RxMsduCnt);
++						apcli->StaStatistic.TxCount += le2cpu32(prTRxMsduCountResult->u4TxMsduCnt);
++					} else
++						pr_warn_ratelimited("mt_wifi: ALL_STA has no APCLI config for station\n");
+ 				}
+ #endif /*APCLI_SUPPORT*/
+ #endif /*DOT11_EHT_BE*/
+@@ -7855,11 +7895,13 @@
+ 	struct UNI_EVENT_ALL_STA_DATA_TX_RETRY_COUNT_T *prEventResult;
+ 	PMAC_TABLE_ENTRY pEntry = NULL;
+ 	UINT32 Idx;
++	UINT16 wcid;
+ 
+ 	prEventResult = (struct UNI_EVENT_ALL_STA_DATA_TX_RETRY_COUNT_T *)Data;
+ 
+ 	for (Idx = 0; Idx < StaNum; Idx++) {
+-		pEntry = entry_get(pAd, prEventResult->arDataTxRetryCountResult[Idx].u2WlanIdx);
++		wcid = uni_event_all_sta_record_wcid(&prEventResult->arDataTxRetryCountResult[Idx]);
++		pEntry = entry_get(pAd, wcid);
+ 
+ 		if (pEntry && pEntry->wdev && (IS_ENTRY_CLIENT(pEntry) || IS_ENTRY_PEER_AP(pEntry)) && pEntry->Sst == SST_ASSOC) {
+ 			struct UNI_EVENT_ONE_STA_DATA_TX_RETRY_COUNT_T *prDataTxRetryCountResult =
+@@ -7889,57 +7931,148 @@
+ }
+ #endif /* TXRX_STAT_SUPPORT */
+ 
++static BOOLEAN uni_event_validate_all_sta_tlv(
++	struct _RTMP_ADAPTER *pAd,
++	struct UNI_EVENT_ALL_STA_INFO_COMMON_T *tlv,
++	UINT32 tlv_available,
++	UINT16 *tag_out,
++	UINT16 *sta_num_out,
++	UINT32 *payload_len_out)
++{
++	UINT16 tag, sta_num, tlv_len;
++	UINT32 record_len = 0, payload_len, idx;
++	UINT16 wcid;
++	const char *reason = "invalid TLV";
++
++	if (tlv_available < sizeof(*tlv)) {
++		reason = "short common header";
++		goto invalid;
++	}
++
++	tag = le2cpu16(get_unaligned(&tlv->u2Tag));
++	tlv_len = le2cpu16(get_unaligned(&tlv->u2Length));
++	sta_num = le2cpu16(get_unaligned(&tlv->u2StaNum));
++	if (tlv_len < sizeof(*tlv) || tlv_len > tlv_available) {
++		reason = "declared TLV length out of bounds";
++		goto invalid;
++	}
++
++	payload_len = tlv_len - sizeof(*tlv);
++	switch (tag) {
++	case UNI_EVENT_ALL_STA_TX_RATE:
++		record_len = sizeof(struct UNI_EVENT_ONE_STA_TX_RATE_T);
++		break;
++	case UNI_EVENT_ALL_STA_TX_STAT:
++		record_len = sizeof(struct UNI_EVENT_ONE_STA_TX_STAT_T);
++		break;
++	case UNI_EVENT_ALL_STA_TXRX_ADM_STAT:
++		record_len = sizeof(struct UNI_EVENT_ONE_STA_TXRX_ADM_STAT_T);
++		break;
++	case UNI_EVENT_ALL_STA_TXRX_AIR_TIME:
++		record_len = sizeof(struct UNI_EVENT_ONE_STA_TXRX_AIR_TIME_T);
++		break;
++	case UNI_EVENT_ALL_STA_DATA_TX_RETRY_COUNT:
++		record_len = sizeof(struct UNI_EVENT_ONE_STA_DATA_TX_RETRY_COUNT_T);
++		break;
++	case UNI_EVENT_ALL_STA_TRX_MSDU_COUNT:
++		record_len = sizeof(struct UNI_EVENT_ONE_STA_TRX_MSDU_COUNT_T);
++		break;
++	default:
++		break;
++	}
++
++	if (record_len) {
++		if (sta_num > payload_len / record_len) {
++			reason = "station count exceeds payload";
++			goto invalid;
++		}
++
++		for (idx = 0; idx < sta_num; idx++) {
++			const UINT8 *record = tlv->au1AllStaContent + idx * record_len;
++
++			wcid = uni_event_all_sta_record_wcid(record);
++			if (!IS_WCID_VALID(pAd, wcid)) {
++				reason = "WCID outside allocated WTBL";
++				goto invalid;
++			}
++		}
++	}
++
++	*tag_out = tag;
++	*sta_num_out = sta_num;
++	*payload_len_out = payload_len;
++	return TRUE;
++
++invalid:
++	pr_warn_ratelimited("mt_wifi: dropping malformed ALL_STA event: %s\n", reason);
++	return FALSE;
++}
++
+ VOID UniEventAllStaUnsolicitHandler(
+ 	VOID *physical_dev,
+ 	UINT8 *pData,
+ 	UINT32 Length,
+ 	EVENT_RXD *event_rxd)
+ {
+-	struct UNI_EVENT_ALL_STA_INFO_T *event = (struct UNI_EVENT_ALL_STA_INFO_T *)pData;
+-	struct UNI_EVENT_ALL_STA_INFO_COMMON_T *tlv = (struct UNI_EVENT_ALL_STA_INFO_COMMON_T *)&(event->au1TlvBuffer[0]);
+-	struct _RTMP_ADAPTER *pAd = physical_device_get_first_mac_adapter(physical_dev);
+-	UINT32 tags_len;
++	struct UNI_EVENT_ALL_STA_INFO_T *event;
++	struct UNI_EVENT_ALL_STA_INFO_COMMON_T *tlv;
++	struct _RTMP_ADAPTER *pAd;
++	UINT16 tag, sta_num;
++	UINT32 payload_len;
+ 	UINT32 fixed_len = sizeof(*event);
+ 
+-	if (Length < fixed_len) {
+-		MTWF_DBG(NULL, DBG_CAT_FW, CATFW_DBGINFO, DBG_LVL_WARN,
+-			"invalid length = %d\n",
+-			Length);
++	if (!physical_dev || !pData) {
++		pr_warn_ratelimited("mt_wifi: dropping ALL_STA event with null input\n");
+ 		return;
+ 	}
+ 
+-	tags_len = Length - fixed_len;
++	if (Length < fixed_len || Length - fixed_len < sizeof(*tlv)) {
++		pr_warn_ratelimited("mt_wifi: dropping short ALL_STA event\n");
++		return;
++	}
++
++	event = (struct UNI_EVENT_ALL_STA_INFO_T *)pData;
++	tlv = (struct UNI_EVENT_ALL_STA_INFO_COMMON_T *)&event->au1TlvBuffer[0];
++	pAd = physical_device_get_first_mac_adapter(physical_dev);
++	if (!pAd || !pAd->MacTab || !pAd->MacTab->Content || !WTBL_MAX_NUM(pAd)) {
++		pr_warn_ratelimited("mt_wifi: dropping ALL_STA event without WTBL\n");
++		return;
++	}
++
++	if (!uni_event_validate_all_sta_tlv(pAd, tlv, Length - fixed_len,
++			&tag, &sta_num, &payload_len))
++		return;
+ 
+-	switch (tlv->u2Tag) {
++	switch (tag) {
+ 	case UNI_EVENT_ALL_STA_TX_RATE:
+-		uni_event_parse_all_sta_tx_rate(pAd, &(tlv->au1AllStaContent[0]), le2cpu16(tlv->u2StaNum), (tags_len - sizeof(*tlv)));
++		uni_event_parse_all_sta_tx_rate(pAd, &(tlv->au1AllStaContent[0]), sta_num, payload_len);
+ 		break;
+ 
+ 	case UNI_EVENT_ALL_STA_TX_STAT:
+-		uni_event_parse_all_sta_tx_stat(pAd, &(tlv->au1AllStaContent[0]), le2cpu16(tlv->u2StaNum), (tags_len - sizeof(*tlv)));
++		uni_event_parse_all_sta_tx_stat(pAd, &(tlv->au1AllStaContent[0]), sta_num, payload_len);
+ 		break;
+ 
+ 	case UNI_EVENT_ALL_STA_TXRX_ADM_STAT:
+-		uni_event_parse_all_sta_txrx_adm_stat(pAd, &(tlv->au1AllStaContent[0]), le2cpu16(tlv->u2StaNum), (tags_len - sizeof(*tlv)));
++		uni_event_parse_all_sta_txrx_adm_stat(pAd, &(tlv->au1AllStaContent[0]), sta_num, payload_len);
+ 		break;
+ 
+ 	case UNI_EVENT_ALL_STA_TXRX_AIR_TIME:
+-		uni_event_parse_all_sta_txrx_air_time(pAd, &(tlv->au1AllStaContent[0]), le2cpu16(tlv->u2StaNum), (tags_len - sizeof(*tlv)));
++		uni_event_parse_all_sta_txrx_air_time(pAd, &(tlv->au1AllStaContent[0]), sta_num, payload_len);
+ 		break;
+ 
+ 	case UNI_EVENT_ALL_STA_TRX_MSDU_COUNT:
+-		uni_event_parse_all_sta_trx_msdu_count(pAd, &(tlv->au1AllStaContent[0]), le2cpu16(tlv->u2StaNum), (tags_len - sizeof(*tlv)));
++		uni_event_parse_all_sta_trx_msdu_count(pAd, &(tlv->au1AllStaContent[0]), sta_num, payload_len);
+ 		break;
+ 
+ #if defined(TXRX_STAT_SUPPORT) || defined(TR181_SUPPORT)
+ 	case UNI_EVENT_ALL_STA_DATA_TX_RETRY_COUNT:
+-		uni_event_parse_all_sta_data_tx_retry_count(pAd, &(tlv->au1AllStaContent[0]), le2cpu16(tlv->u2StaNum), (tags_len - sizeof(*tlv)));
++		uni_event_parse_all_sta_data_tx_retry_count(pAd, &(tlv->au1AllStaContent[0]), sta_num, payload_len);
+ 		break;
+ #endif /* TXRX_STAT_SUPPORT */
+ 
+ 	default:
+ 		MTWF_DBG(NULL, DBG_CAT_FW, CATFW_DBGINFO, DBG_LVL_DEBUG,
+-			"Tag = %u\n", tlv->u2Tag);
++			"Tag = %u\n", tag);
+ 		break;
+ 	}
+ }
