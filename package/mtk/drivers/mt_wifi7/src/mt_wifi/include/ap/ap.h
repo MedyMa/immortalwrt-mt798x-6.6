@@ -396,6 +396,7 @@ NDIS_STATUS APOneShotSettingInitialize(RTMP_ADAPTER *pAd);
 VOID APShutdown(RTMP_ADAPTER *pAd);
 
 #ifdef CONFIG_6G_SUPPORT
+INT ap_6g_cfg_init(RTMP_ADAPTER *pAd, struct wifi_dev *wdev);
 NDIS_STATUS ap_6g_build_discovery_frame(RTMP_ADAPTER *pAd, struct wifi_dev *wdev);
 INT ap_6g_set_frame_offload(RTMP_ADAPTER *pAd, struct wifi_dev *wdev);
 #endif

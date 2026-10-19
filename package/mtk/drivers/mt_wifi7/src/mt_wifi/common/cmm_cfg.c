@@ -12969,6 +12969,10 @@ INT32 set_datcfg_ack_cts_timeout (RTMP_ADAPTER *pAd)
 		return FALSE;
 	}
 
+	/* The profile defaults below preserve TMAC CR values, not host timeouts. */
+	if (pAd->CommonCfg.ack_cts_enable == FALSE)
+		return TRUE;
+
 	idx = hc_get_hw_band_idx(pAd);
 
 	if (pAd->CommonCfg.distance > 0) {

@@ -25068,6 +25068,18 @@ INT RTMP_AP_IoctlHandle(
 				goto end;
 			}
 			pAd->ApCfg.MBSSID[MAIN_MBSSID].mbss_idx = MAIN_MBSSID;
+#ifdef CONFIG_6G_SUPPORT
+			if (ap_6g_cfg_init(pAd, wdev) != TRUE) {
+				MTWF_DBG(pAd, DBG_CAT_INIT, CATINIT_INTF, DBG_LVL_ERROR,
+					 "6 GHz discovery buffer initialization failed\n");
+				wdev->bAllowBeaconing = FALSE;
+				if (wifi_sys_close(wdev) != TRUE)
+					MTWF_DBG(pAd, DBG_CAT_INIT, CATINIT_INTF, DBG_LVL_ERROR,
+						 "close wdev after discovery buffer failure failed\n");
+				Status = NDIS_STATUS_FAILURE;
+				goto end;
+			}
+#endif
 			APStartUpForMbss(pAd, &pAd->ApCfg.MBSSID[MAIN_MBSSID]);
 			APStartRekeyTimer(pAd, wdev);
 		}

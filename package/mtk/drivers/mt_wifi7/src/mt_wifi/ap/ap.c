@@ -36,6 +36,10 @@ extern VOID vow_avg_pkt_len_reset(struct _RTMP_ADAPTER *ad);
 extern VOID vow_avg_pkt_len_calculate(struct _MAC_TABLE_ENTRY *entry);
 #endif
 
+#ifdef CONFIG_6G_SUPPORT
+static INT ap_6g_cfg_deinit(RTMP_ADAPTER *pAd, struct wifi_dev *wdev);
+#endif
+
 #ifdef IAPP_SUPPORT
 BOOLEAN IAPP_L2_Update_Frame_Send(RTMP_ADAPTER *pAd, UINT8 *mac, INT wdev_idx);
 #endif /*IAPP_SUPPORT*/
@@ -569,6 +573,9 @@ NDIS_STATUS APOneShotSettingInitialize(RTMP_ADAPTER *pAd)
 VOID APShutdown(RTMP_ADAPTER *pAd)
 {
 	BSS_STRUCT *pMbss = &pAd->ApCfg.MBSSID[MAIN_MBSSID];
+#ifdef CONFIG_6G_SUPPORT
+	UINT32 idx;
+#endif
 
 	MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_DOWN, DBG_LVL_INFO, "--->\n");
 #ifdef MT_MAC
@@ -578,6 +585,10 @@ VOID APShutdown(RTMP_ADAPTER *pAd)
 #else
 	MlmeRadioOff(pAd);
 	APStop(pAd, pMbss, AP_BSS_OPER_ALL);
+#endif
+#ifdef CONFIG_6G_SUPPORT
+	for (idx = 0; idx < pAd->ApCfg.BssidNum && idx < MAX_MBSSID_NUM(pAd); idx++)
+		ap_6g_cfg_deinit(pAd, &pAd->ApCfg.MBSSID[idx].wdev);
 #endif
 	/*remove sw related timer and table*/
 	rtmp_ap_exit(pAd);
@@ -748,11 +759,17 @@ static INT ap_hw_tb_init(RTMP_ADAPTER *pAd)
 }
 
 #ifdef CONFIG_6G_SUPPORT
-static INT ap_6g_cfg_init(RTMP_ADAPTER *pAd, struct wifi_dev *wdev)
+INT ap_6g_cfg_init(RTMP_ADAPTER *pAd, struct wifi_dev *wdev)
 {
 	NDIS_STATUS Status = NDIS_STATUS_SUCCESS;
 	pap_6g_cfg pap_cfg = &wdev->ap6g_cfg;
 	pdiscov_iob dsc_iob = &pap_cfg->dsc_iob;
+
+	if (dsc_iob->pkt_buf) {
+		MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_INFO,
+			 "discovery pkt_buf already initialized: 0x%p\n", dsc_iob->pkt_buf);
+		return TRUE;
+	}
 
 	NdisZeroMemory(pap_cfg, sizeof(ap_6g_cfg));
 
@@ -769,8 +786,14 @@ static INT ap_6g_cfg_init(RTMP_ADAPTER *pAd, struct wifi_dev *wdev)
 		Status = MlmeAllocateMemory(pAd, (PVOID)&dsc_iob->pkt_buf);
 		MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_INFO,
 				 "alloc discovery pkt_buf 0x%p\n", dsc_iob->pkt_buf);
-		if (Status == NDIS_STATUS_FAILURE)
+		if (Status != NDIS_STATUS_SUCCESS || !dsc_iob->pkt_buf) {
+			if (dsc_iob->pkt_buf) {
+				MlmeFreeMemory(dsc_iob->pkt_buf);
+				dsc_iob->pkt_buf = NULL;
+			}
+			NdisFreeSpinLock(&dsc_iob->pkt_lock);
 			return FALSE;
+		}
 	} else {
 		MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_ERROR,
 		"discovery pkt_buf allocated!\n");
@@ -1249,8 +1272,7 @@ VOID APStartUpForMbss(RTMP_ADAPTER *pAd, BSS_STRUCT *pMbss)
 	/* Tx Power Percentage value via profile */
 	TxPowerDropCtrl(pAd, pAd->CommonCfg.ucTxPowerPercentage, ucBandIdx);
 
-	/* Config Tx CCK Stream */
-	TxCCKStreamCtrl(pAd, pAd->CommonCfg.CCKTxStream, ucBandIdx);
+	/* Keep the hardware default: profile-startup CCK stream control is unsupported. */
 
 #if defined(TX_POWER_CONTROL_SUPPORT) || defined(TX_POWER_CONTROL_SUPPORT_V2)
 	if (arch_ops && arch_ops->arch_txpower_boost)
@@ -9429,11 +9451,24 @@ INT ap_inf_open(struct wifi_dev *wdev)
 
 	if (wifi_sys_open(wdev) != TRUE) {
 		MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_ERROR, "open fail!!!\n");
+		wdev->state = 0;
 		return FALSE;
 	}
 
 	MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_INFO,
 		"AP inf up for ra_%x(func_idx) OmacIdx=%d\n", wdev->func_idx, wdev->OmacIdx);
+
+#ifdef CONFIG_6G_SUPPORT
+	if (ap_6g_cfg_init(pAd, wdev) != TRUE) {
+		MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_ERROR,
+			 "6 GHz discovery buffer initialization failed\n");
+		if (wifi_sys_close(wdev) != TRUE)
+			MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_ERROR,
+				 "close wdev after discovery buffer failure failed\n");
+		wdev->state = 0;
+		return FALSE;
+	}
+#endif
 
 	MlmeRadioOn(pAd, wdev);
 
@@ -9532,10 +9567,6 @@ INT ap_inf_open(struct wifi_dev *wdev)
 		}
 	}
 
-#endif
-
-#ifdef CONFIG_6G_SUPPORT
-	ap_6g_cfg_init(pAd, wdev);
 #endif
 
 #ifdef WSC_INCLUDED

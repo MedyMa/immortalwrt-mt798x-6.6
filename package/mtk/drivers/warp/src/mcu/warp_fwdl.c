@@ -174,6 +174,29 @@ err_out:
 	return ret;
 }
 
+static int warp_format_wo_fw_name(char *buf, size_t buf_size,
+		const char *chip_set, int keep_chip_prefix, int wed_idx)
+{
+	size_t chip_len;
+	const char *chip_name;
+	int written;
+
+	if (!buf || !buf_size || !chip_set)
+		return -1;
+
+	chip_len = strlen(chip_set);
+	if (chip_len < 2 || (!keep_chip_prefix && chip_len == 2))
+		return -1;
+
+	chip_name = keep_chip_prefix ? chip_set : chip_set + 2;
+	written = snprintf(buf, buf_size, "%s_WOCPU%d_RAM_CODE_release.bin",
+			chip_name, wed_idx);
+	if (written < 0 || (size_t)written >= buf_size)
+		return -1;
+
+	return 0;
+}
+
 static int warp_fw_init(struct warp_entry *warp)
 {
 	const struct firmware *fw_entry;
@@ -181,27 +204,15 @@ static int warp_fw_init(struct warp_entry *warp)
 	int print_ret = 0;
 	struct platform_device *pdev = warp->wed.pdev;
 	struct warp_fwdl_ctrl *ctrl = &warp->woif.fwdl_ctrl;
-	char bin_name[100] = {0}, chip_name[7] = {0};
+	char bin_name[100] = {0};
 
 #ifdef WARP_CHIP_SET
-	print_ret = snprintf(chip_name, strlen(WARP_CHIP_SET)+1, "%s", WARP_CHIP_SET);
-	if (print_ret)
-		warp_dbg(WARP_DBG_ERR, "%s:print error\n", __func__);
-
-	if (warp->wed.ver == 2 && warp->wed.sub_ver == 0 ) {
-		memcpy(bin_name, chip_name, strlen(WARP_CHIP_SET));
-		print_ret = snprintf(&bin_name[strlen(WARP_CHIP_SET)],
-				sizeof(bin_name)-strlen(WARP_CHIP_SET),
-				"_WOCPU%d_RAM_CODE_release.bin", warp->idx);
-		if (print_ret)
-			warp_dbg(WARP_DBG_ERR, "%s:print error\n", __func__);
-	} else {
-		memcpy(bin_name, &chip_name[2], strlen(WARP_CHIP_SET)-2);
-		print_ret = snprintf(&bin_name[(strlen(WARP_CHIP_SET)-2)],
-				sizeof(bin_name)-strlen(WARP_CHIP_SET)-2,
-				"_WOCPU%d_RAM_CODE_release.bin", warp->idx);
-		if (print_ret)
-			warp_dbg(WARP_DBG_ERR, "%s:print error\n", __func__);
+	print_ret = warp_format_wo_fw_name(bin_name, sizeof(bin_name), WARP_CHIP_SET,
+			warp->wed.ver == 2 && warp->wed.sub_ver == 0, warp->idx);
+	if (print_ret) {
+		warp_dbg(WARP_DBG_ERR, "%s:failed to format firmware name (%d)\n",
+			 __func__, print_ret);
+		goto err_out;
 	}
 #else
 	goto err_out;
