@@ -223,7 +223,7 @@
  
  		if (pEntry && pEntry->wdev && (IS_ENTRY_CLIENT(pEntry) || IS_ENTRY_PEER_AP(pEntry)) && pEntry->Sst == SST_ASSOC) {
  			struct UNI_EVENT_ONE_STA_DATA_TX_RETRY_COUNT_T *prDataTxRetryCountResult =
-@@ -7889,57 +7931,148 @@
+@@ -7889,57 +7931,150 @@
  }
  #endif /* TXRX_STAT_SUPPORT */
  
@@ -288,8 +288,10 @@
 +
 +			wcid = uni_event_all_sta_record_wcid(record);
 +			if (!IS_WCID_VALID(pAd, wcid)) {
-+				reason = "WCID outside allocated WTBL";
-+				goto invalid;
++				pr_warn_once("mt_wifi: dropping malformed ALL_STA event: tag=%u record=%u WCID=%u WTBL_MAX=%u\n",
++					(unsigned int)tag, (unsigned int)idx, (unsigned int)wcid,
++					(unsigned int)WTBL_MAX_NUM(pAd));
++				return FALSE;
 +			}
 +		}
 +	}
