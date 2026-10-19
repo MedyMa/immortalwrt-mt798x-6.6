@@ -23,6 +23,7 @@ local datconf = require "datconf"
 local utils = require "mtwifi_utils"
 local defs = require "mtwifi_defs"
 local bandwidth = require "mtwifi_bandwidth"
+local uci = require "uci"
 
 local l1dat = l1parser.load_l1_profile(l1parser.L1_DAT_PATH)
 
@@ -116,6 +117,12 @@ end
 function set_dev_dat(dats, dat, cfg)
     if cfg ~= nil then
         dats[dat] = cfg2dat(cfg)
+    end
+end
+
+function set_optional_dev_dat(dats, dat, cfg)
+    if cfg ~= nil and cfg ~= "" then
+        set_dev_dat(dats, dat, cfg)
     end
 end
 
@@ -365,15 +372,204 @@ function set_chip_cfg(cfg, dats)
     end
 end
 
+local function mld_group(config)
+    local value = config.mldgroup
+
+    if value ~= nil and value ~= "" then
+        local group = tonumber(value)
+        if not group or group < 0 or group > 16 or group ~= math.floor(group) then
+            return nil, false
+        end
+        return group, true
+    end
+
+    value = config.mlo
+    if value == nil then
+        return nil, true
+    elseif value == true or value == 1 or value == "1" then
+        return 1, true
+    elseif value == false or value == 0 or value == "0" then
+        return 0, true
+    end
+
+    return nil, false
+end
+
+local function mld_group_with_profile(iface, profile, apidx)
+    local group, valid = mld_group(iface)
+    if group ~= nil or not valid then
+        return group, valid
+    end
+
+    local token = utils.token_get(profile and profile.MldGroup, apidx, "0")
+    return mld_group({ mldgroup = token })
+end
+
+local function mld_bool(value)
+    if value == true or value == 1 or value == "1" or value == "true" or value == "yes" then
+        return "1"
+    elseif value == false or value == 0 or value == "0" or value == "false" or value == "no" or value == nil or value == "" then
+        return "0"
+    end
+    return tostring(value)
+end
+
+local function mld_disabled(value)
+    return mld_bool(value) == "1"
+end
+
+local function mld_eht_mode(value)
+    local modes = {
+        EHT20 = true, EHT40 = true, EHT80 = true, EHT80_80 = true,
+        EHT160 = true, EHT320 = true
+    }
+    return type(value) == "string" and modes[value] == true
+end
+
+local function mld_writer_signature(iface)
+    local enc = defs.enc2dat[iface.encryption or "none"]
+    if not enc then
+        return nil
+    end
+
+    local authmode, cipher = enc[1], enc[2]
+    local pmf_mfpc = tostring(defs.vif_cfgs.PMFMFPC or "0")
+    local pmf_mfpr = tostring(defs.vif_cfgs.PMFMFPR or "0")
+    local pmf_sha256 = tostring(defs.vif_cfgs.PMFSHA256 or "0")
+    if authmode == "OWE" or authmode == "WPA3PSK" then
+        pmf_mfpc, pmf_mfpr, pmf_sha256 = "1", "1", "0"
+    elseif authmode == "WPA2PSKWPA3PSK" then
+        pmf_mfpc, pmf_mfpr, pmf_sha256 = "1", "0", "0"
+    end
+
+    -- Match the AP writer: omitted key becomes empty, and 802.1X/RADIUS
+    -- fields retain the reset defaults because this writer does not map them.
+    return {
+        tostring(iface.ssid or ""), authmode, cipher, tostring(iface.key or ""),
+        pmf_mfpc, pmf_mfpr, pmf_sha256, mld_bool(defs.vif_cfgs.IEEE8021X)
+    }
+end
+
+local function add_mld_member(groups, group, signature)
+    if group and group > 0 and signature then
+        local members = groups[group] or {}
+        members[#members + 1] = signature
+        groups[group] = members
+    end
+end
+
+local function validate_mld_groups(cfg)
+    local groups, affected, other_aps = {}, {}, {}
+    local cursor = uci.cursor()
+    local current_device = cfg.device
+    local current_device_type = cursor:get("wireless", current_device, "type")
+
+    if current_device_type ~= "mtwifi" then
+        return true
+    end
+
+    local current_dev = l1dat.devname_ridx[current_device]
+    local current_profile = current_dev and load_profile(current_dev.profile_path) or {}
+    local interfaces = cfg.interfaces or {}
+    local vif_num = 0
+    for _ in pairs(interfaces) do vif_num = vif_num + 1 end
+    local config = cfg.config or {}
+    local htmode = config.htmode or cursor:get("wireless", current_device, "htmode")
+    local disabled_value = config.disabled
+    if disabled_value == nil then
+        disabled_value = cursor:get("wireless", current_device, "disabled")
+    end
+    local radio_disabled = mld_disabled(disabled_value)
+    local apidx = 0
+
+    -- The writer walks netifd's numeric interface keys and increments the DAT
+    -- slot only for APs. Resolve an omitted option from that exact profile slot.
+    for index = 0, vif_num - 1 do
+        local item = interfaces[tostring(index)] or interfaces[index]
+        local iface = item and (item.config or item)
+        if iface and iface.mode == "ap" then
+            apidx = apidx + 1
+            local group, valid = mld_group_with_profile(iface, current_profile, apidx)
+            if not valid then
+                return false
+            end
+
+            local active = not radio_disabled and not mld_disabled(iface.disabled) and mld_eht_mode(htmode)
+            if active and group and group > 0 then
+                affected[group] = true
+                add_mld_member(groups, group, mld_writer_signature(iface))
+            end
+        end
+    end
+
+    -- Other radios are not part of the current netifd JSON. Their persisted
+    -- UCI AP order corresponds to compact AP BSSID slots; use their DAT token
+    -- when group aliases are absent, then compare the values this writer maps.
+    cursor:foreach("wireless", "wifi-iface", function(iface)
+        local device = iface.device
+        if device and device ~= current_device and iface.mode == "ap" and
+            cursor:get("wireless", device, "type") == "mtwifi" and
+            not mld_disabled(cursor:get("wireless", device, "disabled")) then
+            local list = other_aps[device] or {}
+            -- Disabled APs still occupy their vendor DAT BSSID slot. Preserve
+            -- them in this ordered list, then exclude them only from members.
+            list[#list + 1] = iface
+            other_aps[device] = list
+        end
+    end)
+
+    for device, aps in pairs(other_aps) do
+        local dev = l1dat.devname_ridx[device]
+        local profile = dev and load_profile(dev.profile_path) or {}
+        local other_htmode = cursor:get("wireless", device, "htmode")
+        if mld_eht_mode(other_htmode) then
+            for slot, iface in ipairs(aps) do
+                if not mld_disabled(iface.disabled) then
+                    local group, valid = mld_group_with_profile(iface, profile, slot)
+                    if valid and group and affected[group] then
+                        add_mld_member(groups, group, mld_writer_signature(iface))
+                    end
+                end
+            end
+        end
+    end
+
+    for group in pairs(affected) do
+        local members = groups[group]
+        if members and #members > 1 then
+            local first = table.concat(members[1], "\0")
+            for index = 2, #members do
+                if table.concat(members[index], "\0") ~= first then
+                    return false
+                end
+            end
+        end
+    end
+
+    return true
+end
+
+local function valid_eht_restricted_twt(value)
+    return value == nil or value == "" or value == 0 or value == "0" or value == 1 or value == "1"
+end
+
 function mtwifi_cfg_setup(argv)
     local cfg = cjson.decode(argv)
-
-    utils.log2file("input = " .. inspect(cfg))
 
     local devname = cfg.device
     local dev = l1dat.devname_ridx[devname]
 
     if not dev then return end
+
+    if not valid_eht_restricted_twt(cfg.config.eht_restricted_twt) then
+        nixio.syslog("err", "mtwifi-cfg: invalid EHT Restricted TWT value")
+        return false
+    end
+
+    if not validate_mld_groups(cfg) then
+        nixio.syslog("err", "mtwifi-cfg: MLO group requires matching SSID and security settings")
+        return false
+    end
 
     local profile = dev.profile_path
 
@@ -383,6 +579,12 @@ function mtwifi_cfg_setup(argv)
         return
     end
     local dats_orig = load_profile(profile)
+    set_optional_dev_dat(dats, "Vht1024QamSupport", cfg.config.vht_1024)
+    set_optional_dev_dat(dats, "TxBurst", cfg.config.tx_burst)
+    local is_5g = cfg.config.band == "5g"
+    set_optional_dev_dat(dats, "IEEE80211H", is_5g and cfg.config.doth or nil)
+    set_optional_dev_dat(dats, "TxPreamble", cfg.config.tx_preamble)
+    set_optional_dev_dat(dats, "DfsEnable", is_5g and cfg.config.dfs or nil)
 
     local vif_num, bssid_num, apcli_num = vif_count(cfg)
 
@@ -398,7 +600,18 @@ function mtwifi_cfg_setup(argv)
         nixio.syslog("err", "mtwifi-cfg: only support one apcli vif!")
     end
 
-        dats.BssidNum = 4
+    dats.BssidNum = 4
+
+    -- HeLdpc is parsed as one semicolon-delimited value per BSSID. Only
+    -- replace the profile when the radio option is explicitly configured.
+    if cfg.config.he_ldpc ~= nil and cfg.config.he_ldpc ~= "" then
+        local he_ldpc = {}
+        local he_ldpc_value = tostring(cfg.config.he_ldpc)
+        for i = 1, tonumber(dats.BssidNum) do
+            he_ldpc[i] = he_ldpc_value
+        end
+        dats.HeLdpc = table.concat(he_ldpc, ";")
+    end
     
 
     -- setup wireless mode
@@ -478,6 +691,32 @@ function mtwifi_cfg_setup(argv)
         end
     end
 
+    -- The profile remains authoritative for omitted optional controls. An
+    -- explicit 802.11h disable clears its dependent DFS settings; otherwise
+    -- only explicitly supplied DFS / Zero-Wait values replace the profile.
+    if is_5g and cfg.config.doth ~= nil and cfg.config.doth ~= "" and mld_bool(cfg.config.doth) == "0" then
+        dats.DfsEnable = 0
+        dats.DfsZeroWait = 0
+        dats.DfsDedicatedZeroWait = 0
+        dats.DfsZeroWaitDefault = 0
+    else
+        if is_5g and cfg.config.dfs ~= nil and cfg.config.dfs ~= "" then
+            dats.DfsEnable = cfg2dat(cfg.config.dfs)
+        end
+        if is_5g and cfg.config.zw_dfs ~= nil and cfg.config.zw_dfs ~= "" then
+            if mld_bool(cfg.config.zw_dfs) == "1" and mld_bool(dats.IEEE80211H) == "1" and
+                mld_bool(dats.DfsEnable) == "1" then
+                dats.DfsZeroWait = (dats.MACRepeaterEn == 1) and 0 or 1
+                dats.DfsDedicatedZeroWait = 2
+                dats.DfsZeroWaitDefault = 1
+            else
+                dats.DfsZeroWait = 0
+                dats.DfsDedicatedZeroWait = 0
+                dats.DfsZeroWaitDefault = 0
+            end
+        end
+    end
+
     -- setup chip cfgs
     set_chip_cfg(cfg, dats)
 
@@ -527,11 +766,14 @@ function mtwifi_cfg_setup(argv)
         dats.TWTSupport = 0
     end
 
-    -- reset vif cfgs to default
+    -- MldGroup is intentionally excluded: an unset UI value preserves the
+    -- profile token, while an explicit group is written in the AP loop below.
     for k,v in pairs(defs.vif_cfgs) do
-        dats[k] = ""
-        for i = 1, bssid_num do
-            dats[k] = utils.token_set(dats[k], i, v)
+        if k ~= "MldGroup" then
+            dats[k] = ""
+            for i = 1, bssid_num do
+                dats[k] = utils.token_set(dats[k], i, v)
+            end
         end
     end
 
@@ -577,16 +819,25 @@ function mtwifi_cfg_setup(argv)
             set_idx_dat(dats, apidx, "WPAPSK", v.config.key or "")
             set_dat(dats, apidx, "NoForwarding", 0)
             set_dat(dats, apidx, "HideSSID", v.config.hidden)
-            set_dat(dats, apidx, "MldGroup", v.config.mlo)
-            if not v.config.mlo then
-                set_dat(dats, apidx, "MldGroup", "0")
+            -- The legacy parser consumes one boolean token per AP BSSID.
+            -- Keep the vendor profile untouched when this EHT-only control is unset.
+            if cfg.config.eht_restricted_twt ~= nil and cfg.config.eht_restricted_twt ~= "" then
+                set_dat(dats, apidx, "EHT_ApRestrictedTwt", cfg.config.eht_restricted_twt)
+            end
+            local group = mld_group(v.config)
+            if group ~= nil then
+                set_dat(dats, apidx, "MldGroup", group)
+            end
+            local effective_group = group
+            if effective_group == nil then
+                effective_group = tonumber(utils.token_get(dats.MldGroup, apidx, "0"))
+            end
+            if effective_group == 0 then
                 if idx == 0 then
                     dats.MacAddress = v.config.macaddr or (dats.MacAddress_Default or "")
                 else
                     set_idx_dat(dats, apidx, "MacAddress", v.config.macaddr or (dats.MacAddress_Default or ""))
                 end
-            else
-                set_dat(dats, apidx, "MldGroup", "1")
             end
             set_dat(dats, apidx, "WmmCapable", v.config.wmm)
             set_dat(dats, apidx, "RRMEnable", v.config.ieee80211k)
@@ -663,7 +914,6 @@ function mtwifi_cfg_setup(argv)
 
     local reinstall_wifidrv = false
     local cfg_diff = diff_cfg(dats_orig, dats)
-    utils.log2file("diff = " .. inspect(cfg_diff))
 
     save_profile(dats, profile)
 
@@ -753,7 +1003,9 @@ local action = {
     ["setup"] = function()
         local argv = io.read()
         if #argv > 0 then
-            mtwifi_cfg_setup(argv)
+            if mtwifi_cfg_setup(argv) == false then
+                os.exit(1)
+            end
         end
     end
 }

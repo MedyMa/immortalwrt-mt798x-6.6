@@ -15,13 +15,14 @@ MTWIFI_CFG_IFNAME_KEY="mtwifi_ifname"
 
 drv_mtwifi_init_device_config() {
 	config_add_int txpower beacon_int
-	config_add_boolean mu_beamformer dbdc_main whnat
-	config_add_string country twt
+	config_add_boolean mu_beamformer dbdc_main whnat vht_1024
+	config_add_string country twt eht_restricted_twt tx_burst doth tx_preamble he_ldpc dfs zw_dfs
 }
 
 drv_mtwifi_init_iface_config() {
 	config_add_string 'ssid:string' macfilter bssid kicklow assocthres 'macaddr:macaddr'
 	config_add_boolean mlo wmm hidden isolate ieee80211k bss_transition
+	config_add_int mldgroup
 	config_add_int wpa_group_rekey frag rts dtim_period
 	config_add_array 'maclist:list(macaddr)'
 	config_add_boolean mumimo_dl mumimo_ul ofdma_dl ofdma_ul amsdu autoba uapsd
@@ -111,7 +112,11 @@ drv_mtwifi_setup() {
 	APCLI_IDX=0
 	for_each_interface sta mtwifi_vif_sta_set_data
 
-	json_dump | /sbin/mtwifi_cfg setup
+	if ! json_dump | /sbin/mtwifi_cfg setup; then
+		wireless_setup_failed "MTWIFI_CFG_SETUP_FAILED"
+		lock -u "$LOCK_FILE"
+		return 1
+	fi
 
 	for_each_interface ap mtwifi_vif_ap_config
 	for_each_interface sta mtwifi_vif_sta_config

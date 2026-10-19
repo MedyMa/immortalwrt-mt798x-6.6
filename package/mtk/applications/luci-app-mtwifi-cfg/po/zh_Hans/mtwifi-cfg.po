@@ -4,6 +4,12 @@ msgstr "Content-Type: text/plain; charset=UTF-8\n"
 msgid "Target Wake Time"
 msgstr "目标唤醒时间（TWT）"
 
+msgid "EHT Restricted TWT"
+msgstr "EHT 受限 TWT"
+
+msgid "Controls the vendor EHT Restricted TWT capability. This is separate from HE Target Wake Time; leave unset to preserve the profile value."
+msgstr "控制厂商 EHT 受限 TWT 能力。该选项独立于 HE 目标唤醒时间；留空可保留配置文件中的值。"
+
 msgid "MU-MIMO DL"
 msgstr "下行 MU-MIMO"
 
@@ -34,6 +40,42 @@ msgstr "弱信号接入阈值"
 msgid "Wireless HWNAT"
 msgstr "无线硬件加速"
 
+msgid "Transmit Burst"
+msgstr "连续发送"
+
+msgid "Transmit Preamble"
+msgstr "发送前导码"
+
+msgid "Long"
+msgstr "长"
+
+msgid "Short"
+msgstr "短"
+
+msgid "Auto"
+msgstr "自动"
+
+msgid "IEEE 802.11h (DFS)"
+msgstr "IEEE 802.11h（DFS）"
+
+msgid "DFS"
+msgstr "动态频率选择（DFS）"
+
+msgid "Control the vendor DfsEnable profile field separately from IEEE 802.11h. Leave unset to preserve the profile setting."
+msgstr "单独控制厂商配置中的 DfsEnable 字段，与 IEEE 802.11h 分开设置。留空可保留配置文件中的设置。"
+
+msgid "Zero-Wait DFS"
+msgstr "零等待 DFS"
+
+msgid "Set the vendor zero-wait fields. MAC Repeater disables the active DfsZeroWait flag. Leave unset to preserve all profile values."
+msgstr "设置厂商零等待字段。启用 MAC Repeater 时，活动的 DfsZeroWait 标志会被禁用。留空可保留配置文件中的全部值。"
+
+msgid "Enabled"
+msgstr "启用"
+
+msgid "Disabled"
+msgstr "禁用"
+
 msgid "Wireless configuration error"
 msgstr "无线网络设置错误"
 
@@ -42,6 +84,33 @@ msgstr "至少需要保留1个MBSSID"
 
 msgid "Enable MLO"
 msgstr "启用MLO"
+
+msgid "MLO Group"
+msgstr "MLO 分组"
+
+msgid "0 disables MLO; interfaces in the same group must use identical SSID and security settings. Leave unset to preserve the profile setting."
+msgstr "0 表示禁用 MLO；同组接口必须使用相同的 SSID 和安全设置。留空可保留配置文件中的设置。"
+
+msgid "Use profile setting"
+msgstr "使用配置文件设置"
+
+msgid "HE LDPC (all AP BSSIDs)"
+msgstr "HE LDPC（所有 AP BSSID）"
+
+msgid "Applies one HeLdpc value to the radio’s AP BSSIDs. Leave unset to preserve the profile tokens."
+msgstr "将同一 HeLdpc 值应用于此射频的所有 AP BSSID。留空可保留配置文件中的各项设置。"
+
+msgid "MLO group must be between 0 and 16"
+msgstr "MLO 分组必须介于 0 和 16 之间"
+
+msgid "MLO group %s requires matching SSID and security settings"
+msgstr "MLO 分组 %s 中的接口必须使用相同的 SSID 和安全设置"
+
+msgid "VHT 1024-QAM (5 GHz)"
+msgstr "VHT 1024-QAM（5 GHz）"
+
+msgid "Vendor VHT extension; this is not HE or EHT 1024-QAM. Leave unset to preserve the profile setting."
+msgstr "厂商 VHT 扩展；这不是 HE 或 EHT 1024-QAM。留空可保留配置文件中的设置。"
 
 msgid "MAC Address"
 msgstr "MAC 地址"

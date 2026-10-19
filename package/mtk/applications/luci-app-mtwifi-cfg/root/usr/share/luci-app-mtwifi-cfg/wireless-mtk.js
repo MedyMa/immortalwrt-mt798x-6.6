@@ -135,6 +135,218 @@ function fixMtkEht320Bitrate(radioNet, bitrate) {
 	return bitrate;
 }
 
+function mtkMldGroup(config) {
+	var value = config.mldgroup;
+
+	if (value != null && value !== '') {
+		value = String(value);
+		if (!/^\d+$/.test(value) || Number(value) > 16)
+			return { valid: false };
+
+		return { valid: true, value: Number(value) };
+	}
+
+	value = config.mlo;
+	if (value == null || value === '')
+		return { valid: true, value: null };
+
+	if (value === true || value === 1 || value === '1')
+		return { valid: true, value: 1 };
+
+	if (value === false || value === 0 || value === '0')
+		return { valid: true, value: 0 };
+
+	return { valid: false };
+}
+
+function mtkMloSecurity(config) {
+	var enc2dat = {
+		none: ['OPEN', 'NONE'],
+		sae: ['WPA3PSK', 'AES'], 'sae+gcmp256': ['WPA3PSK', 'GCMP256'],
+		'sae-mixed': ['WPA2PSKWPA3PSK', 'AES'],
+		'psk2+tkip+ccmp': ['WPA2PSK', 'TKIPAES'], 'psk2+tkip+aes': ['WPA2PSK', 'TKIPAES'],
+		'psk2+tkip': ['WPA2PSK', 'TKIP'], 'psk2+ccmp': ['WPA2PSK', 'AES'],
+		'psk2+aes': ['WPA2PSK', 'AES'], psk2: ['WPA2PSK', 'AES'],
+		'psk+tkip+ccmp': ['WPAPSK', 'AES'], 'psk+tkip+aes': ['WPAPSK', 'AES'],
+		'psk+tkip': ['WPAPSK', 'AES'], 'psk+ccmp': ['WPAPSK', 'AES'],
+		'psk+aes': ['WPAPSK', 'AES'], psk: ['WPAPSK', 'AES'],
+		'psk-mixed+tkip+ccmp': ['WPAPSKWPA2PSK', 'TKIPAES'],
+		'psk-mixed+tkip+aes': ['WPAPSKWPA2PSK', 'TKIPAES'],
+		'psk-mixed+tkip': ['WPAPSKWPA2PSK', 'TKIP'],
+		'psk-mixed+ccmp': ['WPAPSKWPA2PSK', 'AES'],
+		'psk-mixed+aes': ['WPAPSKWPA2PSK', 'AES'],
+		'psk-mixed': ['WPAPSKWPA2PSK', 'AES'], owe: ['OWE', 'AES']
+	}, enc = enc2dat[String(config.encryption || 'none')],
+	    authmode = enc ? enc[0] : String(config.encryption || ''),
+	    cipher = enc ? enc[1] : '',
+	    pmf = authmode === 'OWE' || authmode === 'WPA3PSK' ? ['1', '1', '0'] :
+		(authmode === 'WPA2PSKWPA3PSK' ? ['1', '0', '0'] : ['0', '0', '0']);
+
+	// The writer maps encryption through mtwifi_defs.enc2dat, empties an
+	// omitted key, resets PMF/802.1X to defaults, and does not write the
+	// remaining hostapd-only authentication options.
+	return JSON.stringify([
+		String(config.ssid == null ? '' : config.ssid), authmode, cipher,
+		String(config.key || ''), pmf[0], pmf[1], pmf[2], '0'
+	]);
+}
+
+function mtkMloDisabled(value) {
+	return value === true || value === 1 || value === '1';
+}
+
+function mtkRadioHtMode(map, device) {
+	var option = map.lookupOption('_freq', device, 'wireless');
+
+	if (option && option[0] && option[0].isActive(device)) {
+		var value = option[0].formvalue(device);
+		if (Array.isArray(value) && value[0] != null)
+			return value[0];
+	}
+
+	return uci.get('wireless', device, 'htmode');
+}
+
+function mtkIsEhtMode(value) {
+	return /^EHT(?:20|40|80|80_80|160|320)$/.test(String(value || ''));
+}
+
+function validateMtkMloGroups(records, focusedDevice) {
+	var groups = {}, affected = {}, fields = [
+		'mode', 'disabled', 'device', 'ssid', 'encryption',
+		'cipher', 'key', 'ieee80211w', 'ieee8021x', 'auth_server', 'auth_port',
+		'auth_secret', 'acct_server', 'acct_port', 'acct_secret'
+	];
+
+	for (var i = 0; i < records.length; i++) {
+		var record = records[i];
+		if (record.deviceType !== 'mtwifi')
+			continue;
+
+		var old = record.original || {}, current = record.current || {},
+		    device = record.device || current.device || old.device,
+		    oldGroup = mtkMldGroup(old), group = mtkMldGroup(current), changed = false,
+		    oldEht = mtkIsEhtMode(record.originalHtMode), eht = mtkIsEhtMode(record.currentHtMode);
+		if (!focusedDevice)
+			focusedDevice = device;
+
+		if (record.originalRadioDisabled !== record.radioDisabled)
+			changed = true;
+		if (record.originalHtMode !== record.currentHtMode)
+			changed = true;
+
+		for (var j = 0; j < fields.length; j++) {
+			if (String(old[fields[j]] == null ? '' : old[fields[j]]) !==
+			    String(current[fields[j]] == null ? '' : current[fields[j]])) {
+				changed = true;
+				break;
+			}
+		}
+		if (!changed && mtkMloSecurity(old) !== mtkMloSecurity(current))
+			changed = true;
+		var groupChanged = oldGroup.valid && group.valid
+			? oldGroup.value !== group.value
+			: (String(old.mldgroup == null ? '' : old.mldgroup) !== String(current.mldgroup == null ? '' : current.mldgroup) ||
+			   String(old.mlo == null ? '' : old.mlo) !== String(current.mlo == null ? '' : current.mlo));
+		if (groupChanged)
+			changed = true;
+
+		var candidateActive = device === focusedDevice && !record.radioDisabled &&
+			current.mode === 'ap' && !mtkMloDisabled(current.disabled) && eht;
+
+		if (!group.valid) {
+			if (groupChanged || (candidateActive &&
+			    ((current.mldgroup != null && current.mldgroup !== '') || current.mlo != null)))
+				return _('MLO group must be between 0 and 16');
+			continue;
+		}
+
+		if (changed && device === focusedDevice) {
+			if (oldEht && oldGroup.valid && oldGroup.value > 0)
+				affected[oldGroup.value] = true;
+			if (eht && group.value > 0)
+				affected[group.value] = true;
+		}
+
+		if (candidateActive && group.value > 0)
+			affected[group.value] = true;
+
+		if (record.radioDisabled || current.mode !== 'ap' || mtkMloDisabled(current.disabled) || !eht ||
+		    !group.value)
+			continue;
+
+		(groups[group.value] || (groups[group.value] = [])).push(mtkMloSecurity(current));
+	}
+
+	for (var group in affected) {
+		var members = groups[group];
+		if (members && members.length > 1) {
+			for (var k = 1; k < members.length; k++)
+				if (members[k] !== members[0])
+					return _('MLO group %s requires matching SSID and security settings').format(group);
+		}
+	}
+
+	return null;
+}
+
+function validateMtkMloForm(map, currentSection, currentGroup) {
+	var fields = [
+		'mldgroup', 'mlo', 'mode', 'disabled', 'device', 'ssid', 'encryption',
+		'cipher', 'key', 'ieee80211w', 'ieee8021x', 'auth_server', 'auth_port',
+		'auth_secret', 'acct_server', 'acct_port', 'acct_secret'
+	], records = [], sections = uci.sections('wireless', 'wifi-iface') || [],
+	    focusedDevice;
+
+	function formValue(option, section, fallback) {
+		var formOption = option === 'key' ? '_wpa_key' : option,
+		    found = map.lookupOption(formOption, section, 'wireless');
+		if (found && found[0] && found[0].isActive(section)) {
+			var value = found[0].formvalue(section);
+			if (value !== null && value !== undefined)
+				return value;
+		}
+		return fallback;
+	}
+	focusedDevice = formValue('device', currentSection,
+		uci.get('wireless', currentSection, 'device'));
+
+	for (var i = 0; i < sections.length; i++) {
+		var section = sections[i], id = section['.name'] || section.name,
+		    original = {}, current = {};
+
+		if (!id)
+			continue;
+		var originalDevice = uci.get('wireless', id, 'device'),
+		    device = id === currentSection ? formValue('device', id, originalDevice) : originalDevice;
+		if (id === currentSection)
+			focusedDevice = device;
+		var useFormValues = device === focusedDevice;
+
+		for (var j = 0; j < fields.length; j++) {
+			var name = fields[j];
+			original[name] = uci.get('wireless', id, name);
+			current[name] = id === currentSection && name === 'mldgroup'
+				? currentGroup
+				: useFormValues ? formValue(name, id, original[name]) : original[name];
+		}
+
+		records.push({
+			sectionId: id,
+			device: device,
+			original: original,
+			current: current,
+			deviceType: device ? uci.get('wireless', device, 'type') : null,
+			originalHtMode: device ? uci.get('wireless', device, 'htmode') : null,
+			currentHtMode: device ? (device === focusedDevice ? mtkRadioHtMode(map, device) : uci.get('wireless', device, 'htmode')) : null,
+			originalRadioDisabled: device ? mtkMloDisabled(uci.get('wireless', device, 'disabled')) : false,
+			radioDisabled: device ? mtkMloDisabled(device === focusedDevice ? formValue('disabled', device, uci.get('wireless', device, 'disabled')) : uci.get('wireless', device, 'disabled')) : false
+		});
+	}
+
+	return validateMtkMloGroups(records, focusedDevice);
+}
+
 function render_radio_status(radioDev, wifiNets) {
 	var name = radioDev.getI18n().replace(/ Wireless Controller .+$/, ''),
 	    node = E('div', [ E('big', {}, E('strong', {}, name)), E('div') ]),
@@ -465,6 +677,18 @@ function add_dep_be_feature(o) {
 	o.depends({'_freq': 'EHT80', '!contains': true});
 	o.depends({'_freq': 'EHT160', '!contains': true});
 	o.depends({'_freq': 'EHT320', '!contains': true});
+}
+
+function add_dep_eht_ap_feature(o) {
+	[ 'EHT20', 'EHT40', 'EHT80', 'EHT80_80', 'EHT160', 'EHT320' ].forEach(function(mode) {
+		o.depends({ '_freq': mode, 'mode': 'ap', '!contains': true });
+	});
+}
+
+function add_dep_eht_radio_feature(o) {
+	[ 'EHT20', 'EHT40', 'EHT80', 'EHT80_80', 'EHT160', 'EHT320' ].forEach(function(mode) {
+		o.depends({ '_freq': mode, '!contains': true });
+	});
 }
 
 var CBIWifiFrequencyValue = form.Value.extend({
@@ -1202,6 +1426,65 @@ return view.extend({
 					o.wifiNetwork = radioNet;
 
 					if (!isDisabled) {
+						if (band == '5g') {
+							o = ss.taboption('advanced', form.ListValue, 'vht_1024', _('VHT 1024-QAM (5 GHz)'), _('Vendor VHT extension; this is not HE or EHT 1024-QAM. Leave unset to preserve the profile setting.'));
+							o.value('', _('Use profile setting'));
+							o.value('1', _('Enabled'));
+							o.value('0', _('Disabled'));
+							o.optional = true;
+							o.rmempty = true;
+						}
+
+						o = ss.taboption('advanced', form.ListValue, 'he_ldpc', _('HE LDPC (all AP BSSIDs)'), _('Applies one HeLdpc value to the radio’s AP BSSIDs. Leave unset to preserve the profile tokens.'));
+						add_dep_he_feature(o);
+						add_dep_be_feature(o);
+						o.value('1', _('Enabled'));
+						o.value('0', _('Disabled'));
+						o.optional = true;
+						o.rmempty = true;
+
+						o = ss.taboption('advanced', form.ListValue, 'tx_burst', _('Transmit Burst'));
+						o.value('', _('Use profile setting'));
+						o.value('1', _('Enabled'));
+						o.value('0', _('Disabled'));
+						o.optional = true;
+						o.rmempty = true;
+
+						o = ss.taboption('advanced', form.ListValue, 'tx_preamble', _('Transmit Preamble'));
+						o.value('', _('Use profile setting'));
+						o.value('0', _('Long'));
+						o.value('1', _('Short'));
+						o.value('2', _('Auto'));
+						o.optional = true;
+						o.rmempty = true;
+
+						if (band == '5g') {
+							o = ss.taboption('advanced', form.ListValue, 'doth', _('IEEE 802.11h (DFS)'));
+							o.value('', _('Use profile setting'));
+							o.value('1', _('Enabled'));
+							o.value('0', _('Disabled'));
+							o.optional = true;
+							o.rmempty = true;
+
+							o = ss.taboption('advanced', form.ListValue, 'dfs', _('DFS'), _('Control the vendor DfsEnable profile field separately from IEEE 802.11h. Leave unset to preserve the profile setting.'));
+							o.depends({ '_freq': '5g', '!contains': true, 'doth': '1' });
+							o.value('', _('Use profile setting'));
+							o.value('1', _('Enabled'));
+							o.value('0', _('Disabled'));
+							o.optional = true;
+							o.rmempty = true;
+							o.retain = true;
+
+							o = ss.taboption('advanced', form.ListValue, 'zw_dfs', _('Zero-Wait DFS'), _('Set the vendor zero-wait fields. MAC Repeater disables the active DfsZeroWait flag. Leave unset to preserve all profile values.'));
+							o.depends({ '_freq': '5g', '!contains': true, 'doth': '1' });
+							o.value('', _('Use profile setting'));
+							o.value('1', _('Enabled'));
+							o.value('0', _('Disabled'));
+							o.optional = true;
+							o.rmempty = true;
+							o.retain = true;
+						}
+
 						o = ss.taboption('advanced', form.Flag, 'noscan', _('Force 40MHz mode'), _('Always use 40MHz channels even if the secondary channel overlaps. Using this option does not comply with IEEE 802.11n-2009!'));
 						o.depends({'_freq': '2g', '!contains': true});
 						o.default = o.disabled;
@@ -1220,6 +1503,17 @@ return view.extend({
 						o.value('', _('Disable'));
 						o.value('1', _('Enable'));
 						o.value('2', _('Force'));
+
+						if (ifmode == 'ap') {
+							o = ss.taboption('advanced', form.ListValue, 'eht_restricted_twt', _('EHT Restricted TWT'), _('Controls the vendor EHT Restricted TWT capability. This is separate from HE Target Wake Time; leave unset to preserve the profile value.'));
+							add_dep_eht_radio_feature(o);
+							o.value('', _('Use profile setting'));
+							o.value('1', _('Enabled'));
+							o.value('0', _('Disabled'));
+							o.optional = true;
+							o.rmempty = true;
+							o.retain = true;
+						}
 					}
 
 					var is_dbdc_main = uci.get('wireless', radioNet.getWifiDeviceName(), 'dbdc_main') == '1';
@@ -1488,9 +1782,41 @@ return view.extend({
 					o = ss.taboption('general', form.Flag, 'hidden', _('Hide <abbr title="Extended Service Set Identifier">ESSID</abbr>'), _('Where the ESSID is hidden, clients may fail to roam and airtime efficiency may be significantly reduced.'));
 					o.depends('mode', 'ap');
 
-					o = ss.taboption('general', form.Flag, 'mlo', _('Enable MLO'));
-					o.depends('mode', 'ap');
-					o.default = o.disabled;
+	o = ss.taboption('general', form.Value, 'mldgroup', _('MLO Group'), _('0 disables MLO; interfaces in the same group must use identical SSID and security settings. Leave unset to preserve the profile setting. A profile-inherited group is checked by the backend when saving.'));
+					add_dep_eht_ap_feature(o);
+					o.datatype = 'range(0,16)';
+					o.optional = true;
+					o.rmempty = true;
+					o.retain = true;
+					o.placeholder = _('Use profile setting');
+					o.cfgvalue = function(section_id) {
+						var group = uci.get('wireless', section_id, 'mldgroup');
+						if (group != null && group !== '')
+							return group;
+
+						var legacy = uci.get('wireless', section_id, 'mlo');
+						return legacy == '1' ? '1' : (legacy == '0' ? '0' : null);
+					};
+					o.write = function(section_id, value) {
+						var current = this.cfgvalue(section_id);
+						if (String(value == null ? '' : value) === String(current == null ? '' : current))
+							return;
+
+						if (value == null || value === '') {
+							uci.unset('wireless', section_id, 'mldgroup');
+							return;
+						}
+
+						uci.set('wireless', section_id, 'mldgroup', value);
+						uci.unset('wireless', section_id, 'mlo');
+					};
+					o.remove = function(section_id) {
+						uci.unset('wireless', section_id, 'mldgroup');
+						uci.unset('wireless', section_id, 'mlo');
+					};
+					o.validate = function(section_id, value) {
+						return validateMtkMloForm(this.map, section_id, value) || true;
+					};
 
 					o = ss.taboption('general', form.Flag, 'wmm', _('WMM Mode'));
 					o.depends('mode', 'ap');
