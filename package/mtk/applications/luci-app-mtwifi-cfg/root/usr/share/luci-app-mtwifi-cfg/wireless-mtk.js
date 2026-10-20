@@ -55,6 +55,7 @@ function mlo_error_text(code) {
 		reload_failed: _('Wireless reload failed; the saved configuration needs attention'),
 		runtime_unverified: _('Wireless settings have not been confirmed; recovery remains available for retry.'),
 		external_change_detected: _('Settings changed outside this page; recovery was stopped'),
+		invalid_response: _('The MLO service returned invalid data'),
 		invalid_request: _('The MLO request is invalid'),
 		operation_not_allowed: _('This MLO operation is not allowed'),
 		pending_changes: _('Apply or discard other wireless changes before managing MLO.')
@@ -63,14 +64,74 @@ function mlo_error_text(code) {
 	return messages[code] || _('The MLO operation failed');
 }
 
+function mlo_invalid_response() {
+	throw { code: 'invalid_response' };
+}
+
+function mlo_normalize_list(value) {
+	if (Array.isArray(value))
+		return value;
+	if (value && typeof value == 'object' && Object.keys(value).length == 0)
+		return [];
+	mlo_invalid_response();
+}
+
+function mlo_normalize_member(member) {
+	if (!member || typeof member != 'object' || Array.isArray(member) ||
+		typeof member.section != 'string' || !member.section)
+		mlo_invalid_response();
+	return member;
+}
+
+function mlo_normalize_group(group) {
+	if (!group || typeof group != 'object' || Array.isArray(group))
+		mlo_invalid_response();
+	var members = mlo_normalize_list(group.members);
+	if (!members.length)
+		mlo_invalid_response();
+	members.forEach(mlo_normalize_member);
+	group.members = members;
+	return group;
+}
+
+function mlo_normalize_rpc_response(response, action) {
+	if (!response || typeof response != 'object' || Array.isArray(response))
+		mlo_invalid_response();
+	if (action == 'status' || Object.prototype.hasOwnProperty.call(response, 'groups')) {
+		response.groups = mlo_normalize_list(response.groups);
+		response.groups.forEach(mlo_normalize_group);
+	}
+	if (action == 'status' || Object.prototype.hasOwnProperty.call(response, 'inventory')) {
+		response.inventory = mlo_normalize_list(response.inventory);
+		response.inventory.forEach(function(item) {
+			if (!item || typeof item != 'object' || Array.isArray(item) ||
+				typeof item.section != 'string' || !item.section ||
+				typeof item.device != 'string' || !item.device)
+				mlo_invalid_response();
+		});
+	}
+	if (Object.prototype.hasOwnProperty.call(response, 'members')) {
+		response.members = mlo_normalize_list(response.members);
+		response.members.forEach(mlo_normalize_member);
+		if (action == 'preview' && (response.members.length < 2 || response.members.length > 3))
+			mlo_invalid_response();
+	}
+	if (Object.prototype.hasOwnProperty.call(response, 'group') && response.group != null)
+		response.group = mlo_normalize_group(response.group);
+	return response;
+}
+
 function mlo_rpc(executable, action, payload) {
 	return fs.exec(executable, [ action, JSON.stringify(payload || {}) ]).then(function(result) {
 		var response;
 		try { response = JSON.parse(result.stdout || '{}'); }
 		catch (e) { throw { code: 'invalid_response' }; }
+		if (!response || typeof response != 'object' || Array.isArray(response))
+			throw { code: 'invalid_response' };
 		if (result.code != 0 || !response.ok)
 			throw { code: response.code || 'operation_failed' };
-		return response;
+		try { return mlo_normalize_rpc_response(response, action); }
+		catch (e) { throw { code: 'invalid_response' }; }
 	});
 }
 
@@ -113,8 +174,9 @@ form.AbstractSection.prototype.handleModalCancel = function(modalMap, ev, isSavi
 };
 
 function mlo_group_for_section(status, section_id) {
-	return (status.groups || []).filter(function(group) {
-		return group.members.some(function(member) { return member.section == section_id; });
+	var groups = mlo_normalize_list(status && status.groups);
+	return groups.filter(function(group) {
+		return mlo_normalize_group(group).members.some(function(member) { return member.section == section_id; });
 	})[0] || null;
 }
 
@@ -208,9 +270,9 @@ function mlo_summary_item(cells, single) {
 }
 
 function mlo_render_group_editor(state, section_id, group) {
-	var inventory = (state.status && state.status.inventory) || [];
+	var inventory = mlo_normalize_list(state.status && state.status.inventory);
 	var editing = !!group;
-	var member_ids = editing ? group.members.map(function(member) { return member.section; }) : [];
+	var member_ids = editing ? mlo_normalize_group(group).members.map(function(member) { return member.section; }) : [];
 	var candidates = inventory.filter(function(item) {
 		return item.eligible !== false && !item.disabled && (!item.grouped || (editing && member_ids.indexOf(item.section) >= 0));
 	});
