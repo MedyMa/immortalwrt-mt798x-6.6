@@ -1,0 +1,19 @@
+{
+	"luci-app-mtwifi-cfg": {
+		"description": "Grant access to mtwifi configuration and MLO management",
+		"read": {
+			"file": {
+				"/usr/sbin/iwpriv": ["exec"],
+				"/usr/sbin/mwctl": ["exec"],
+				"/usr/sbin/mtwifi-mlo-status": ["exec"]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/iwpriv": ["exec"],
+				"/usr/sbin/mwctl": ["exec"],
+				"/usr/sbin/mtwifi-mlo-control": ["exec"]
+			}
+		}
+	}
+}

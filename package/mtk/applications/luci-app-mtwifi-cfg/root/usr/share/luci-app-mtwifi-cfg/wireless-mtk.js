@@ -32,6 +32,502 @@ function count_changes(section_id) {
 	return n;
 }
 
+function mlo_error_text(code) {
+	var messages = {
+		busy: _('Another MLO operation is in progress'),
+		member_count: _('Select two or three access points'),
+		invalid_member: _('The selected access point is no longer available'),
+		unsupported_member: _('MLO is only available for supported vendor EHT access points'),
+		duplicate_radio: _('Select no more than one access point per radio'),
+		already_grouped: _('An access point already belongs to another MLO group'),
+		security_mismatch: _('Security settings do not match'),
+		unsupported_security: _('This security mode cannot be checked safely'),
+		invalid_ssid: _('Enter a valid wireless name'),
+		no_group_id: _('No MLO group number is available'),
+		group_limit: _('No MLO group is available; close an existing group first.'),
+		conflict: _('Settings changed outside this page; review them before continuing'),
+		state_corrupt: _('MLO recovery data is damaged; do not overwrite it'),
+		state_write_failed: _('Could not save MLO recovery data'),
+		apply_failed_recovery_required: _('Applying failed. Check the recovery status before retrying'),
+		needs_recovery: _('Wireless changes are not confirmed; the recovery record is saved for another attempt.'),
+		operation_pending: _('Wireless is still applying or restoring. The recovery record is saved; check again later.'),
+		restore_failed: _('Recovery failed; use the recovery action again after checking the settings'),
+		reload_failed: _('Wireless reload failed; the saved configuration needs attention'),
+		runtime_unverified: _('Wireless settings have not been confirmed; recovery remains available for retry.'),
+		external_change_detected: _('Settings changed outside this page; recovery was stopped'),
+		invalid_request: _('The MLO request is invalid'),
+		operation_not_allowed: _('This MLO operation is not allowed'),
+		pending_changes: _('Apply or discard other wireless changes before managing MLO.')
+	};
+
+	return messages[code] || _('The MLO operation failed');
+}
+
+function mlo_rpc(executable, action, payload) {
+	return fs.exec(executable, [ action, JSON.stringify(payload || {}) ]).then(function(result) {
+		var response;
+		try { response = JSON.parse(result.stdout || '{}'); }
+		catch (e) { throw { code: 'invalid_response' }; }
+		if (result.code != 0 || !response.ok)
+			throw { code: response.code || 'operation_failed' };
+		return response;
+	});
+}
+
+function mlo_wait_for_operation(id, attempts) {
+	return mlo_rpc('/usr/sbin/mtwifi-mlo-control', 'poll', { id: Number(id) }).then(function(result) {
+		if (!result.pending)
+			return result;
+		if (attempts <= 1)
+			throw { code: 'operation_pending' };
+		return new Promise(function(resolve) { setTimeout(resolve, 1000); }).then(function() {
+			return mlo_wait_for_operation(id, attempts - 1);
+		});
+	});
+}
+
+function mlo_has_pending_wireless_changes() {
+	var state = uci.state || {};
+	for (var key of [ 'changes', 'creates', 'deletes', 'reorder' ]) {
+		if (state[key] && state[key].wireless && Object.keys(state[key].wireless).length)
+			return true;
+	}
+	return false;
+}
+
+function mlo_manager_buttons(buttons) {
+	return E('div', { 'class': 'right' }, buttons);
+}
+
+function mlo_clear(node) {
+	while (node.firstChild)
+		node.removeChild(node.firstChild);
+}
+
+var mlo_pending_action = null;
+var mlo_handle_modal_cancel = form.AbstractSection.prototype.handleModalCancel;
+form.AbstractSection.prototype.handleModalCancel = function(modalMap, ev, isSaving) {
+	if (!isSaving)
+		mlo_pending_action = null;
+	return mlo_handle_modal_cancel.call(this, modalMap, ev, isSaving);
+};
+
+function mlo_group_for_section(status, section_id) {
+	return (status.groups || []).filter(function(group) {
+		return group.members.some(function(member) { return member.section == section_id; });
+	})[0] || null;
+}
+
+function mlo_pending_changes() {
+	var state = uci.state || {};
+	for (var key of [ 'changes', 'creates', 'deletes', 'reorder' ]) {
+		if (!state[key]) continue;
+		for (var config in state[key])
+			if (state[key][config] && Object.keys(state[key][config]).length)
+				return true;
+	}
+	return false;
+}
+
+function mlo_pending_wireless_changes() {
+	var state = uci.state || {};
+	for (var key of [ 'changes', 'creates', 'deletes', 'reorder' ])
+		if (state[key] && state[key].wireless && Object.keys(state[key].wireless).length)
+			return true;
+	return false;
+}
+
+function mlo_same_payload(a, b) {
+	return !!a && !!b && a.ssid == b.ssid && a.revision == b.revision &&
+		JSON.stringify((a.members || []).slice().sort()) == JSON.stringify((b.members || []).slice().sort());
+}
+
+function mlo_request_fingerprint(payload) {
+	return JSON.stringify({
+		group_id: payload.group_id == null ? null : Number(payload.group_id),
+		members: (payload.members || []).slice().sort(),
+		ssid: String(payload.ssid || '')
+	});
+}
+
+function mlo_stage_action(state, section_id, value) {
+	var enabled = String(value) == '1';
+	if (state.group) {
+		if (!enabled) {
+			mlo_pending_action = { owner: section_id, action: 'close', payload: { id: Number(state.group.id) } };
+		}
+		else if (state.operation == 'edit' && state.payload) {
+			mlo_pending_action = { owner: section_id, action: 'edit', payload: state.payload };
+		}
+		else if (mlo_pending_action && mlo_pending_action.owner == section_id && mlo_pending_action.action == 'close') {
+			mlo_pending_action = null;
+		}
+		return;
+	}
+
+	if (enabled && state.operation == 'create' && state.payload) {
+		mlo_pending_action = { owner: section_id, action: 'create', payload: state.payload };
+	}
+	else if (mlo_pending_action && mlo_pending_action.owner == section_id) {
+		mlo_pending_action = null;
+	}
+}
+
+function mlo_install_inline_styles() {
+	if (document.getElementById('mlo-inline-styles'))
+		return;
+
+	var style = E('style', { 'id': 'mlo-inline-styles' }, `
+.mlo-inline-control { display: inline-flex; align-items: center; }
+.mlo-inline-row .mlo-member-list { display: flex; width: 100%; flex-direction: column; align-items: flex-start; gap: .35rem; }
+.mlo-inline-row .mlo-member-choice { display: flex; align-items: center; justify-content: flex-start; gap: .55rem; width: max-content; max-width: 100%; line-height: 1.5; }
+.mlo-inline-row .mlo-member-choice input[type="checkbox"] { flex: 0 0 1rem; width: 1rem !important; min-width: 1rem !important; height: 1rem !important; margin: 0; }
+.mlo-inline-row .mlo-inline-ssid { width: 16rem; max-width: 100%; min-width: 0; }
+.mlo-inline-row .mlo-inline-note { margin: .25rem 0; line-height: 1.5; }
+.mlo-inline-row .mlo-summary-list { display: grid; width: min(100%, 42rem); }
+.mlo-inline-row .mlo-summary-item { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr) minmax(0, 1fr); gap: .5rem; padding: .3rem .2rem; border-bottom: 1px solid var(--border-color, rgba(127,127,127,.35)); color: inherit; line-height: 1.5; }
+.mlo-inline-row .mlo-summary-item > span { min-width: 0; overflow-wrap: anywhere; }
+.mlo-inline-row .mlo-summary-head { font-weight: 600; opacity: .8; }
+.mlo-inline-row .mlo-summary-item.mlo-summary-single { grid-template-columns: 4.5rem minmax(0, 1fr); }
+.mlo-inline-row .mlo-inline-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.mlo-inline-row .mlo-inline-message { margin: .25rem 0; line-height: 1.5; }
+.mlo-inline-row .mlo-inline-member { display: flex; gap: .6rem; line-height: 1.5; padding: .2rem 0; }
+.mlo-inline-row .mlo-inline-member > :first-child { flex: 0 0 4.5rem; }
+@media screen and (max-width: 600px) {
+	.mlo-inline-row .mlo-inline-ssid { width: 100%; min-width: 0; }
+	.mlo-inline-row .mlo-summary-item { grid-template-columns: 3.5rem minmax(0, 1fr) minmax(0, 1fr); gap: .25rem; }
+	.mlo-inline-row .mlo-summary-item.mlo-summary-single { grid-template-columns: 3.5rem minmax(0, 1fr); }
+}
+`);
+	document.head.appendChild(style);
+}
+
+function mlo_summary_item(cells, single) {
+	return E('div', { 'class': 'mlo-summary-item' + (single ? ' mlo-summary-single' : '') },
+		cells.map(function(value) { return E('span', {}, value); }));
+}
+
+function mlo_render_group_editor(state, section_id, group) {
+	var inventory = (state.status && state.status.inventory) || [];
+	var editing = !!group;
+	var member_ids = editing ? group.members.map(function(member) { return member.section; }) : [];
+	var candidates = inventory.filter(function(item) {
+		return item.eligible !== false && !item.disabled && (!item.grouped || (editing && member_ids.indexOf(item.section) >= 0));
+	});
+	var selected = [];
+	if (editing) {
+		selected = member_ids.slice();
+	}
+	else if (state.operation == 'create' && state.payload) {
+		selected = state.payload.members.slice();
+	}
+	else {
+		var by_device = {};
+		candidates.sort(function(a, b) {
+			var order = { '2.4G': 0, '5G': 1, '6G': 2 };
+			return (order[a.band] || 0) - (order[b.band] || 0);
+		});
+		var current = candidates.filter(function(item) { return item.section == section_id; })[0];
+		if (current) {
+			selected.push(current.section);
+			by_device[current.device] = true;
+		}
+		candidates.forEach(function(item) {
+			if (selected.length < 3 && !by_device[item.device]) {
+				selected.push(item.section);
+				by_device[item.device] = true;
+			}
+		});
+	}
+
+	var list = E('div', { 'class': 'mlo-member-list' });
+	var inputs = [];
+	candidates.forEach(function(item) {
+		var is_current = item.section == section_id;
+		var checkbox = E('input', { 'type': 'checkbox', 'value': item.section, 'disabled': editing || is_current || null });
+		checkbox.checked = selected.indexOf(item.section) >= 0;
+		inputs.push(checkbox);
+		list.appendChild(E('label', { 'class': 'mlo-member-choice' }, [ checkbox, E('strong', {}, item.band + ' · ' + item.ssid) ]));
+	});
+	if (!candidates.length || !candidates.some(function(item) { return item.section == section_id; }))
+		list.appendChild(E('p', { 'class': 'alert-message warning mlo-inline-note' }, _('This access point is not available for MLO.')));
+	var member_help = E('p', { 'class': 'cbi-value-description mlo-inline-note' }, _('Choose two or three radios on different bands.'));
+	var capacity_help = state.status && state.status.capabilities && state.status.capabilities.max_groups == 1 ?
+		E('p', { 'class': 'cbi-value-description mlo-inline-note' }, _('This driver supports one MLO group; close it before creating another.')) : null;
+
+	var ssid = E('input', { 'type': 'text', 'class': 'cbi-input-text mlo-inline-ssid', 'maxlength': '32', 'autocomplete': 'off' });
+	var preferred = candidates.filter(function(item) { return item.band == '5G'; })[0] || candidates[0];
+	ssid.value = editing ? group.members[0].ssid :
+		(state.operation == 'create' && state.payload ? state.payload.ssid : (preferred ? preferred.ssid : ''));
+	var ssid_help = E('p', { 'class': 'cbi-value-description mlo-inline-note' }, _('The selected access points will use this name.'));
+	var password = E('span', { 'class': 'mlo-inline-note' }, _('Keep existing password'));
+	var summary = E('div', { 'class': 'mlo-summary-list mlo-change-summary' });
+	var message = E('p', { 'class': 'mlo-inline-message' }, _('Review the changes again after changing the selection or wireless name.'));
+	var preview_button = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Review changes'));
+	var stage_text = E('p', { 'class': 'cbi-value-description mlo-inline-note' }, _('Save this interface, then choose Save & Apply.'));
+	var preview_generation = 0, active_preview_key = null;
+	var current_request = function() {
+		var members = inputs.filter(function(input) { return input.checked; }).map(function(input) { return input.value; });
+		var request = { members: members, ssid: ssid.value };
+		if (editing) request.group_id = Number(group.id);
+		return request;
+	};
+	var invalidate = function() {
+		preview_generation++;
+		active_preview_key = null;
+		if (mlo_pending_action && mlo_pending_action.owner == section_id) mlo_pending_action = null;
+		state.operation = null;
+		state.payload = null;
+		state.preview = null;
+		state.editor.previewed = false;
+		if (state.refreshValidation)
+			state.refreshValidation();
+		while (summary.firstChild) summary.removeChild(summary.firstChild);
+		message.textContent = _('Review the changes again after changing the selection or wireless name.');
+		preview_button.style.display = '';
+		preview_button.disabled = false;
+		state.refreshRows();
+	};
+	inputs.forEach(function(input) { input.addEventListener('change', invalidate); });
+	ssid.addEventListener('input', invalidate);
+	preview_button.addEventListener('click', function() {
+		var chosen = inputs.filter(function(input) { return input.checked; }).map(function(input) { return input.value; });
+		if (chosen.length < 2 || chosen.length > 3) {
+			message.textContent = _('Select two or three access points.');
+			return;
+		}
+		var devices = {};
+		for (var i = 0; i < chosen.length; i++) {
+			var item = candidates.filter(function(candidate) { return candidate.section == chosen[i]; })[0];
+			if (!item || devices[item.device]) {
+				message.textContent = _('Select one access point per radio.');
+				return;
+			}
+			devices[item.device] = true;
+		}
+		if (chosen.indexOf(section_id) < 0) {
+			message.textContent = _('Include the access point currently being edited.');
+			return;
+		}
+		var payload = { members: chosen.slice(), ssid: String(ssid.value) };
+		if (editing) payload.group_id = Number(group.id);
+		var fingerprint = mlo_request_fingerprint(payload);
+		var generation = ++preview_generation;
+		active_preview_key = fingerprint;
+		preview_button.disabled = true;
+		mlo_rpc('/usr/sbin/mtwifi-mlo-status', 'preview', JSON.parse(JSON.stringify(payload))).then(function(result) {
+			if (generation != preview_generation || active_preview_key != fingerprint) return;
+			if (mlo_request_fingerprint(current_request()) != fingerprint) { invalidate(); return; }
+			if (!result || typeof result.revision != 'string' || !Array.isArray(result.members)) {
+				message.textContent = mlo_error_text('invalid_response');
+				preview_button.disabled = false;
+				return;
+			}
+			while (summary.firstChild) summary.removeChild(summary.firstChild);
+			summary.appendChild(mlo_summary_item([ _('Frequency'), _('Current name'), _('New name') ], false));
+			summary.lastChild.classList.add('mlo-summary-head');
+			result.members.forEach(function(member) {
+				summary.appendChild(mlo_summary_item([ member.band, member.ssid, result.ssid ], false));
+			});
+			message.textContent = _('Security settings match. Password and security settings will remain unchanged.');
+			state.operation = editing ? 'edit' : 'create';
+			var reviewed_members = payload.members.slice();
+			state.payload = editing ? { id: Number(group.id), members: reviewed_members, ssid: payload.ssid, revision: result.revision } :
+				{ members: reviewed_members, ssid: payload.ssid, revision: result.revision };
+			state.preview = { members: reviewed_members.slice(), ssid: payload.ssid, revision: result.revision };
+			state.editor.previewed = true;
+			if (state.refreshValidation)
+				state.refreshValidation();
+			if (mlo_pending_action && mlo_pending_action.owner == section_id)
+				mlo_pending_action = null;
+			preview_button.style.display = 'none';
+			state.refreshRows();
+		}).catch(function(error) {
+			if (generation != preview_generation || active_preview_key != fingerprint) return;
+			if (mlo_request_fingerprint(current_request()) != fingerprint) { invalidate(); return; }
+			message.textContent = mlo_error_text(error.code);
+			preview_button.disabled = false;
+		});
+	});
+
+	return {
+		members: E('div', {}, [ list, member_help, capacity_help ]),
+		ssid: E('div', {}, [ ssid, ssid_help ]),
+		password: password,
+		summary: summary,
+		actions: E('div', {}, [ message, E('div', { 'class': 'mlo-inline-actions' }, [ preview_button, stage_text ]) ])
+	};
+}
+
+function mlo_render_group_status(state, section_id) {
+	var group = state.group;
+	var label = group.state == 'saved' ?
+		(group.runtime == 'config_applied' ? _('Configuration applied · MLO link unverified') : _('Saved · runtime not verified')) :
+		(group.state == 'applying' ? _('Applying') :
+		(group.state == 'recovery_pending' ? _('Waiting for wireless confirmation') :
+		(group.state == 'restore_failed' ? _('Restore failed') : _('Needs attention'))));
+	var member_list = E('div', { 'class': 'mlo-summary-list' });
+	group.members.forEach(function(member) {
+		member_list.appendChild(mlo_summary_item([ member.band, member.ssid ], true));
+	});
+	var manage = E('button', { 'class': 'cbi-button cbi-button-action', 'click': function() {
+		state.editing = true;
+		state.refreshRows();
+	} }, _('Manage'));
+	var close = E('button', { 'class': 'cbi-button cbi-button-negative', 'click': function() {
+		state.checkbox.checked = false;
+		state.checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+	} }, _('Close and restore'));
+	var actions = [];
+	if (state.can_create)
+		actions.push(manage);
+	actions.push(close);
+	return E('div', {}, [ E('p', { 'class': 'mlo-inline-note' }, label), member_list, E('div', { 'class': 'mlo-inline-actions' }, actions) ]);
+}
+
+function mlo_render_restore_summary(state) {
+	var members = E('div', { 'class': 'mlo-summary-list' });
+	state.group.members.forEach(function(member) {
+		members.appendChild(mlo_summary_item([ member.band, member.original_ssid || member.ssid ], true));
+	});
+	return E('div', {}, [
+		E('p', { 'class': 'mlo-inline-note' }, _('The original wireless names will be restored.')),
+		members,
+		E('p', { 'class': 'cbi-value-description mlo-inline-note' }, _('Passwords, security settings and network bindings will not change.')),
+		E('p', { 'class': 'cbi-value-description mlo-inline-note' }, _('Your settings will be checked before restoring. If they changed elsewhere, you will be asked what to do.'))
+	]);
+}
+
+function mlo_add_display_option(section, state, section_id, key, title, render_value) {
+	var row = section.taboption('general', form.DummyValue, key, title);
+	row.retain = true;
+	row.cfgvalue = function() { return ''; };
+	row.parse = function() { return Promise.resolve(); };
+	row.write = function() {};
+	row.remove = function() {};
+	row.renderWidget = function() { return render_value(); };
+	var render = row.render;
+	row.render = function(option_index, id, in_table) {
+		return render.call(this, option_index, id, in_table).then(function(node) {
+			node.classList.add('mlo-inline-row', 'mlo-inline-row-' + key);
+			state.rows[key] = node;
+			state.refreshRows();
+			return node;
+		});
+	};
+	return row;
+}
+
+function add_mlo_interface_option(section, section_id, radioNet) {
+	var device = radioNet.getWifiDeviceName();
+	var htmode = uci.get('wireless', device, 'htmode') || '';
+	if (uci.get('wireless', device, 'type') != 'mtwifi')
+		return;
+
+	mlo_install_inline_styles();
+	var state = { status: null, group: null, operation: null, payload: null, preview: null, checkbox: null, rows: {}, editing: false, editor: null,
+		can_create: radioNet.getMode() == 'ap' && uci.get('wireless', section_id, 'wds') != '1' && /^EHT/.test(htmode) };
+	var option = section.taboption('general', form.Flag, '_mlo_enabled', _('Enable MLO'), _('MLO is off by default. Choose radios to create a group; security and passwords are not changed.'));
+	option.optional = false;
+	option.rmempty = false;
+	state.refreshRows = function() {
+		var enabled = !!(state.checkbox && state.checkbox.checked);
+		var editor_visible = enabled && (!state.group || state.editing);
+		var visibility = {
+			_mlo_members: editor_visible,
+			_mlo_ssid: editor_visible,
+			_mlo_password: editor_visible,
+			_mlo_summary: editor_visible && !!(state.editor && state.editor.previewed),
+			_mlo_actions: editor_visible,
+			_mlo_status: enabled && !!state.group && !state.editing,
+			_mlo_restore: !enabled && !!state.group
+		};
+		Object.keys(visibility).forEach(function(key) {
+			if (state.rows[key])
+				state.rows[key].style.display = visibility[key] ? '' : 'none';
+		});
+	};
+	state.getEditor = function() {
+		if (!state.editor)
+			state.editor = mlo_render_group_editor(state, section_id, state.group);
+		return state.editor;
+	};
+	state.refreshValidation = function() {
+		var widget = option.getUIElement(section_id);
+		if (widget)
+			widget.triggerValidation();
+	};
+	option.enabled = '1';
+	option.disabled = '0';
+	option.default = '0';
+	option.retain = true;
+	option.depends('mode', 'ap');
+	option.load = function(id) {
+		return mlo_rpc('/usr/sbin/mtwifi-mlo-status', 'status', {}).then(function(status) {
+			state.status = status;
+			state.group = mlo_group_for_section(status, id);
+			if (mlo_pending_action && mlo_pending_action.owner == id) {
+				state.operation = mlo_pending_action.action;
+				state.payload = mlo_pending_action.payload;
+				state.preview = mlo_pending_action.payload;
+			}
+			return (state.group && !(mlo_pending_action && mlo_pending_action.owner == id && mlo_pending_action.action == 'close')) ||
+				(mlo_pending_action && mlo_pending_action.owner == id && mlo_pending_action.action != 'close') ? '1' : '0';
+		});
+	};
+	option.cfgvalue = function(id) {
+		if (mlo_pending_action && mlo_pending_action.owner == id)
+			return mlo_pending_action.action == 'close' ? '0' : '1';
+		return state.group ? '1' : '0';
+	};
+	option.validate = function(id, value) {
+		value = option.formvalue(id);
+		if (mlo_pending_action && mlo_pending_action.owner != id)
+			return _('Finish the other MLO change before starting another one.');
+		if (!state.group && String(value) == '1' &&
+		    (state.operation != 'create' || !state.payload || !state.preview || !mlo_same_payload(state.payload, state.preview)))
+			return _('Review the MLO changes before saving this interface.');
+		if (state.group && String(value) == '1' && state.operation == 'edit' && !state.payload)
+			return _('Review the MLO changes before saving this interface.');
+		return true;
+	};
+	option.write = function(id, value) {
+		mlo_stage_action(state, id, value);
+	};
+	option.remove = function() {};
+	option.renderWidget = function(id, option_index, cfgvalue) {
+		var widget = form.Flag.prototype.renderWidget.call(this, id, option_index, cfgvalue);
+		var checkbox = widget.querySelector('input[type="checkbox"]');
+		state.checkbox = checkbox;
+		var caps = state.status && state.status.capabilities;
+		var at_capacity = !state.group && caps && state.status.groups && state.status.groups.length >= caps.max_groups;
+		checkbox.disabled = (!state.can_create && !state.group) || !!at_capacity;
+		checkbox.addEventListener('change', state.refreshRows);
+		var control = E('div', { 'class': 'mlo-inline-control' }, widget);
+		setTimeout(state.refreshRows, 0);
+		return control;
+	};
+
+	mlo_add_display_option(section, state, section_id, '_mlo_members', _('Select radios'), function() { return state.getEditor().members; });
+	mlo_add_display_option(section, state, section_id, '_mlo_ssid', _('Wireless name'), function() { return state.getEditor().ssid; });
+	mlo_add_display_option(section, state, section_id, '_mlo_password', _('Password'), function() { return state.getEditor().password; });
+	mlo_add_display_option(section, state, section_id, '_mlo_summary', _('Change summary'), function() { return state.getEditor().summary; });
+	mlo_add_display_option(section, state, section_id, '_mlo_actions', _('Actions'), function() { return state.getEditor().actions; });
+	mlo_add_display_option(section, state, section_id, '_mlo_status', _('MLO status'), function() {
+		return state.group ? mlo_render_group_status(state, section_id) : E('span', {});
+	});
+	mlo_add_display_option(section, state, section_id, '_mlo_restore', _('Restore'), function() {
+		return state.group ? mlo_render_restore_summary(state) : E('span', {});
+	});
+}
+
+function mlo_show_save_error(error) {
+	ui.showModal(_('MLO was not applied'), [
+		E('p', {}, mlo_error_text(error && error.code)),
+		E('div', { 'class': 'button-row' }, E('button', { 'class': 'btn cbi-button', 'click': ui.hideModal }, _('Close')))
+	]);
+}
+
 function render_radio_badge(radioDev) {
 	return E('span', { 'class': 'ifacebadge' }, [
 		E('img', { 'src': L.resource('icons/wifi%s.svg').format(radioDev.isUp() ? '' : '_disabled') }),
@@ -148,7 +644,7 @@ function mtkMldGroup(config) {
 
 	value = config.mlo;
 	if (value == null || value === '')
-		return { valid: true, value: null };
+		return { valid: true, value: 0 };
 
 	if (value === true || value === 1 || value === '1')
 		return { valid: true, value: 1 };
@@ -275,15 +771,25 @@ function validateMtkMloGroups(records, focusedDevice) {
 		    !group.value)
 			continue;
 
-		(groups[group.value] || (groups[group.value] = [])).push(mtkMloSecurity(current));
+		var legacyBoolean = (old.mldgroup == null || old.mldgroup === '') &&
+			mtkMloDisabled(old.mlo) && !changed && !groupChanged;
+		(groups[group.value] || (groups[group.value] = [])).push({
+			security: mtkMloSecurity(current), legacyBoolean: legacyBoolean
+		});
 	}
 
 	for (var group in affected) {
 		var members = groups[group];
 		if (members && members.length > 1) {
+			var legacyOnly = true;
 			for (var k = 1; k < members.length; k++)
-				if (members[k] !== members[0])
-					return _('MLO group %s requires matching SSID and security settings').format(group);
+				if (members[k].security !== members[0].security) {
+					for (var n = 0; n < members.length; n++)
+						legacyOnly = legacyOnly && members[n].legacyBoolean;
+					if (!legacyOnly)
+						return _('MLO group %s requires matching SSID and security settings').format(group);
+					break;
+				}
 		}
 	}
 
@@ -326,9 +832,14 @@ function validateMtkMloForm(map, currentSection, currentGroup) {
 		for (var j = 0; j < fields.length; j++) {
 			var name = fields[j];
 			original[name] = uci.get('wireless', id, name);
-			current[name] = id === currentSection && name === 'mldgroup'
-				? currentGroup
-				: useFormValues ? formValue(name, id, original[name]) : original[name];
+			if (id === currentSection && name === 'mldgroup') {
+				var oldGroup = mtkMldGroup(original);
+				current[name] = oldGroup.valid && Number(currentGroup) === oldGroup.value
+					? original[name] : currentGroup;
+			}
+			else {
+				current[name] = useFormValues ? formValue(name, id, original[name]) : original[name];
+			}
 		}
 
 		records.push({
@@ -680,9 +1191,18 @@ function add_dep_be_feature(o) {
 }
 
 function add_dep_eht_ap_feature(o) {
-	[ 'EHT20', 'EHT40', 'EHT80', 'EHT80_80', 'EHT160', 'EHT320' ].forEach(function(mode) {
-		o.depends({ '_freq': mode, 'mode': 'ap', '!contains': true });
-	});
+	o.depends('mode', 'ap');
+	var checkDepends = o.checkDepends;
+	o.checkDepends = function(section_id) {
+		if (!checkDepends.call(this, section_id))
+			return false;
+
+		var device = uci.get('wireless', section_id, 'device'),
+			freq = device && this.map.lookupOption('_freq', device, 'wireless'),
+			value = freq && freq[0].formvalue(freq[1]);
+
+		return Array.isArray(value) && /^EHT/.test(String(value[0] || ''));
+	};
 }
 
 function add_dep_eht_radio_feature(o) {
@@ -1782,45 +2302,11 @@ return view.extend({
 					o = ss.taboption('general', form.Flag, 'hidden', _('Hide <abbr title="Extended Service Set Identifier">ESSID</abbr>'), _('Where the ESSID is hidden, clients may fail to roam and airtime efficiency may be significantly reduced.'));
 					o.depends('mode', 'ap');
 
-	o = ss.taboption('general', form.Value, 'mldgroup', _('MLO Group'), _('0 disables MLO; interfaces in the same group must use identical SSID and security settings. Leave unset to preserve the profile setting. A profile-inherited group is checked by the backend when saving.'));
-					add_dep_eht_ap_feature(o);
-					o.datatype = 'range(0,16)';
-					o.optional = true;
-					o.rmempty = true;
-					o.retain = true;
-					o.placeholder = _('Use profile setting');
-					o.cfgvalue = function(section_id) {
-						var group = uci.get('wireless', section_id, 'mldgroup');
-						if (group != null && group !== '')
-							return group;
-
-						var legacy = uci.get('wireless', section_id, 'mlo');
-						return legacy == '1' ? '1' : (legacy == '0' ? '0' : null);
-					};
-					o.write = function(section_id, value) {
-						var current = this.cfgvalue(section_id);
-						if (String(value == null ? '' : value) === String(current == null ? '' : current))
-							return;
-
-						if (value == null || value === '') {
-							uci.unset('wireless', section_id, 'mldgroup');
-							return;
-						}
-
-						uci.set('wireless', section_id, 'mldgroup', value);
-						uci.unset('wireless', section_id, 'mlo');
-					};
-					o.remove = function(section_id) {
-						uci.unset('wireless', section_id, 'mldgroup');
-						uci.unset('wireless', section_id, 'mlo');
-					};
-					o.validate = function(section_id, value) {
-						return validateMtkMloForm(this.map, section_id, value) || true;
-					};
-
 					o = ss.taboption('general', form.Flag, 'wmm', _('WMM Mode'));
 					o.depends('mode', 'ap');
 					o.default = o.enabled;
+
+					add_mlo_interface_option(ss, s.section, radioNet);
 
 					o = ss.taboption('advanced', form.Flag, 'isolate', _('Isolate Clients'), _('Prevents client-to-client communication'));
 					o.depends('mode', 'ap');
@@ -3033,9 +3519,42 @@ return view.extend({
 
 			cbi_update_table(table, [], E('em', { 'class': 'spinning' }, _('Collecting data...')))
 
-			return E([ nodes, E('h3', _('Associated Stations')), table ]);
+						return E([ nodes, E('h3', _('Associated Stations')), table ]);
 		}, this, m));
 	},
 
-	handleReset: null
+	handleSaveApply: function(ev, mode) {
+		if (!mlo_pending_action)
+			return this.super('handleSaveApply', [ ev, mode ]);
+
+		if (mode != '0') {
+			mlo_pending_action = null;
+			ui.addNotification(null, E('p', _('MLO changes were not applied. Use Save & Apply to manage MLO.')));
+			return this.super('handleSaveApply', [ ev, mode ]);
+		}
+
+		if (mlo_pending_changes()) {
+			mlo_pending_action = null;
+			ui.addNotification(null, E('p', _('Other changes will be applied first. Reopen the interface to make the MLO change separately.')));
+			return this.super('handleSaveApply', [ ev, mode ]);
+		}
+
+		var pending = mlo_pending_action;
+		ui.showModal(_('Applying MLO changes'), E('p', { 'class': 'spinning' }, _('Please wait…')));
+		return mlo_rpc('/usr/sbin/mtwifi-mlo-control', pending.action, pending.payload).then(function(result) {
+			return result.pending ? mlo_wait_for_operation(result.id || pending.payload.id, 360) : result;
+		}).then(function(result) {
+			mlo_pending_action = null;
+			if (result.state == 'rolled_back')
+				ui.addNotification(null, E('p', _('MLO could not be applied; the previous wireless settings were restored.')));
+			window.location.reload();
+		}).catch(function(error) {
+			mlo_pending_action = null;
+			mlo_show_save_error(error);
+		});
+	},
+	handleReset: function(ev) {
+		mlo_pending_action = null;
+		return this.super('handleReset', []);
+	}
 });

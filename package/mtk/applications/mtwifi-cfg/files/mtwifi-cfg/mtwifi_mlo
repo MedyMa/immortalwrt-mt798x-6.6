@@ -1,0 +1,865 @@
+#!/usr/bin/lua
+-- Restricted RPC helper for transactional vendor MLO group management.
+-- This executable never accepts or returns PSKs and never logs UCI values.
+
+local cjson = require "cjson"
+local nixio = require "nixio"
+local fs = require "nixio.fs"
+local uci = require "uci"
+local defs = require "mtwifi_defs"
+
+local STATE_DIR = "/etc/mtwifi-cfg"
+local STATE_FILE = STATE_DIR .. "/mlo-groups.json"
+local LOCK_FILE = "/var/lock/mtwifi-mlo-manager.lock"
+local MAX_MANAGED_GROUP = 1
+local lock_fd
+local MAX_REQUEST = 4096
+local OPERATION_TIMEOUT = 180
+local RELOAD_RETRY_INTERVAL = 8
+local MAX_RELOAD_ATTEMPTS = 5
+local RELOAD_TIMEOUT = 8
+local STATUS_TIMEOUT = 4
+local PROCESS_OUTPUT_LIMIT = 2097152
+local MANAGED = { "ssid", "mldgroup", "mlo" }
+local allowed_status = { status = true, preview = true }
+local allowed_control = { create = true, edit = true, close = true, poll = true, recover = true, ["recover-startup"] = true }
+
+local function emit(value)
+	io.write(cjson.encode(value), "\n")
+end
+
+local function result_error(code, message)
+	emit({ ok = false, code = code, message = message })
+end
+
+local function scalar(value)
+	if value == nil then return nil end
+	if type(value) == "boolean" then return value and "1" or "0" end
+	return tostring(value)
+end
+
+local function disabled(value)
+	value = scalar(value)
+	return value == "1" or value == "true" or value == "yes"
+end
+
+local function group_value(value, legacy)
+	local raw = scalar(value)
+	if raw ~= nil and raw ~= "" then
+		local n = tonumber(raw)
+		if not n or n < 0 or n > MAX_MANAGED_GROUP or n ~= math.floor(n) then return nil, false end
+		return n, true
+	end
+	if disabled(legacy) then return 1, true end
+	return 0, true
+end
+
+local function cursor()
+	return uci.cursor()
+end
+
+local function device_info(c, section)
+	local device = c:get("wireless", section, "device")
+	if not device or c:get("wireless", device, "type") ~= "mtwifi" then return nil end
+	local htmode = c:get("wireless", device, "htmode") or ""
+	local eht_modes = { EHT20 = true, EHT40 = true, EHT80 = true,
+		EHT80_80 = true, EHT160 = true, EHT320 = true }
+	if not eht_modes[htmode] then return nil end
+	return device, htmode
+end
+
+local function band_name(c, device, htmode)
+	local band = c:get("wireless", device, "band")
+	if band == "2g" or band == "2.4g" then return "2.4G" end
+	if band == "5g" then return "5G" end
+	if band == "6g" or htmode == "EHT320" then return "6G" end
+	local hwmode = c:get("wireless", device, "hwmode")
+	if hwmode == "a" then return "5G" end
+	return "未知频段"
+end
+
+local function normalize_names(value)
+	local names, seen = {}, {}
+	if type(value) == "table" then
+		for _, item in ipairs(value) do
+			if type(item) == "string" and item ~= "" and not seen[item] then seen[item] = true; names[#names + 1] = item end
+		end
+	elseif type(value) == "string" then
+		for item in value:gmatch("%S+") do if not seen[item] then seen[item] = true; names[#names + 1] = item end end
+	end
+	table.sort(names)
+	return names
+end
+
+local function network_signature(c, iface)
+	local names = normalize_names(iface.network)
+	if #names == 0 then return nil end
+	local rows = {}
+	for _, name in ipairs(names) do
+		if not name:match("^[%w_.%-]+$") then return nil end
+		local network = c:get_all("network", name)
+		if not network or network[".type"] ~= "interface" then return nil end
+		local device, ifname = normalize_names(network.device), normalize_names(network.ifname)
+		if #device == 0 and #ifname == 0 then return nil end
+		rows[#rows + 1] = { name, scalar(network.proto) or "", table.concat(device, " "), table.concat(ifname, " "), scalar(network.type) or "" }
+	end
+	return cjson.encode(rows)
+end
+
+local function interface_identity(c, section)
+	local iface = c:get_all("wireless", section)
+	if not iface or iface[".type"] ~= "wifi-iface" or type(iface.device) ~= "string" or iface.device == "" then return nil end
+	local device = c:get_all("wireless", iface.device)
+	local network = network_signature(c, iface)
+	if not device or not network then return nil end
+	return { section_type = iface[".type"], mode = scalar(iface.mode) or "", device = iface.device,
+		device_type = scalar(device.type) or "", htmode = scalar(device.htmode) or "",
+		band = scalar(device.band) or "", network = network }
+end
+
+local function same_identity(c, member)
+	local expected = member and member.identity
+	local actual = member and interface_identity(c, member.section)
+	if type(expected) ~= "table" or not actual then return false end
+	for _, key in ipairs({ "section_type", "mode", "device", "device_type", "htmode", "band", "network" }) do
+		if actual[key] ~= expected[key] then return false end
+	end
+	return true
+end
+
+local function all_identities_match(c, members)
+	for _, member in ipairs(members or {}) do if not same_identity(c, member) then return false end end
+	return #(members or {}) > 0
+end
+
+local function load_state()
+	local file = io.open(STATE_FILE, "r")
+	if not file then return { version = 1, groups = {} } end
+	local data = file:read("*a")
+	file:close()
+	local ok, decoded = pcall(cjson.decode, data)
+	if not ok or type(decoded) ~= "table" or type(decoded.groups) ~= "table" then
+		return nil, "state_corrupt"
+	end
+	return decoded
+end
+
+local function save_state(state)
+	if not fs.stat(STATE_DIR) then
+		if not fs.mkdir(STATE_DIR, 448) then return false end -- 0700
+	end
+	if fs.chmod and not fs.chmod(STATE_DIR, 448) then return false end -- 0700
+	local tmp = STATE_FILE .. ".tmp." .. tostring(nixio.getpid())
+	local flags = nixio.open_flags("wronly", "creat", "excl", "sync")
+	local file = nixio.open(tmp, flags, 384) -- 0600
+	if not file then return false end
+	local data = cjson.encode(state) .. "\n"
+	local written = file:write(data)
+	local synced = written == #data and file:sync()
+	file:close()
+	if not synced then os.remove(tmp); return false end
+	if fs.chmod and not fs.chmod(tmp, 384) then os.remove(tmp); return false end -- 0600
+	if not os.rename(tmp, STATE_FILE) then os.remove(tmp); return false end
+	local dir = nixio.open(STATE_DIR, "r")
+	if not dir then return false end
+	local dir_synced = dir:sync()
+	dir:close()
+	if not dir_synced then return false end
+	return true
+end
+
+local function acquire_lock()
+	local fd = nixio.open(LOCK_FILE, nixio.open_flags("rdwr", "creat"), 384) -- 0600
+	if not fd then return false end
+	if not fd:lock("tlock") then fd:close(); return false end
+	lock_fd = fd
+	return true
+end
+local function release_lock()
+	if lock_fd then
+		pcall(function() lock_fd:lock("ulock") end)
+		pcall(function() lock_fd:close() end)
+		lock_fd = nil
+	end
+end
+local function capture_fields(c, section)
+	local fields = {}
+	for _, name in ipairs(MANAGED) do
+		local value = c:get("wireless", section, name)
+		fields[name] = { present = value ~= nil, value = scalar(value) }
+	end
+	return fields
+end
+
+local function revision_token(c, members, ssid, group_id)
+	local rows = {}
+	for _, member in ipairs(members) do
+		local identity = member.identity or interface_identity(c, member.section)
+		local iface = c:get_all("wireless", member.section)
+		local fields = capture_fields(c, member.section)
+		local enc = iface and defs.enc2dat[iface.encryption or "none"]
+		if not identity or not iface or not enc then return nil end
+		rows[#rows + 1] = { member.section, identity.section_type, identity.mode, identity.device,
+			identity.device_type, identity.htmode, identity.band, identity.network,
+			fields.ssid.present and "1" or "0", fields.ssid.value or "",
+			fields.mldgroup.present and "1" or "0", fields.mldgroup.value or "",
+			fields.mlo.present and "1" or "0", fields.mlo.value or "",
+			scalar(iface.ssid) or "", enc[1], enc[2], scalar(iface.ieee8021x) or "",
+			scalar(iface.ieee80211w) or "" }
+	end
+	return cjson.encode({ tostring(group_id or ""), tostring(ssid or ""), rows })
+end
+
+local function same_fields(c, section, fields)
+	if type(fields) ~= "table" then return false end
+	for _, name in ipairs(MANAGED) do
+		local expected = fields[name]
+		if type(expected) ~= "table" then return false end
+		local current = c:get("wireless", section, name)
+		if (current ~= nil) ~= (expected.present == true) then return false end
+		if expected.present and scalar(current) ~= expected.value then return false end
+	end
+	return true
+end
+
+local function all_match(c, members, snapshots)
+	if type(snapshots) ~= "table" then return false end
+	for _, member in ipairs(members or {}) do
+		if not same_fields(c, member.section, snapshots[member.section]) then return false end
+	end
+	return true
+end
+
+local function all_members_match_any(c, members, snapshots_list)
+	for _, member in ipairs(members or {}) do
+		local matched = false
+		for _, snapshots in ipairs(snapshots_list or {}) do
+			if snapshots and same_fields(c, member.section, snapshots[member.section]) then
+				matched = true
+				break
+			end
+		end
+		if not matched then return false end
+	end
+	return # (members or {}) > 0
+end
+
+local function write_fields(c, section, fields)
+	for _, name in ipairs(MANAGED) do
+		local value = fields[name]
+		if value.present then
+			if not c:set("wireless", section, name, value.value) then return false end
+		else
+			c:delete("wireless", section, name)
+		end
+	end
+	return true
+end
+
+local function bounded_exec(argv, timeout, capture)
+	local read_fd, write_fd
+	if capture then
+		read_fd, write_fd = nixio.pipe()
+		if not read_fd or not write_fd then return false, nil, "pipe_failed" end
+	end
+	local pid = nixio.fork()
+	if not pid or pid < 0 then
+		if read_fd then read_fd:close() end
+		if write_fd then write_fd:close() end
+		return false, nil, "fork_failed"
+	end
+	if pid == 0 then
+		nixio.chdir("/")
+		if not nixio.setsid() then os.exit(126) end
+		-- The child must not keep the parent's flock alive if the RPC is killed.
+		if lock_fd then pcall(function() lock_fd:close() end) end
+		local null = nixio.open("/dev/null", "w+")
+		if not null then os.exit(126) end
+		nixio.dup(write_fd or null, nixio.stdout)
+		nixio.dup(null, nixio.stderr)
+		nixio.dup(null, nixio.stdin)
+		if read_fd then read_fd:close() end
+		if write_fd then write_fd:close() end
+		null:close()
+		nixio.exec(unpack(argv))
+		os.exit(127)
+	end
+	if write_fd then write_fd:close() end
+
+	local output, output_size = {}, 0
+	local child_done, child_code, eof = false, nil, not capture
+	local deadline = os.time() + timeout
+	while true do
+		if read_fd and not eof then
+			local pollfds = { { fd = read_fd, events = nixio.poll_flags("in", "err", "hup") } }
+			local ready, poll_error = nixio.poll(pollfds, 100)
+			if ready == nil and poll_error ~= nixio.const.EINTR then
+				nixio.kill(-pid, 9); nixio.kill(pid, 9)
+				read_fd:close()
+				return false, nil, "poll_failed"
+			end
+			if ready and ready > 0 and pollfds[1].revents > 0 then
+				local chunk = read_fd:read(4096)
+				if chunk and #chunk > 0 then
+					output_size = output_size + #chunk
+					if output_size > PROCESS_OUTPUT_LIMIT then
+						nixio.kill(-pid, 9); nixio.kill(pid, 9)
+						read_fd:close()
+						return false, nil, "output_too_large"
+					end
+					output[#output + 1] = chunk
+				else
+					eof = true
+					read_fd:close()
+					read_fd = nil
+				end
+			end
+		else
+			nixio.nanosleep(0, 100000000)
+		end
+		if not child_done then
+			local waited, _, code = nixio.waitpid(pid, "nohang")
+			if waited == pid then child_done, child_code = true, code end
+		end
+		if child_done and eof then return child_code == 0, table.concat(output) end
+		if os.time() >= deadline then
+			nixio.kill(-pid, 9); nixio.kill(pid, 9)
+			if read_fd then read_fd:close() end
+			return false, nil, "timeout"
+		end
+	end
+end
+
+local function reload_wifi()
+	return bounded_exec({ "/sbin/wifi", "reload" }, RELOAD_TIMEOUT, false)
+end
+
+local function wireless_runtime_status()
+	local ok, text = bounded_exec({ "/bin/ubus", "call", "network.wireless", "status" }, STATUS_TIMEOUT, true)
+	if not ok or type(text) ~= "string" or text == "" then return nil end
+	local decoded, status = pcall(cjson.decode, text)
+	if not decoded or type(status) ~= "table" then return nil end
+	return status
+end
+
+local function runtime_field_matches(config, expected, name)
+	local wanted = expected and expected[name]
+	if wanted and wanted.present then return scalar(config[name]) == scalar(wanted.value) end
+	local actual = scalar(config[name])
+	if name == "mldgroup" then return actual == nil or actual == "" or actual == "0" end
+	if name == "mlo" then return actual == nil or actual == "" or actual == "0" or actual == "false" end
+	return actual == nil or actual == ""
+end
+
+local function wireless_runtime_matches(status, members, expected)
+	for _, member in ipairs(members or {}) do
+		local device = status[member.device]
+		if type(device) ~= "table" or device.up ~= true or device.pending ~= false or
+			device.retry_setup_failed ~= false or device.setup_failed == true then return false end
+		local found = false
+		for _, iface in ipairs(device.interfaces or {}) do
+			if iface.section == member.section and type(iface.config) == "table" then
+				local fields = expected and expected[member.section]
+				local matches = true
+				for _, name in ipairs(MANAGED) do
+					if not runtime_field_matches(iface.config, fields, name) then matches = false; break end
+				end
+				if matches then found = true; break end
+			end
+		end
+		if not found then return false end
+	end
+	return #(members or {}) > 0
+end
+
+local function runtime_matches(members, expected)
+	local status = wireless_runtime_status()
+	return status and wireless_runtime_matches(status, members, expected) or false
+end
+
+local function current_groups(state, c)
+	c = c or cursor()
+	local used, owned = {}, {}
+	for _, record in ipairs(state.groups) do
+		if record.id then owned[tonumber(record.id)] = record end
+	end
+	c:foreach("wireless", "wifi-iface", function(iface)
+		if iface.mode == "ap" and iface.device and c:get("wireless", iface.device, "type") == "mtwifi" then
+			local group, valid = group_value(iface.mldgroup, iface.mlo)
+			if valid and group and group > 0 then used[group] = true end
+		end
+	end)
+	for id in pairs(owned) do used[id] = true end
+	return c, used, owned
+end
+
+local function security_signature(iface)
+	local enc = defs.enc2dat[iface.encryption or "none"]
+	if not enc then return nil end
+	local authmode, cipher = enc[1], enc[2]
+	local allowed_auth = authmode == "WPA3PSK" or authmode == "OWE"
+	local allowed_cipher = { AES = true, CCMP128 = true, CCMP256 = true, GCMP128 = true, GCMP256 = true }
+	if not allowed_auth or not allowed_cipher[cipher] then return nil end
+	local pmf_mfpc = tostring(defs.vif_cfgs.PMFMFPC or "0")
+	local pmf_mfpr = tostring(defs.vif_cfgs.PMFMFPR or "0")
+	local pmf_sha256 = tostring(defs.vif_cfgs.PMFSHA256 or "0")
+	if authmode == "OWE" or authmode == "WPA3PSK" then
+		pmf_mfpc, pmf_mfpr, pmf_sha256 = "1", "1", "0"
+	elseif authmode == "WPA2PSKWPA3PSK" then
+		pmf_mfpc, pmf_mfpr, pmf_sha256 = "1", "0", "0"
+	end
+	-- This branch's AP writer uses shared profile defaults for 802.1X and
+	-- maps only auth mode, cipher, PSK and the PMF values above.
+	local values = {
+		authmode, cipher, tostring(iface.key or ""), pmf_mfpc, pmf_mfpr,
+		pmf_sha256, scalar(defs.vif_cfgs.IEEE8021X) or "0"
+	}
+	return table.concat(values, "\0")
+end
+
+local function selected_aps(c, selected, allow_owned, state)
+	if type(selected) ~= "table" or #selected < 2 or #selected > 3 then return nil, "member_count" end
+	local unique, devices, members, signature, common_network = {}, {}, {}, nil, nil
+	state = state or load_state()
+	if not state then return nil, "state_corrupt" end
+	local owned_sections = {}
+	for _, rec in ipairs(state.groups or {}) do
+		for _, member in ipairs(rec.members or {}) do owned_sections[member.section] = true end
+	end
+	for _, section in ipairs(selected) do
+		if type(section) ~= "string" or not section:match("^[%w_]+$") or unique[section] then return nil, "invalid_member" end
+		unique[section] = true
+		local iface = c:get_all("wireless", section)
+		if not iface or iface[".type"] ~= "wifi-iface" or iface.mode ~= "ap" or disabled(iface.disabled) or disabled(iface.wds) then
+			return nil, "invalid_member"
+		end
+		local identity = interface_identity(c, section)
+		if not identity or identity.device_type ~= "mtwifi" then return nil, "unsupported_member" end
+		if common_network and common_network ~= identity.network then return nil, "network_mismatch" end
+		common_network = identity.network
+		local device, htmode = identity.device, identity.htmode
+		if disabled(c:get("wireless", device, "disabled")) then return nil, "unsupported_member" end
+		local eht_modes = { EHT20 = true, EHT40 = true, EHT80 = true, EHT80_80 = true, EHT160 = true, EHT320 = true }
+		if not eht_modes[htmode] then return nil, "unsupported_member" end
+		if devices[device] then return nil, "duplicate_radio" end
+		devices[device] = true
+		local group, valid = group_value(iface.mldgroup, iface.mlo)
+		if not valid or (group and group > 0 and not (allow_owned and owned_sections[section])) then return nil, "already_grouped" end
+		if owned_sections[section] and not allow_owned then return nil, "already_grouped" end
+		local sig = security_signature(iface)
+		if not sig then return nil, "unsupported_security" end
+		if signature and signature ~= sig then return nil, "security_mismatch" end
+		signature = sig
+		members[#members + 1] = { section = section, device = device, band = band_name(c, device, htmode),
+			ssid = scalar(iface.ssid) or "", identity = identity }
+	end
+	return members
+end
+local function build_status()
+	local state, err = load_state()
+	if not state then return nil, err end
+	local c, _, owned = current_groups(state)
+	local groups = {}
+	for _, record in ipairs(state.groups) do
+		local members, conflict = {}, false
+		for _, member in ipairs(record.members or {}) do
+			local current = capture_fields(c, member.section)
+			local consistent = same_identity(c, member) and (same_fields(c, member.section, record.expected[member.section]) or
+				(record.previous and same_fields(c, member.section, record.previous[member.section])) or
+				same_fields(c, member.section, record.original[member.section]))
+			if not consistent then
+				conflict = true
+			end
+			members[#members + 1] = {
+				section = member.section, device = member.device, band = member.band,
+				ssid = scalar(c:get("wireless", member.section, "ssid")) or "",
+				original_ssid = record.original[member.section].ssid.value or ""
+			}
+		end
+		local phase = record.phase
+		local state_name = conflict and "conflict" or
+			((phase == "restore_failed" or phase == "edit_failed" or phase == "restoring") and "restore_failed" or
+			(phase == "applied" and "saved" or phase))
+		groups[#groups + 1] = {
+			id = record.id, state = state_name,
+			runtime = phase == "applied" and (record.runtime_confirmed and "config_applied" or "unverified") or "not_ready",
+			members = members
+		}
+	end
+	local inventory = {}
+	c:foreach("wireless", "wifi-iface", function(iface)
+		if iface.mode ~= "ap" or not iface.device then return end
+		local device, htmode = device_info(c, iface[".name"])
+		if not device then return end
+		local group, valid = group_value(iface.mldgroup, iface.mlo)
+		local rec = valid and owned[group] or nil
+		inventory[#inventory + 1] = {
+			section = iface[".name"], device = device,
+			band = band_name(c, device, htmode), ssid = scalar(iface.ssid) or "",
+			grouped = not valid or (group or 0) > 0,
+			managed = rec ~= nil,
+			eligible = not disabled(iface.wds),
+			disabled = disabled(iface.disabled) or disabled(c:get("wireless", device, "disabled"))
+		}
+	end)
+	return { ok = true, groups = groups, inventory = inventory, capabilities = { max_groups = MAX_MANAGED_GROUP } }
+end
+
+local function find_group(state, id)
+	for index, record in ipairs(state.groups) do
+		if tonumber(record.id) == tonumber(id) then return record, index end
+	end
+	return nil
+end
+
+local function preview(payload, c, state)
+	c, state = c or cursor(), state or load_state()
+	if not state then return { ok = false, code = "state_corrupt", message = "state_corrupt" } end
+	local allow_owned = false
+	if payload.group_id ~= nil then
+		if type(payload.group_id) ~= "number" or payload.group_id < 1 or payload.group_id > MAX_MANAGED_GROUP or payload.group_id ~= math.floor(payload.group_id) then
+			return { ok = false, code = "invalid_request", message = "invalid_request" }
+		end
+		local record = find_group(state, payload.group_id)
+		if not record or #record.members ~= #(payload.members or {}) then return { ok = false, code = "invalid_member", message = "invalid_member" } end
+		local expected = {}
+		for _, member in ipairs(record.members) do expected[member.section] = true end
+		for _, section in ipairs(payload.members or {}) do if not expected[section] then return { ok = false, code = "invalid_member", message = "invalid_member" } end end
+		allow_owned = true
+	end
+	local members, err = selected_aps(c, payload.members, allow_owned, state)
+	if not members then
+		local messages = { member_count = "select_two_or_three", invalid_member = "invalid_member", unsupported_member = "unsupported_member",
+			duplicate_radio = "duplicate_radio", already_grouped = "already_grouped", security_mismatch = "security_mismatch",
+			unsupported_security = "unsupported_security", network_mismatch = "network_mismatch", state_corrupt = "state_corrupt" }
+		return { ok = false, code = err, message = messages[err] or "invalid_request" }
+	end
+	if type(payload.ssid) ~= "string" or #payload.ssid < 1 or #payload.ssid > 32 or payload.ssid:find("[%z\r\n]") then
+		return { ok = false, code = "invalid_ssid", message = "invalid_ssid" }
+	end
+	local revision = revision_token(c, members, payload.ssid, payload.group_id)
+	if not revision then return { ok = false, code = "invalid_member", message = "invalid_member" } end
+	return { ok = true, members = members, ssid = payload.ssid, revision = revision,
+		security_matches = true, max_groups = MAX_MANAGED_GROUP }
+end
+local function persist_and_reload(state, record)
+	record.phase, record.action = "applying", "apply"
+	record.started_at = record.started_at or os.time()
+	record.reload_attempts = record.reload_attempts or 0
+	if not save_state(state) then return false, "state_write_failed" end
+	local c = cursor()
+	if not all_identities_match(c, record.members) or not all_match(c, record.members, record.precondition) then return false, "conflict" end
+	for _, member in ipairs(record.members) do
+		if not write_fields(c, member.section, record.expected[member.section]) then return false, "uci_write_failed" end
+	end
+	if not c:commit("wireless") then return false, "uci_commit_failed" end
+	local verify = cursor()
+	if not all_identities_match(verify, record.members) or not all_match(verify, record.members, record.expected) then return false, "conflict" end
+	record.last_reload_at, record.reload_attempts = os.time(), record.reload_attempts + 1
+	record.reload_failed = true
+	if not save_state(state) then return false, "state_write_failed" end
+	-- A reload is only requested here. Runtime confirmation is a later short RPC.
+	local reloaded = reload_wifi()
+	record.reload_failed = not reloaded
+	if not save_state(state) then return false, "state_write_failed" end
+	return true, "pending"
+end
+
+local function restore_snapshots(state, record, snapshots, allowed_current, reload_after)
+	record.phase, record.action, record.restore_expected = "recovery_pending", "restore", snapshots
+	record.restore_started_at = os.time()
+	record.last_reload_at, record.reload_attempts = nil, 0
+	if not save_state(state) then return false, "state_write_failed" end
+	local c = cursor()
+	local candidates = { snapshots }
+	for _, candidate in ipairs(allowed_current or {}) do candidates[#candidates + 1] = candidate end
+	if not all_identities_match(c, record.members) or not all_members_match_any(c, record.members, candidates) then
+		record.phase = "recovery_conflict"; save_state(state)
+		return false, "conflict"
+	end
+	if not all_match(c, record.members, snapshots) then
+		for _, member in ipairs(record.members) do
+			if not snapshots[member.section] or not write_fields(c, member.section, snapshots[member.section]) then return false, "uci_write_failed" end
+		end
+		if not c:commit("wireless") then return false, "uci_commit_failed" end
+	end
+	local verify = cursor()
+	if not all_identities_match(verify, record.members) or not all_match(verify, record.members, snapshots) then return false, "conflict" end
+	if reload_after then
+		record.last_reload_at, record.reload_attempts = os.time(), 1
+		record.reload_failed = true
+		if not save_state(state) then return false, "state_write_failed" end
+		local reloaded = reload_wifi()
+		record.reload_failed = not reloaded
+		if not save_state(state) then return false, "state_write_failed" end
+	else
+		record.reload_failed = true
+		if not save_state(state) then return false, "state_write_failed" end
+	end
+	return true, "pending"
+end
+local function group_security_matches(c, record)
+	local signature
+	for _, member in ipairs(record.members or {}) do
+		local iface = c:get_all("wireless", member.section)
+		if not iface then return false end
+		local current = security_signature(iface)
+		if not current or (signature and signature ~= current) then return false end
+		signature = current
+	end
+	return signature ~= nil
+end
+
+local function pending_records(state)
+	local pending = {}
+	for index, record in ipairs(state.groups or {}) do
+		if record.phase ~= "applied" then pending[#pending + 1] = { record = record, index = index } end
+	end
+	return pending
+end
+
+local function recover_pending(state, reload_after)
+	local pending = pending_records(state)
+	if #pending == 0 then return { ok = true, state = "clean" } end
+	if #pending ~= 1 then return { ok = false, code = "pending_recovery", message = "pending_recovery" } end
+	local entry, record = pending[1], pending[1].record
+	local c, target = cursor(), nil
+	if record.operation == "edit" or record.previous then target = record.previous
+	elseif record.restore_expected then target = record.restore_expected
+	else target = record.original end
+	local allowed = { record.original or {}, record.expected or {} }
+	if record.previous then allowed[#allowed + 1] = record.previous end
+	if record.restore_expected then allowed[#allowed + 1] = record.restore_expected end
+	if not target or not all_identities_match(c, record.members) or not all_members_match_any(c, record.members, allowed) then
+		record.phase = "recovery_conflict"; save_state(state)
+		return { ok = false, code = "conflict", message = "external_change_detected" }
+	end
+	local restored, restore_error = restore_snapshots(state, record, target, allowed, reload_after)
+	if not restored then
+		record.phase = restore_error == "conflict" and "recovery_conflict" or "restore_failed"
+		save_state(state)
+		return { ok = false, code = restore_error or "needs_recovery", message = "restore_failed" }
+	end
+	return { ok = true, state = reload_after and "restoring" or "pending_network_start",
+		pending = reload_after == true, id = record.id, runtime = "unverified" }
+end
+
+local function finish_operation(state, record, index, was_restore)
+	local operation = record.operation
+	if not was_restore then
+		record.phase, record.action, record.operation = "applied", nil, nil
+		record.precondition, record.previous, record.restore_expected = nil, nil, nil
+		record.runtime_confirmed = true
+		if not save_state(state) then return { ok = false, code = "state_write_failed", message = "state_write_failed" } end
+		return { ok = true, state = "saved", pending = false, id = record.id, runtime = "config_applied" }
+	end
+	if operation == "edit" or record.previous then
+		local target = record.restore_expected or record.previous
+		record.expected, record.phase, record.action, record.operation = target, "applied", nil, nil
+		record.previous, record.restore_expected, record.precondition = nil, nil, nil
+		record.runtime_confirmed = true
+		record.ssid = target[record.members[1].section].ssid.value
+		if not save_state(state) then return { ok = false, code = "state_write_failed", message = "state_write_failed" } end
+		return { ok = true, state = operation == "close" and "restored" or "rolled_back", pending = false, id = record.id }
+	end
+	table.remove(state.groups, index)
+	if not save_state(state) then return { ok = false, code = "state_write_failed", message = "state_write_failed" } end
+	return { ok = true, state = operation == "close" and "restored" or "rolled_back", pending = false, id = record.id }
+end
+
+local function poll_operation(state, id)
+	local pending = pending_records(state)
+	if #pending == 0 then return { ok = true, state = "done", pending = false, id = id } end
+	if #pending ~= 1 or tonumber(pending[1].record.id) ~= tonumber(id) then
+		return { ok = false, code = "pending_recovery", message = "pending_recovery" }
+	end
+	local entry, record = pending[1], pending[1].record
+	local restoring = record.phase ~= "applying"
+	local target = restoring and (record.restore_expected or record.original) or record.expected
+	local now = os.time()
+	if not restoring and not tonumber(record.started_at) then
+		record.started_at = tonumber(record.created_at) or now
+		if not save_state(state) then return { ok = false, code = "state_write_failed", message = "state_write_failed" } end
+	end
+	local current = cursor()
+	if not target or not all_identities_match(current, record.members) or not all_match(current, record.members, target) then
+		record.phase = "recovery_conflict"; save_state(state)
+		return { ok = false, code = "conflict", message = "external_change_detected", pending = true, id = id }
+	end
+	if target and runtime_matches(record.members, target) then return finish_operation(state, record, entry.index, restoring) end
+	if not restoring and now - (tonumber(record.started_at) or now) >= OPERATION_TIMEOUT then
+		local rollback = record.operation == "edit" and record.previous or record.original
+		local allowed = { record.original or {}, record.expected or {}, rollback or {} }
+		local ok, err = restore_snapshots(state, record, rollback, allowed, true)
+		if not ok then
+			record.phase = err == "conflict" and "recovery_conflict" or "restore_failed"; save_state(state)
+			return { ok = false, code = "needs_recovery", message = "restore_failed", pending = true, id = id }
+		end
+		return { ok = true, state = "restoring", pending = true, id = id }
+	end
+	local last = tonumber(record.last_reload_at) or 0
+	local attempts = tonumber(record.reload_attempts) or 0
+	local retry_reload = record.reload_failed == true or (restoring and now - last >= 60)
+	if attempts < MAX_RELOAD_ATTEMPTS and retry_reload and now - last >= RELOAD_RETRY_INTERVAL then
+		record.last_reload_at, record.reload_attempts = now, attempts + 1
+		record.reload_failed = true
+		if not save_state(state) then return { ok = false, code = "state_write_failed", message = "state_write_failed" } end
+		local reloaded = reload_wifi()
+		record.reload_failed = not reloaded
+		if not save_state(state) then return { ok = false, code = "state_write_failed", message = "state_write_failed" } end
+	end
+	return { ok = true, state = restoring and "recovery_pending" or "applying", pending = true, id = id }
+end
+
+local function control(action, payload)
+	if not acquire_lock() then return { ok = false, code = "busy", message = "busy" } end
+	local ok, result = pcall(function()
+		local state, err = load_state()
+		if not state then return { ok = false, code = err, message = err } end
+		if action == "recover-startup" then return recover_pending(state, false) end
+		if action == "poll" then return poll_operation(state, payload.id) end
+		if action == "recover" then return recover_pending(state, true) end
+		local pending = pending_records(state)
+		if #pending > 0 then
+			if action == "close" and #pending == 1 and tonumber(payload.id) == tonumber(pending[1].record.id) then
+				return recover_pending(state, true)
+			end
+			return { ok = false, code = "pending_recovery", message = "pending_recovery" }
+		end
+		local c, used, owned = current_groups(state)
+		local changes = c:changes("wireless")
+		if type(changes) == "table" and next(changes) then return { ok = false, code = "pending_changes", message = "pending_changes" } end
+		if action == "create" then
+			local plan = preview(payload, c, state)
+			if not plan.ok then return plan end
+			if type(payload.revision) ~= "string" or payload.revision ~= plan.revision then return { ok = false, code = "stale_preview", message = "stale_preview" } end
+			local id
+			for candidate = 1, MAX_MANAGED_GROUP do if not used[candidate] then id = candidate; break end end
+			if not id then return { ok = false, code = "group_limit", message = "group_limit" } end
+			local record = { id = id, phase = "preparing", action = "prepare", operation = "create", created_at = os.time(),
+				ssid = payload.ssid, members = plan.members, original = {}, expected = {}, precondition = {} }
+			for _, member in ipairs(record.members) do
+				local original = capture_fields(c, member.section)
+				record.original[member.section], record.precondition[member.section] = original, original
+				record.expected[member.section] = { ssid = { present = true, value = payload.ssid },
+					mldgroup = { present = true, value = tostring(id) }, mlo = { present = true, value = "1" } }
+			end
+			local fresh = preview(payload, cursor(), state)
+			if not fresh.ok or fresh.revision ~= plan.revision or not all_match(cursor(), record.members, record.precondition) then
+				return { ok = false, code = "stale_preview", message = "stale_preview" }
+			end
+			state.groups[#state.groups + 1] = record
+			if not save_state(state) then return { ok = false, code = "state_write_failed", message = "state_write_failed" } end
+			record.phase, record.action = "applying", "apply"
+			local success, failure = persist_and_reload(state, record)
+			if not success then
+				local restored = restore_snapshots(state, record, record.original, { record.expected, record.original }, true)
+				if not restored then
+					record.phase, record.action, record.operation, record.restore_expected = "restore_failed", "restore", "create", record.original
+					save_state(state)
+					return { ok = false, code = "needs_recovery", message = failure or "apply_failed_recovery_required" }
+				end
+				return { ok = true, id = id, state = "restoring", pending = true, runtime = "unverified" }
+			end
+			return { ok = true, id = id, state = "applying", pending = true, runtime = "unverified" }
+		elseif action == "edit" then
+			local record = find_group(state, payload.id)
+			if not record or record.phase ~= "applied" or tonumber(record.id) > MAX_MANAGED_GROUP then return { ok = false, code = "unknown_group", message = "unknown_group" } end
+			local plan = preview({ group_id = tonumber(record.id), members = payload.members, ssid = payload.ssid }, c, state)
+			if not plan.ok then return plan end
+			if type(payload.revision) ~= "string" or payload.revision ~= plan.revision then return { ok = false, code = "stale_preview", message = "stale_preview" } end
+			if not all_identities_match(c, record.members) or not all_match(c, record.members, record.expected) then return { ok = false, code = "conflict", message = "external_change_detected" } end
+			local previous = {}
+			for _, member in ipairs(record.members) do
+				previous[member.section] = record.expected[member.section]
+				record.expected[member.section] = { ssid = { present = true, value = payload.ssid },
+					mldgroup = { present = true, value = tostring(record.id) }, mlo = { present = true, value = "1" } }
+			end
+			record.phase, record.action, record.operation, record.previous, record.precondition = "applying", "apply", "edit", previous, previous
+			record.ssid = payload.ssid
+			if not save_state(state) then return { ok = false, code = "state_write_failed", message = "operation_failed" } end
+			local success, failure = persist_and_reload(state, record)
+			if not success then
+				local restored = restore_snapshots(state, record, previous, { record.expected, previous }, true)
+				if not restored then
+					record.phase, record.action, record.operation, record.restore_expected = "restore_failed", "restore", "edit", previous
+					save_state(state)
+					return { ok = false, code = "needs_recovery", message = failure or "edit_failed_recovery_required" }
+				end
+				return { ok = true, id = record.id, state = "restoring", pending = true, runtime = "unverified" }
+			end
+			return { ok = true, id = record.id, state = "applying", pending = true, runtime = "unverified" }
+		elseif action == "close" then
+			local record, index = find_group(state, payload.id)
+			if not record then return { ok = false, code = "unknown_group", message = "unknown_group" } end
+			if not all_identities_match(c, record.members) then return { ok = false, code = "conflict", message = "external_change_detected" } end
+			local allowed = { record.expected, record.original }
+			if record.previous then allowed[#allowed + 1] = record.previous end
+			if not all_members_match_any(c, record.members, allowed) then return { ok = false, code = "conflict", message = "external_change_detected" } end
+			record.phase, record.action, record.operation, record.restore_expected = "restoring", "restore", "close", record.original
+			if not save_state(state) then return { ok = false, code = "state_write_failed", message = "restore_failed" } end
+			local restored, restore_error = restore_snapshots(state, record, record.original, allowed, true)
+			if not restored then
+				record.phase, record.action, record.operation = "restore_failed", "restore", "close"; save_state(state)
+				return { ok = false, code = restore_error or "runtime_unverified", message = "restore_failed" }
+			end
+			return { ok = true, id = record.id, state = "restoring", pending = true, runtime = "unverified" }
+		end
+		return { ok = false, code = "invalid_action", message = "invalid_action" }
+	end)
+	release_lock()
+	if not ok then nixio.syslog("err", "mtwifi-mlo: control operation failed"); return { ok = false, code = "internal_error", message = "operation_failed" } end
+	return result
+end
+local script = (arg[0] or ""):match("([^/]+)$") or ""
+local read_only = script == "mtwifi-mlo-status"
+local action = arg[1]
+local permitted = (read_only and allowed_status[action]) or
+	(script == "mtwifi-mlo-control" and allowed_control[action])
+if not permitted then
+	result_error("forbidden", "operation_not_allowed")
+	os.exit(0)
+end
+
+local payload = {}
+if #arg > 2 then result_error("invalid_request", "invalid_request"); os.exit(0) end
+if arg[2] then
+	if #arg[2] > MAX_REQUEST then result_error("request_too_large", "invalid_request"); os.exit(0) end
+	local ok, decoded = pcall(cjson.decode, arg[2])
+	if not ok or type(decoded) ~= "table" then result_error("invalid_request", "invalid_request"); os.exit(0) end
+	payload = decoded
+end
+
+local payload_keys = (action == "status" or action == "recover" or action == "recover-startup") and {} or
+	(action == "preview" and { members = true, ssid = true, group_id = true } or
+	(action == "create" and { members = true, ssid = true, revision = true } or
+	(action == "edit" and { id = true, members = true, ssid = true, revision = true } or
+	((action == "close" or action == "poll") and { id = true } or {}))))
+for key in pairs(payload) do
+	if not payload_keys[key] then result_error("invalid_request", "invalid_request"); os.exit(0) end
+end
+if action == "close" or action == "edit" or action == "poll" then
+	local max_id = (action == "close" or action == "poll") and 64 or MAX_MANAGED_GROUP
+	if type(payload.id) ~= "number" or payload.id < 1 or payload.id > max_id or payload.id ~= math.floor(payload.id) then
+		result_error("invalid_request", "invalid_request"); os.exit(0)
+	end
+end
+if action == "preview" or action == "create" or action == "edit" then
+	if type(payload.members) ~= "table" or type(payload.ssid) ~= "string" then
+		result_error("invalid_request", "invalid_request"); os.exit(0)
+	end
+end
+
+local output
+if action == "status" then
+	local err
+	output, err = build_status()
+	if not output then output = { ok = false, code = err, message = err } end
+elseif action == "preview" then
+	output = preview(payload)
+elseif action == "recover" then
+	output = control(action, payload)
+else
+	output = control(action, payload)
+end
+emit(output)

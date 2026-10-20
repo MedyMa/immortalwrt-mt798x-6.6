@@ -385,7 +385,9 @@ local function mld_group(config)
 
     value = config.mlo
     if value == nil then
-        return nil, true
+        -- New and unset AP configuration defaults to MLO disabled even when
+        -- a vendor profile template contains a nonzero MldGroup token.
+        return 0, true
     elseif value == true or value == 1 or value == "1" then
         return 1, true
     elseif value == false or value == 0 or value == "0" then
@@ -403,6 +405,11 @@ local function mld_group_with_profile(iface, profile, apidx)
 
     local token = utils.token_get(profile and profile.MldGroup, apidx, "0")
     return mld_group({ mldgroup = token })
+end
+
+local function mld_legacy_boolean(config)
+    return (config.mldgroup == nil or config.mldgroup == "") and
+        (config.mlo == true or config.mlo == 1 or config.mlo == "1")
 end
 
 local function mld_bool(value)
@@ -450,16 +457,17 @@ local function mld_writer_signature(iface)
     }
 end
 
-local function add_mld_member(groups, group, signature)
+local function add_mld_member(groups, group, signature, legacy_boolean)
     if group and group > 0 and signature then
         local members = groups[group] or {}
-        members[#members + 1] = signature
+        members[#members + 1] = { signature = signature, legacy_boolean = legacy_boolean }
         groups[group] = members
     end
 end
 
 local function validate_mld_groups(cfg)
     local groups, affected, other_aps = {}, {}, {}
+    local legacy_mismatch = false
     local cursor = uci.cursor()
     local current_device = cfg.device
     local current_device_type = cursor:get("wireless", current_device, "type")
@@ -497,7 +505,7 @@ local function validate_mld_groups(cfg)
             local active = not radio_disabled and not mld_disabled(iface.disabled) and mld_eht_mode(htmode)
             if active and group and group > 0 then
                 affected[group] = true
-                add_mld_member(groups, group, mld_writer_signature(iface))
+                add_mld_member(groups, group, mld_writer_signature(iface), mld_legacy_boolean(iface))
             end
         end
     end
@@ -527,7 +535,7 @@ local function validate_mld_groups(cfg)
                 if not mld_disabled(iface.disabled) then
                     local group, valid = mld_group_with_profile(iface, profile, slot)
                     if valid and group and affected[group] then
-                        add_mld_member(groups, group, mld_writer_signature(iface))
+                        add_mld_member(groups, group, mld_writer_signature(iface), mld_legacy_boolean(iface))
                     end
                 end
             end
@@ -537,13 +545,28 @@ local function validate_mld_groups(cfg)
     for group in pairs(affected) do
         local members = groups[group]
         if members and #members > 1 then
-            local first = table.concat(members[1], "\0")
+            local first = table.concat(members[1].signature, "\0")
+            local mismatch, legacy_only = false, true
             for index = 2, #members do
-                if table.concat(members[index], "\0") ~= first then
-                    return false
+                if table.concat(members[index].signature, "\0") ~= first then
+                    mismatch = true
                 end
             end
+            for _, member in ipairs(members) do
+                if not member.legacy_boolean then legacy_only = false end
+            end
+            if mismatch and legacy_only then
+                -- Preserve old per-band SSIDs for explicit legacy mlo=1;
+                -- numeric MldGroup assignments remain strictly validated.
+                legacy_mismatch = true
+            elseif mismatch then
+                return false
+            end
         end
+    end
+
+    if legacy_mismatch then
+        nixio.syslog("warning", "mtwifi-cfg: preserving legacy mlo=1 groups; set explicit mldgroup to validate SSID/security consistency")
     end
 
     return true

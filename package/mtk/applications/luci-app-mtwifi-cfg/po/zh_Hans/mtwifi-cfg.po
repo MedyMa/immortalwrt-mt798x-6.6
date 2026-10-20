@@ -83,7 +83,40 @@ msgid "At least one MBSSID needs to be reserved"
 msgstr "至少需要保留1个MBSSID"
 
 msgid "Enable MLO"
-msgstr "启用MLO"
+msgstr "启用 MLO"
+
+msgid "MLO is an advanced feature for compatible clients and is off by default. When enabled, radios in the same group must use the same network name, encryption method, and password."
+msgstr "MLO 是面向兼容客户端的高级功能，默认关闭。开启后，同一分组的无线名称、加密方式和密码必须一致。"
+
+msgid "MLO Group"
+msgstr "MLO 分组"
+
+msgid "Default: 1 when enabled"
+msgstr "启用时默认：1"
+
+msgid "Choose the MLO group to join. Radios in the same group use the same network name and security settings."
+msgstr "选择要加入的 MLO 分组；同一分组使用相同的无线名称和安全设置。"
+
+msgid "Use profile setting"
+msgstr "使用配置文件设置"
+
+msgid "HE LDPC (all AP BSSIDs)"
+msgstr "HE LDPC（所有 AP BSSID）"
+
+msgid "Applies one HeLdpc value to the radio’s AP BSSIDs. Leave unset to preserve the profile tokens."
+msgstr "将同一 HeLdpc 值应用于此射频的所有 AP BSSID。留空可保留配置文件中的各项设置。"
+
+msgid "MLO group must be between 0 and 16"
+msgstr "MLO 分组必须介于 0 和 16 之间"
+
+msgid "MLO group %s requires matching SSID and security settings"
+msgstr "MLO 分组 %s 中的接口必须使用相同的 SSID 和安全设置"
+
+msgid "VHT 1024-QAM (5 GHz)"
+msgstr "VHT 1024-QAM（5 GHz）"
+
+msgid "Vendor VHT extension; this is not HE or EHT 1024-QAM. Leave unset to preserve the profile setting."
+msgstr "厂商 VHT 扩展；这不是 HE 或 EHT 1024-QAM。留空可保留配置文件中的设置。"
 
 msgid "MLO Group"
 msgstr "MLO 分组"
@@ -126,3 +159,273 @@ msgstr "覆盖默认 MAC 地址 - 可用地址的范围可能受限于驱动"
 
 msgid "Enables The 802.11k standard provides information to discover the best available access point"
 msgstr "启用 802.11k 自动寻找发现最佳可用接入点的信息"
+
+msgid "Another MLO operation is in progress"
+msgstr "另一个 MLO 操作正在进行"
+
+msgid "Select two or three access points"
+msgstr "请选择两个或三个无线接口"
+
+msgid "The selected access point is no longer available"
+msgstr "所选无线接口已不可用"
+
+msgid "MLO is only available for supported vendor EHT access points"
+msgstr "MLO 仅支持兼容的厂商 EHT AP"
+
+msgid "Select no more than one access point per radio"
+msgstr "每个射频最多选择一个无线接口"
+
+msgid "An access point already belongs to another MLO group"
+msgstr "所选无线接口已属于其他 MLO 组"
+
+msgid "Security settings do not match"
+msgstr "安全设置不一致"
+
+msgid "This security mode cannot be checked safely"
+msgstr "无法安全校验此加密方式"
+
+msgid "Enter a valid wireless name"
+msgstr "请输入有效的无线名称"
+
+msgid "No MLO group number is available"
+msgstr "没有可用的 MLO 组"
+
+msgid "No MLO group is available; close an existing group first."
+msgstr "没有可用的 MLO 组；请先关闭现有组。"
+
+msgid "This driver supports one MLO group; close it before creating another."
+msgstr "当前驱动仅支持一个 MLO 组；如需新建，请先关闭现有组。"
+
+msgid "Settings changed outside this page; review them before continuing"
+msgstr "设置已在其他位置更改，请检查后再继续"
+
+msgid "MLO recovery data is damaged; do not overwrite it"
+msgstr "MLO 恢复数据已损坏，请勿覆盖"
+
+msgid "Could not save MLO recovery data"
+msgstr "无法保存 MLO 恢复数据"
+
+msgid "Applying failed. Check the recovery status before retrying"
+msgstr "应用失败，请检查恢复状态后再重试"
+
+msgid "Recovery failed; use the recovery action again after checking the settings"
+msgstr "恢复失败，请检查设置后再次尝试恢复"
+
+msgid "Wireless reload failed; the saved configuration needs attention"
+msgstr "无线重载失败，已保存的配置需要检查"
+
+msgid "Wireless settings have not been confirmed; recovery remains available for retry."
+msgstr "无线设置尚未确认应用，恢复记录会保留以便重试。"
+
+msgid "Settings changed outside this page; recovery was stopped"
+msgstr "检测到其他位置的设置变更，已停止恢复"
+
+msgid "The MLO request is invalid"
+msgstr "MLO 请求无效"
+
+msgid "This MLO operation is not allowed"
+msgstr "不允许执行此 MLO 操作"
+
+msgid "The MLO operation failed"
+msgstr "MLO 操作失败"
+
+msgid "Select two or three radios and one access point on each. Passwords and security settings are kept as they are."
+msgstr "请选择两个或三个射频，并为每个射频选择一个无线接口。密码和安全设置保持不变。"
+
+msgid "No ungrouped supported access points are available."
+msgstr "没有可用的未分组无线接口。"
+
+msgid "Wireless name"
+msgstr "无线名称"
+
+msgid "Use one name on all selected access points."
+msgstr "所有选中的无线接口将使用同一名称。"
+
+msgid "Password"
+msgstr "密码"
+
+msgid "Keep existing password"
+msgstr "沿用现有密码"
+
+msgid "Security settings must match. The password is never displayed."
+msgstr "安全设置必须一致。密码不会显示。"
+
+msgid "Apply or discard other wireless changes before managing MLO."
+msgstr "请先应用或放弃其他无线更改，再管理 MLO。"
+
+msgid "Settings match. Password and security settings will remain unchanged."
+msgstr "设置一致。密码和安全设置保持不变。"
+
+msgid "Frequency"
+msgstr "频段"
+
+msgid "Current name"
+msgstr "当前名称"
+
+msgid "New name"
+msgstr "新名称"
+
+msgid "Review changes"
+msgstr "预览变更"
+
+msgid "Save name"
+msgstr "保存名称"
+
+msgid "Create MLO network"
+msgstr "创建 MLO 网络"
+
+msgid "Cancel"
+msgstr "取消"
+
+msgid "MLO is off by default. Create a group only for compatible devices."
+msgstr "MLO 默认关闭。仅为兼容设备创建分组。"
+
+msgid "Saved · runtime not verified"
+msgstr "已保存 · 运行状态待验证"
+
+msgid "Configuration applied · MLO link unverified"
+msgstr "配置已应用 · 多链路状态未验证"
+
+msgid "Waiting for wireless confirmation"
+msgstr "等待无线服务确认"
+
+msgid "Applying"
+msgstr "应用中"
+
+msgid "Restore failed"
+msgstr "恢复失败"
+
+msgid "Settings changed outside this page"
+msgstr "设置已在其他位置更改"
+
+msgid "Needs attention"
+msgstr "需要检查"
+
+msgid "MLO group"
+msgstr "MLO 分组"
+
+msgid "Edit name"
+msgstr "编辑名称"
+
+msgid "Close and restore"
+msgstr "关闭并恢复"
+
+msgid "MLO configuration is saved; client multi-link operation is not verified here."
+msgstr "MLO 配置已保存；此处无法验证客户端多链路运行状态。"
+
+msgid "Close and restore MLO"
+msgstr "关闭并恢复 MLO"
+
+msgid "The original wireless names will be restored. Passwords, security settings and network bindings will not be changed. Settings are checked before restoring to avoid overwriting other changes."
+msgstr "将恢复原无线名称，不会更改密码、安全设置或网络绑定。恢复前会检查配置，避免覆盖其他变更。"
+
+msgid "Loading MLO status…"
+msgstr "正在读取 MLO 状态…"
+
+msgid "Manage MLO only for supported vendor EHT access points."
+msgstr "仅可管理受支持的厂商 EHT 无线接口。"
+
+msgid "MLO network"
+msgstr "MLO 网络"
+
+msgid "MLO settings were saved and wireless reload was requested. Runtime multi-link operation is not verified here."
+msgstr "MLO 配置已保存并请求重载无线。此处无法验证多链路运行状态。"
+
+msgid "Some access points already belong to an existing MLO group. The manager will not take them over."
+msgstr "部分无线接口已属于现有 MLO 分组，管理工具不会接管。"
+
+msgid "MLO is off by default. Choose radios to create a group; security and passwords are not changed."
+msgstr "MLO 默认关闭。开启后，同一分组需使用相同的无线名称和安全设置。"
+
+msgid "Select two or three access points on different radios. Passwords and security settings will not be changed."
+msgstr "选择不同射频上的两个或三个无线接口。密码和安全设置不会更改。"
+
+msgid "This access point is not available for MLO."
+msgstr "当前无线接口不能用于 MLO。"
+
+msgid "Select radios"
+msgstr "选择射频"
+
+msgid "The selected access points will use this name."
+msgstr "所选无线接口将使用此无线名称。"
+
+msgid "Review the changes again after changing the selection or wireless name."
+msgstr "更改所选接口或无线名称后，请重新预览。"
+
+msgid "Select two or three access points."
+msgstr "请选择两个或三个无线接口。"
+
+msgid "Select one access point per radio."
+msgstr "每个射频只能选择一个无线接口。"
+
+msgid "Include the access point currently being edited."
+msgstr "必须包含当前正在编辑的无线接口。"
+
+msgid "The original wireless names will be restored when you save and apply. Passwords, security settings and network bindings will not change."
+msgstr "保存并应用后将恢复原无线名称。密码、安全设置和网络绑定不会更改。"
+
+msgid "Settings are checked first to avoid overwriting other changes."
+msgstr "恢复前会检查配置，避免覆盖其他更改。"
+
+msgid "Finish the other MLO change before starting another one."
+msgstr "请先完成当前 MLO 操作，再开始其他操作。"
+
+msgid "Review the MLO changes before saving this interface."
+msgstr "保存此接口前，请先预览 MLO 更改。"
+
+msgid "MLO was not applied"
+msgstr "MLO 未应用"
+
+msgid "Other changes will be applied first. Reopen the interface to make the MLO change separately."
+msgstr "将先应用其他更改。请重新打开接口后单独进行 MLO 操作。"
+
+msgid "MLO changes were not applied. Use Save & Apply to manage MLO."
+msgstr "MLO 更改未应用。请使用“保存并应用”管理 MLO。"
+
+msgid "Applying MLO changes"
+msgstr "正在应用 MLO 更改"
+
+msgid "Please wait…"
+msgstr "请稍候…"
+
+msgid "Choose two or three radios on different bands."
+msgstr "选择两个或三个不同频段的无线接口。"
+
+msgid "Save this interface, then choose Save & Apply."
+msgstr "先保存此接口，再点击“保存并应用”。"
+
+msgid "The original wireless names will be restored."
+msgstr "关闭后将恢复原无线名称。"
+
+msgid "Your settings will be checked before restoring. If they changed elsewhere, you will be asked what to do."
+msgstr "关闭前会核对配置；如检测到其他修改，会提示处理，避免覆盖。"
+
+msgid "Actions"
+msgstr "操作"
+
+msgid "MLO status"
+msgstr "MLO 状态"
+
+msgid "Restore"
+msgstr "恢复内容"
+
+msgid "Change summary"
+msgstr "变更摘要"
+
+msgid "Manage"
+msgstr "管理"
+
+msgid "Security settings match. Password and security settings will remain unchanged."
+msgstr "安全设置一致；不会更改密码和安全设置。"
+
+msgid "Passwords, security settings and network bindings will not change."
+msgstr "不会更改密码、安全设置和网络绑定。"
+
+msgid "Wireless changes are not confirmed; the recovery record is saved for another attempt."
+msgstr "无线配置尚未确认；恢复记录已保存，可稍后重试。"
+
+msgid "Wireless is still applying or restoring. The recovery record is saved; check again later."
+msgstr "无线配置仍在应用或恢复；恢复记录已保存，请稍后查看。"
+
+msgid "MLO could not be applied; the previous wireless settings were restored."
+msgstr "MLO 应用失败，已恢复之前的无线设置。"
