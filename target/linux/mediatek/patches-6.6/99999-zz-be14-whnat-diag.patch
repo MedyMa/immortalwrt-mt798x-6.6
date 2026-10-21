@@ -1,0 +1,153 @@
+--- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
++++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
+@@ -35,6 +35,59 @@
+ 
+ #include "nf_hnat_mtk.h"
+ #include "hnat.h"
++#include <linux/atomic.h>
++#include <linux/moduleparam.h>
++
++/* Temporary diagnostic draft: disabled unless explicitly enabled. */
++static bool hnat_diag_enable;
++static int whnat_diag_enable_get(char *buf, const struct kernel_param *kp)
++{
++	return scnprintf(buf, PAGE_SIZE, "%c\n",
++			  READ_ONCE(*(bool *)kp->arg) ? 'Y' : 'N');
++}
++static int whnat_diag_enable_set(const char *val, const struct kernel_param *kp)
++{
++	bool enable;
++	int err = kstrtobool(val, &enable);
++
++	if (err)
++		return err;
++	WRITE_ONCE(*(bool *)kp->arg, enable);
++	return 0;
++}
++static const struct kernel_param_ops whnat_diag_enable_ops = {
++	.set = whnat_diag_enable_set,
++	.get = whnat_diag_enable_get,
++};
++module_param_cb(hnat_diag_enable, &whnat_diag_enable_ops, &hnat_diag_enable, 0600);
++MODULE_PARM_DESC(hnat_diag_enable, "Enable aggregate HNAT WHNAT path counters");
++
++static int hnat_diag_atomic_get(char *buf, const struct kernel_param *kp)
++{
++	return scnprintf(buf, PAGE_SIZE, "%lld\n",
++			  atomic64_read((atomic64_t *)kp->arg));
++}
++static const struct kernel_param_ops hnat_diag_atomic_ops = {
++	.get = hnat_diag_atomic_get,
++};
++#define HNAT_DIAG_COUNTER(name) \
++	static atomic64_t hnat_diag_##name = ATOMIC64_INIT(0); \
++	module_param_cb(hnat_diag_##name, &hnat_diag_atomic_ops, \
++			&hnat_diag_##name, 0444)
++HNAT_DIAG_COUNTER(rx_hook_calls);
++HNAT_DIAG_COUNTER(rx_no_headroom);
++HNAT_DIAG_COUNTER(rx_not_from_wed);
++HNAT_DIAG_COUNTER(rx_wed0);
++HNAT_DIAG_COUNTER(rx_wed1);
++HNAT_DIAG_COUNTER(rx_wed2);
++HNAT_DIAG_COUNTER(rx_no_hnat_private);
++HNAT_DIAG_COUNTER(rx_bad_entry);
++HNAT_DIAG_COUNTER(rx_bad_ppe);
++HNAT_DIAG_COUNTER(cpu_wifi_attempts);
++HNAT_DIAG_COUNTER(cpu_wifi_gso);
++HNAT_DIAG_COUNTER(cpu_wifi_gso_errors);
++HNAT_DIAG_COUNTER(cpu_wifi_segments_queued);
++
+ 
+ #include "../mtk_eth_soc.h"
+ #include "../mtk_eth_reset.h"
+@@ -1027,6 +1080,8 @@
+ static void hnat_cpu_to_ge_xmit(struct sk_buff *skb)
+ {
+ 	u16 vlan_id;
++	if (unlikely(READ_ONCE(hnat_diag_enable)))
++		atomic64_inc(&hnat_diag_cpu_wifi_segments_queued);
+ 
+ 	if (unlikely(!hnat_priv || !hnat_priv->g_ppdev)) {
+ 		dev_kfree_skb_any(skb);
+@@ -1068,6 +1123,8 @@
+ 	struct sk_buff *segs, *seg, *next;
+ 	netdev_features_t features;
+ 
++	if (unlikely(READ_ONCE(hnat_diag_enable)))
++		atomic64_inc(&hnat_diag_cpu_wifi_attempts);
+ 	if (unlikely(skb_shinfo(skb)->frag_list))
+ 		return -1;
+ 	if (unlikely(skb_cow_head(skb, FOE_INFO_LEN + ETH_HLEN)))
+@@ -1100,6 +1157,8 @@
+ 		return 0;
+ 	}
+ 
++	if (unlikely(READ_ONCE(hnat_diag_enable)))
++		atomic64_inc(&hnat_diag_cpu_wifi_gso);
+ 	/* QDMA/PPE/WED can reorder consecutive hardware-TSO batches.
+ 	 * Produce wire-sized skbs here while retaining SG and checksum
+ 	 * offload.  GSO uses skb->cb[32..47] and allocates fresh skb
+@@ -1109,6 +1168,8 @@
+ 	features = hnat_priv->g_ppdev->features & ~NETIF_F_GSO_MASK;
+ 	segs = skb_gso_segment(skb, features);
+ 	if (IS_ERR(segs)) {
++		if (unlikely(READ_ONCE(hnat_diag_enable)))
++			atomic64_inc(&hnat_diag_cpu_wifi_gso_errors);
+ 		pr_warn_ratelimited("HNAT: CPU-to-WiFi GSO segmentation failed: %ld\n",
+ 				    PTR_ERR(segs));
+ 		dev_kfree_skb_any(skb);
+@@ -2726,20 +2787,49 @@
+ 
+ int mtk_sw_nat_hook_rx(struct sk_buff *skb)
+ {
+-	if (!IS_SPACE_AVAILABLE_HEAD(skb) || !FROM_WED(skb)) {
++	bool diag = unlikely(READ_ONCE(hnat_diag_enable));
++	u8 iface;
++
++	if (diag)
++		atomic64_inc(&hnat_diag_rx_hook_calls);
++	if (!IS_SPACE_AVAILABLE_HEAD(skb)) {
++		if (diag)
++			atomic64_inc(&hnat_diag_rx_no_headroom);
+ 		skb_hnat_magic_tag(skb) = 0;
+ 		return NF_ACCEPT;
+ 	}
+-
++	if (!FROM_WED(skb)) {
++		if (diag)
++			atomic64_inc(&hnat_diag_rx_not_from_wed);
++		skb_hnat_magic_tag(skb) = 0;
++		return NF_ACCEPT;
++	}
++
++	iface = skb_hnat_iface(skb);
++	if (diag) {
++		if (!hnat_priv)
++			atomic64_inc(&hnat_diag_rx_no_hnat_private);
++		else if (skb_hnat_entry(skb) >= hnat_priv->foe_etry_num)
++			atomic64_inc(&hnat_diag_rx_bad_entry);
++		if (iface == FOE_MAGIC_WED0)
++			atomic64_inc(&hnat_diag_rx_wed0);
++		else if (iface == FOE_MAGIC_WED1)
++			atomic64_inc(&hnat_diag_rx_wed1);
++		else if (iface == FOE_MAGIC_WED2)
++			atomic64_inc(&hnat_diag_rx_wed2);
++	}
+ 	skb_hnat_alg(skb) = 0;
+ 	skb_hnat_magic_tag(skb) = HNAT_MAGIC_TAG;
+ 
+-	if (skb_hnat_iface(skb) == FOE_MAGIC_WED0)
++	if (iface == FOE_MAGIC_WED0)
+ 		skb_hnat_sport(skb) = NR_WDMA0_PORT;
+-	else if (skb_hnat_iface(skb) == FOE_MAGIC_WED1)
++	else if (iface == FOE_MAGIC_WED1)
+ 		skb_hnat_sport(skb) = NR_WDMA1_PORT;
+-	else if (skb_hnat_iface(skb) == FOE_MAGIC_WED2)
++	else if (iface == FOE_MAGIC_WED2)
+ 		skb_hnat_sport(skb) = NR_WDMA2_PORT;
++
++	if (diag && hnat_priv && skb_hnat_ppe(skb) >= CFG_PPE_NUM)
++		atomic64_inc(&hnat_diag_rx_bad_ppe);
+ 
+ 	return NF_ACCEPT;
+ }

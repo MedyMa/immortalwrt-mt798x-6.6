@@ -1,0 +1,57 @@
+--- a/mt_wifi/common/cmm_data.c
++++ b/mt_wifi/common/cmm_data.c
+@@ -25,6 +25,41 @@
+ 
+ 
+ #include "rt_config.h"
++#include <linux/atomic.h>
++#include <linux/moduleparam.h>
++
++/* Default-off counter for RX packets forced to the software path. */
++static bool whnat_force_rx_diag_enable;
++static int whnat_diag_enable_get(char *buf, const struct kernel_param *kp)
++{
++	return scnprintf(buf, PAGE_SIZE, "%c\n",
++			  READ_ONCE(*(bool *)kp->arg) ? 'Y' : 'N');
++}
++static int whnat_diag_enable_set(const char *val, const struct kernel_param *kp)
++{
++	bool enable;
++	int err = kstrtobool(val, &enable);
++
++	if (err)
++		return err;
++	WRITE_ONCE(*(bool *)kp->arg, enable);
++	return 0;
++}
++static const struct kernel_param_ops whnat_diag_enable_ops = {
++	.set = whnat_diag_enable_set,
++	.get = whnat_diag_enable_get,
++};
++module_param_cb(whnat_force_rx_diag_enable, &whnat_diag_enable_ops, &whnat_force_rx_diag_enable, 0600);
++static atomic64_t whnat_force_rx_sw_packets = ATOMIC64_INIT(0);
++static int whnat_force_rx_sw_packets_get(char *buf, const struct kernel_param *kp)
++{
++	return scnprintf(buf, PAGE_SIZE, "%lld\n", atomic64_read((atomic64_t *)kp->arg));
++}
++static const struct kernel_param_ops whnat_force_rx_sw_packets_ops = {
++	.get = whnat_force_rx_sw_packets_get,
++};
++module_param_cb(whnat_force_rx_sw_packets, &whnat_force_rx_sw_packets_ops,
++		&whnat_force_rx_sw_packets, 0444);
+ #include "txs.h"
+ #ifdef TXRX_STAT_SUPPORT
+ #include "hdev/hdev_basic.h"
+@@ -2955,8 +2990,11 @@
+ 		}
+ #endif
+ #ifdef CONFIG_FAST_NAT_SUPPORT
+-		if (peer_entry && (peer_entry->ForceSwPath & FORCE_SW_PATH_RX))
++		if (peer_entry && (peer_entry->ForceSwPath & FORCE_SW_PATH_RX)) {
++			if (unlikely(READ_ONCE(whnat_force_rx_diag_enable)))
++				atomic64_inc(&whnat_force_rx_sw_packets);
+ 			RTMP_SET_PACKET_TYPE(pPacket, RX_DATA_SWPATH);
++		}
+ #endif
+ 		announce_802_3_packet(pAd, pPacket, op_mode);
+ 	} else {

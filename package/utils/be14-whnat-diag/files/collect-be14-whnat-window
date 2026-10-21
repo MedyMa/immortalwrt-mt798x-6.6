@@ -1,0 +1,238 @@
+#!/bin/sh
+# One short sample for the exact 35e699e diagnostic candidate. This script is
+# not for stock firmware: install only after matching diagnostic kernel modules
+# are loaded. It never changes whnat_en, network settings, PPE state, or MIBs.
+
+case "${1:-}" in
+  --help|-h)
+    printf '%s\n' 'BE14 module-only diagnostic capture (default 20 seconds).' 'Requires matching diagnostic kernel IPKs; does not install, reboot, or change WHNAT.' 'Run: WINDOW_SECONDS=20 collect-be14-whnat-window'
+    exit 0 ;;
+  '') ;;
+  *) printf '%s\n' 'Unknown argument; use --help' >&2; exit 2 ;;
+esac
+
+set -u
+umask 077
+
+SYSROOT=${SYSROOT:-/sys}
+PROCROOT=${PROCROOT:-/proc}
+OUTROOT=${OUTROOT:-/tmp}
+SLEEP_BIN=${SLEEP_BIN:-sleep}
+TAR_BIN=${TAR_BIN:-tar}
+SS_BIN=${SS_BIN:-ss}
+WINDOW_SECONDS=${WINDOW_SECONDS:-20}
+ACCOUNTING_COUNTER_REL=kernel/debug/hnat/accounting
+
+stamp=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || printf unknown)
+base="be14-whnat-sample-${stamp}-$$"
+work="$OUTROOT/$base"
+archive="$OUTROOT/$base.tar.gz"
+switches="$work/switches-before.tsv"
+touched="$work/switches-touched.tsv"
+exit_status=0
+
+mkdir -m 700 "$work" 2>/dev/null || {
+	printf '%s\n' "cannot create private output directory: $work" >&2
+	exit 1
+}
+: > "$work/errors.txt"
+: > "$switches"
+: > "$touched"
+printf 'coverage=hnat,pci_rx,wifi_swpath,accounting\nomitted=ethernet_builtin,dtb\nstarted_utc=%s\nwindow_seconds=%s\n' \
+	"$(date -u +%FT%TZ 2>/dev/null || printf unavailable)" "$WINDOW_SECONDS" > "$work/run.txt"
+
+restore_switches() {
+	[ -s "$touched" ] || return 0
+	failed=0
+	while IFS="$(printf '\t')" read -r rel old; do
+		[ -n "$rel" ] || continue
+		if ! printf '%s\n' "$old" > "$SYSROOT/$rel" 2>> "$work/errors.txt"; then
+			printf 'FAILED: could not restore %s\n' "$rel" >> "$work/errors.txt"
+			failed=1
+			continue
+		fi
+		printf 'restored=%s value=%s\n' "$rel" "$old" >> "$work/run.txt"
+	done < "$touched"
+	return "$failed"
+}
+
+cleanup() {
+	exit_status=$?
+	trap - EXIT HUP INT TERM
+	set +e
+	restore_switches || exit_status=1
+	printf 'exit_status=%s\nfinished_utc=%s\n' \
+		"$exit_status" "$(date -u +%FT%TZ 2>/dev/null || printf unavailable)" >> "$work/run.txt"
+	if [ -d "$work" ]; then
+		"$TAR_BIN" -czf "$archive" -C "$OUTROOT" "$base" >> "$work/errors.txt" 2>&1
+		if [ $? -ne 0 ]; then
+			rm -f "$archive"
+			exit_status=1
+			printf '%s\n' 'FAILED: could not create sample archive' >&2
+		else
+			printf 'archive=%s\n' "$archive"
+		fi
+		rm -rf "$work"
+	fi
+	exit "$exit_status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fail() {
+	printf 'ERROR: %s\n' "$*" | tee -a "$work/errors.txt" >&2
+	exit 1
+}
+
+valid_counter() {
+	v=$1
+	case "$v" in -*) digits=${v#-} ;; *) digits=$v ;; esac
+	case "$digits" in ''|*[!0-9]*) return 1 ;; esac
+	return 0
+}
+
+read_counter() {
+	module=$1
+	name=$2
+	path="$SYSROOT/module/$module/parameters/$name"
+	[ -f "$path" ] && [ -r "$path" ] || fail "missing read-only software counter: /sys/module/$module/parameters/$name"
+	value=$(tr -d '[:space:]' < "$path" 2>/dev/null) || fail "cannot read software counter: $module/$name"
+	valid_counter "$value" || fail "counter is not an integer: $module/$name"
+	printf '%s.%s=%s\n' "$module" "$name" "$value"
+}
+
+read_module_counters() {
+	module=$1
+	shift
+	for name do
+		read_counter "$module" "$name"
+	done
+}
+
+preflight_switch() {
+	rel=$1
+	path="$SYSROOT/$rel"
+	[ -f "$path" ] && [ -r "$path" ] && [ -w "$path" ] || \
+		fail "required diagnostic switch missing/not writable: /sys/$rel (matching diagnostic build must be loaded)"
+	old=$(tr -d '[:space:]' < "$path" 2>/dev/null) || fail "cannot read switch: /sys/$rel"
+	case "$old" in
+		Y|1|N|0) ;;
+		*) fail "unexpected boolean getter value at /sys/$rel: $old" ;;
+	esac
+	printf '%s\t%s\n' "$rel" "$old" >> "$switches"
+}
+
+case "$WINDOW_SECONDS" in *[!0-9]*|'') fail 'WINDOW_SECONDS must be an integer' ;; esac
+[ "$WINDOW_SECONDS" -ge 1 ] && [ "$WINDOW_SECONDS" -le 60 ] || \
+	fail 'sampling window must be between 1 and 60 seconds'
+
+# Exact module_param_cb names from diagnostic patch 96a7d0bcb28d...d377b.
+# mtk_eth_soc.c is linked into mtk_eth. Each original value is saved first.
+preflight_switch module/mtkhnat/parameters/hnat_diag_enable
+preflight_switch module/mtk_pci/parameters/whnat_rx_diag_enable
+preflight_switch module/mt_wifi/parameters/whnat_force_rx_diag_enable
+preflight_switch module/mtkhnat/parameters/hnat_account_lock_diag_enable
+
+# Exact existing read-only debugfs endpoint from 35e699e hnat_debugfs.c.
+# hnat_account_show snapshots software state; it does not drain PPE MIBs.
+accounting_path="$SYSROOT/$ACCOUNTING_COUNTER_REL"
+[ -f "$accounting_path" ] && [ -r "$accounting_path" ] || \
+	fail 'required /sys/kernel/debug/hnat/accounting is absent/unreadable; refusing to mount debugfs or guess another node'
+
+# Ethernet diagnostics and DTB changes are not included in the IPK suite.
+# Counter getters are 0444 atomic64 reads. Verify every declared field before
+# changing any enable switch, so a partial diagnostic install fails closed.
+: > "$work/counter-interface-check.txt"
+read_module_counters mtkhnat \
+	hnat_diag_rx_hook_calls hnat_diag_rx_no_headroom hnat_diag_rx_not_from_wed \
+	hnat_diag_rx_wed0 hnat_diag_rx_wed1 hnat_diag_rx_wed2 \
+	hnat_diag_rx_no_hnat_private hnat_diag_rx_bad_entry hnat_diag_rx_bad_ppe \
+	hnat_diag_cpu_wifi_attempts hnat_diag_cpu_wifi_gso \
+	hnat_diag_cpu_wifi_gso_errors hnat_diag_cpu_wifi_segments_queued \
+	> "$work/counter-interface-check.txt"
+read_module_counters mtk_pci \
+	whnat_rx_diag_desc_total whnat_rx_diag_desc_ppe_valid \
+	whnat_rx_diag_desc_no_ppe_valid whnat_rx_diag_desc_hw_path \
+	whnat_rx_diag_desc_cannot_reorder whnat_rx_diag_desc_csrn_zero \
+	whnat_rx_diag_desc_csrn_nonzero whnat_rx_diag_desc_pn_fail \
+	whnat_rx_diag_desc_repeat whnat_rx_diag_desc_oldpkt \
+	whnat_rx_diag_queue_rro whnat_rx_diag_queue_msdu_pg \
+	whnat_rx_diag_skb_built whnat_rx_diag_skb_hw_path \
+	whnat_rx_diag_skb_no_hw_path whnat_rx_diag_bus_handoff \
+	whnat_rx_diag_fifo_enqueued whnat_rx_diag_fifo_drop >> "$work/counter-interface-check.txt"
+read_module_counters mt_wifi whnat_force_rx_sw_packets >> "$work/counter-interface-check.txt"
+cat "$accounting_path" > "$work/accounting-interface-check.txt" 2> "$work/accounting-interface-error.txt" || \
+	fail 'cannot read verified software accounting debugfs endpoint'
+printf 'counter_interface_preflight=complete\naccounting_counter_path=/sys/%s\n' \
+	"$ACCOUNTING_COUNTER_REL" >> "$work/run.txt"
+
+# Capture baseline before enabling any switches.
+capture() {
+	label=$1
+	printf '%s\n' "$(date -u +%FT%TZ 2>/dev/null || printf unavailable)" > "$work/${label}.time"
+	if [ -r "$PROCROOT/uptime" ]; then cat "$PROCROOT/uptime" > "$work/${label}.uptime"; else printf unavailable > "$work/${label}.uptime"; fi
+	if [ -r "$PROCROOT/net/snmp" ]; then
+		awk '
+			$1 == "Tcp:" && !seen { for (i=2; i<=NF; i++) key[i]=$i; seen=1; next }
+			$1 == "Tcp:" && seen { for (i=2; i<=NF; i++) if (key[i] == "RetransSegs") { print $i; found=1; exit } }
+			END { if (!found) print "unavailable" }
+		' "$PROCROOT/net/snmp" 2>/dev/null > "$work/${label}.tcp_retrans_segs"
+	else
+		printf unavailable > "$work/${label}.tcp_retrans_segs"
+	fi
+	if command -v "$SS_BIN" >/dev/null 2>&1; then
+		"$SS_BIN" -s > "$work/${label}.ss-summary" 2> "$work/${label}.ss-error" || printf 'ss_summary=failed\n' >> "$work/${label}.ss-error"
+	else
+		printf '%s\n' 'ss unavailable; aggregate socket summary omitted' > "$work/${label}.ss-summary"
+	fi
+	{
+		for d in "$SYSROOT"/class/net/*; do
+			[ -d "$d/statistics" ] || continue
+			iface=${d##*/}
+			for key in rx_errors tx_errors rx_dropped tx_dropped; do
+				f="$d/statistics/$key"
+				if [ -r "$f" ]; then val=$(cat "$f" 2>/dev/null) || val=unavailable; else val=unavailable; fi
+				printf '%s.%s=%s\n' "$iface" "$key" "$val"
+			done
+		done
+	} > "$work/${label}.interface-errors"
+	{
+		read_module_counters mtkhnat \
+			hnat_diag_rx_hook_calls hnat_diag_rx_no_headroom hnat_diag_rx_not_from_wed \
+			hnat_diag_rx_wed0 hnat_diag_rx_wed1 hnat_diag_rx_wed2 \
+			hnat_diag_rx_no_hnat_private hnat_diag_rx_bad_entry hnat_diag_rx_bad_ppe \
+			hnat_diag_cpu_wifi_attempts hnat_diag_cpu_wifi_gso \
+			hnat_diag_cpu_wifi_gso_errors hnat_diag_cpu_wifi_segments_queued
+		read_module_counters mtk_pci \
+			whnat_rx_diag_desc_total whnat_rx_diag_desc_ppe_valid \
+			whnat_rx_diag_desc_no_ppe_valid whnat_rx_diag_desc_hw_path \
+			whnat_rx_diag_desc_cannot_reorder whnat_rx_diag_desc_csrn_zero \
+			whnat_rx_diag_desc_csrn_nonzero whnat_rx_diag_desc_pn_fail \
+			whnat_rx_diag_desc_repeat whnat_rx_diag_desc_oldpkt \
+			whnat_rx_diag_queue_rro whnat_rx_diag_queue_msdu_pg \
+			whnat_rx_diag_skb_built whnat_rx_diag_skb_hw_path \
+			whnat_rx_diag_skb_no_hw_path whnat_rx_diag_bus_handoff \
+			whnat_rx_diag_fifo_enqueued whnat_rx_diag_fifo_drop
+		read_module_counters mt_wifi whnat_force_rx_sw_packets
+	} > "$work/${label}.module-counters" || fail "module counter read failed for $label"
+	cat "$accounting_path" > "$work/${label}.accounting-software-counters" 2> "$work/${label}.accounting-error" || \
+		fail "accounting software counter read failed for $label"
+}
+
+capture before
+# Preserve a restore entry for every switch, including those already enabled.
+cat "$switches" > "$touched" || fail 'could not stage switch restore values'
+while IFS="$(printf '\t')" read -r rel old; do
+	case "$old" in Y|1) continue ;; esac
+	if ! printf 'Y\n' > "$SYSROOT/$rel" 2>> "$work/errors.txt"; then
+		fail "could not enable diagnostic switch: /sys/$rel"
+	fi
+done < "$switches"
+
+printf 'Sampling for %s seconds; upload over BE14 Wi-Fi now.\n' "$WINDOW_SECONDS"
+"$SLEEP_BIN" "$WINDOW_SECONDS" || fail 'sampling window sleep failed'
+capture after
+printf 'sample_complete=1\n' >> "$work/run.txt"
+exit 0

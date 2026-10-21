@@ -1,0 +1,164 @@
+--- a/wlan_hwifi/bus/mtk_pci_dma.c
++++ b/wlan_hwifi/bus/mtk_pci_dma.c
+@@ -34,6 +34,60 @@
+ #include "bus.h"
+ #include "mtk_pci_dma.h"
+ #include "mtk_rro.h"
++
++#include <linux/atomic.h>
++#include <linux/moduleparam.h>
++
++/* Default-off aggregate counters for one controlled diagnostic run. */
++static bool whnat_rx_diag_enable;
++static int whnat_diag_enable_get(char *buf, const struct kernel_param *kp)
++{
++	return scnprintf(buf, PAGE_SIZE, "%c\n",
++			  READ_ONCE(*(bool *)kp->arg) ? 'Y' : 'N');
++}
++static int whnat_diag_enable_set(const char *val, const struct kernel_param *kp)
++{
++	bool enable;
++	int err = kstrtobool(val, &enable);
++
++	if (err)
++		return err;
++	WRITE_ONCE(*(bool *)kp->arg, enable);
++	return 0;
++}
++static const struct kernel_param_ops whnat_diag_enable_ops = {
++	.set = whnat_diag_enable_set,
++	.get = whnat_diag_enable_get,
++};
++module_param_cb(whnat_rx_diag_enable, &whnat_diag_enable_ops, &whnat_rx_diag_enable, 0600);
++static int whnat_rx_diag_atomic_get(char *buf, const struct kernel_param *kp)
++{
++	return scnprintf(buf, PAGE_SIZE, "%lld\n", atomic64_read((atomic64_t *)kp->arg));
++}
++static const struct kernel_param_ops whnat_rx_diag_atomic_ops = { .get = whnat_rx_diag_atomic_get };
++#define WHNAT_RX_DIAG_COUNTER(name) \
++	static atomic64_t whnat_rx_diag_##name = ATOMIC64_INIT(0); \
++	module_param_cb(whnat_rx_diag_##name, &whnat_rx_diag_atomic_ops, \
++			&whnat_rx_diag_##name, 0444)
++
++WHNAT_RX_DIAG_COUNTER(desc_total);
++WHNAT_RX_DIAG_COUNTER(desc_ppe_valid);
++WHNAT_RX_DIAG_COUNTER(desc_no_ppe_valid);
++WHNAT_RX_DIAG_COUNTER(desc_hw_path);
++WHNAT_RX_DIAG_COUNTER(desc_cannot_reorder);
++WHNAT_RX_DIAG_COUNTER(desc_csrn_zero);
++WHNAT_RX_DIAG_COUNTER(desc_csrn_nonzero);
++WHNAT_RX_DIAG_COUNTER(desc_pn_fail);
++WHNAT_RX_DIAG_COUNTER(desc_repeat);
++WHNAT_RX_DIAG_COUNTER(desc_oldpkt);
++WHNAT_RX_DIAG_COUNTER(queue_rro);
++WHNAT_RX_DIAG_COUNTER(queue_msdu_pg);
++WHNAT_RX_DIAG_COUNTER(skb_built);
++WHNAT_RX_DIAG_COUNTER(skb_hw_path);
++WHNAT_RX_DIAG_COUNTER(skb_no_hw_path);
++WHNAT_RX_DIAG_COUNTER(bus_handoff);
++WHNAT_RX_DIAG_COUNTER(fifo_enqueued);
++WHNAT_RX_DIAG_COUNTER(fifo_drop);
+ 
+ 
+ static u32
+@@ -1353,25 +1407,47 @@
+ 	rx_info->len = GET_FIELD(RXDMAD_SDL0, dw1);
+ 	rx_info->more = !GET_FIELD(RXDMAD_LS0, dw1);
+ 	rx_info->ip_frag = GET_FIELD(RXDMAD_F, dw3);
++	if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++		atomic64_inc(&whnat_rx_diag_desc_total);
+ 
+ 	if (dw3 & RXDMAD_PPE_VLD_MASK) {
+ 		rx_info->ppe_entry = GET_FIELD(RXDMAD_PPE_ENTRY, dw3);
+ 		rx_info->csrn = GET_FIELD(RXDMAD_CSRN, dw3);
+-
+-		if (GET_FIELD(RXDMAD_IND_REASON, dw2) != IND_REASON_CANNOT_DO_REORDER)
++		if (unlikely(READ_ONCE(whnat_rx_diag_enable))) {
++			atomic64_inc(&whnat_rx_diag_desc_ppe_valid);
++			atomic64_inc(rx_info->csrn ? &whnat_rx_diag_desc_csrn_nonzero :
++					      &whnat_rx_diag_desc_csrn_zero);
++		}
++
++		if (GET_FIELD(RXDMAD_IND_REASON, dw2) != IND_REASON_CANNOT_DO_REORDER) {
+ 			rx_info->hw_path = true;
++			if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++				atomic64_inc(&whnat_rx_diag_desc_hw_path);
++		} else if (unlikely(READ_ONCE(whnat_rx_diag_enable))) {
++			atomic64_inc(&whnat_rx_diag_desc_cannot_reorder);
++		}
++	} else if (unlikely(READ_ONCE(whnat_rx_diag_enable))) {
++		atomic64_inc(&whnat_rx_diag_desc_no_ppe_valid);
+ 	}
+ 
+ 	if (dw1 & RXDMAD_VER_MASK) {
+ 		if (GET_FIELD(RXDMAD_PN_CHK_FAIL, dw1) ||
+-		    GET_FIELD(RXDMAD_IND_REASON, dw2) == IND_REASON_PN_CHK_FAIL)
++		    GET_FIELD(RXDMAD_IND_REASON, dw2) == IND_REASON_PN_CHK_FAIL) {
+ 			rx_info->pn_chk_fail = true;
++			if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++				atomic64_inc(&whnat_rx_diag_desc_pn_fail);
++		}
+ 
+ 		/* Decide drop in mac rxd parser */
+-		if (GET_FIELD(RXDMAD_IND_REASON, dw2) == IND_REASON_REPEAT)
++		if (GET_FIELD(RXDMAD_IND_REASON, dw2) == IND_REASON_REPEAT) {
+ 			rx_info->repeat_pkt = 1;
+-		else if (GET_FIELD(RXDMAD_IND_REASON, dw2) == IND_REASON_OLDPKT)
++			if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++				atomic64_inc(&whnat_rx_diag_desc_repeat);
++		} else if (GET_FIELD(RXDMAD_IND_REASON, dw2) == IND_REASON_OLDPKT) {
+ 			rx_info->old_pkt = 1;
++			if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++				atomic64_inc(&whnat_rx_diag_desc_oldpkt);
++		}
+ 	} else {
+ 		rx_info->drop = dw1 & (RXDMAD_RXD_DROP_MASK | RXDMAD_TO_HOST_A_MASK) ?
+ 				RXDMAD_VER_ZREO_DROP : RXDMAD_NON_DROP;
+@@ -1659,6 +1735,10 @@
+ 
+ 		if (q->q_attr == Q_RX_DATA_RRO ||
+ 			q->q_attr == Q_RX_DATA_MSDU_PG) {
++			if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++				atomic64_inc(q->q_attr == Q_RX_DATA_RRO ?
++						      &whnat_rx_diag_queue_rro :
++						      &whnat_rx_diag_queue_msdu_pg);
+ 			done++;
+ 			continue;
+ 		}
+@@ -1693,6 +1773,11 @@
+ 
+ 		skb_rx_info = (struct mtk_bus_rx_info *)skb->cb;
+ 		*skb_rx_info = rx_info;
++		if (unlikely(READ_ONCE(whnat_rx_diag_enable))) {
++			atomic64_inc(&whnat_rx_diag_skb_built);
++			atomic64_inc(rx_info.hw_path ? &whnat_rx_diag_skb_hw_path :
++					      &whnat_rx_diag_skb_no_hw_path);
++		}
+ 
+ 		if (rx_info.hw_path) {
+ 			SET_PACKET_TYPE(rx_info.skb, RX_PPE_VALID);
+@@ -1709,16 +1794,24 @@
+ 		if (likely(rq->rx_offload.kfifo_enable)) {
+ 			rx_process.skb = skb;
+ 			if (unlikely(!kfifo_put(&rq->bus_rx_process_fifo, rx_process))) {
++				if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++					atomic64_inc(&whnat_rx_diag_fifo_drop);
+ 				dbg_bus_kfifo_full_drop_by_hwifi_inc(to_bus_trans(trans));
+ 				dev_err(dev->dev, "%s(): rx_data fifo full\n\n", __func__);
+ 				dev_kfree_skb(skb);
+ 				break;
+ 			}
++			if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++				atomic64_inc(&whnat_rx_diag_fifo_enqueued);
+ 		} else {
++			if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++				atomic64_inc(&whnat_rx_diag_bus_handoff);
+ 			mtk_bus_rx_process((struct mtk_bus_trans *)trans,
+ 							q->q_attr, skb);
+ 		}
+ #else
++		if (unlikely(READ_ONCE(whnat_rx_diag_enable)))
++			atomic64_inc(&whnat_rx_diag_bus_handoff);
+ 		mtk_bus_rx_process((struct mtk_bus_trans *)trans,
+ 							q->q_attr, skb);
+ #endif /* CONFIG_HWIFI_RX_PROCESS_WORKQUEUE */

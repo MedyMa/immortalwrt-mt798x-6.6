@@ -16,7 +16,7 @@
  /* TOPRGU resets */
  #define MT7988_TOPRGU_SGMII0_GRST		1
  #define MT7988_TOPRGU_SGMII1_GRST		2
-@@ -197,6 +206,86 @@
+@@ -197,6 +206,87 @@
  		regulator-always-on;
  	};
  
@@ -25,6 +25,7 @@
 +		wed_num = <3>;
 +		/* add this property for wed get the pci slot number. */
 +		pci_slot_map = <0>, <1>, <2>;
++		dy_rxbm_enable = "true";
 +		reg = <0 0x15010000 0 0x2000>,
 +		      <0 0x15012000 0 0x2000>,
 +		      <0 0x15014000 0 0x2000>;
