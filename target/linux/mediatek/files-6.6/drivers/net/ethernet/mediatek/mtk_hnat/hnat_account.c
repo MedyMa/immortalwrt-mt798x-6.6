@@ -354,6 +354,16 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		return true;
 	}
 	if (confirm) {
+		/* Two CPUs may snapshot the same prefill before entry_lock. Once the
+		 * first confirm publishes BIND, the second snapshot is already handled.
+		 * Keep its owner; retiring it here loses accounting for the live FOE.
+		 */
+		if (owner_live(h, ppe, slot) && !s->owner->prefill &&
+		    (!ct || (ct == s->owner->ct &&
+			     CTINFO2DIR(info) == s->owner->dir))) {
+			spin_unlock_bh(&p->lock);
+			return true;
+		}
 		if (s->generation != expected_generation ||
 		    !owner_live(h, ppe, slot) || !s->owner->prefill ||
 		    (ct && (ct != s->owner->ct || CTINFO2DIR(info) != s->owner->dir))) {
