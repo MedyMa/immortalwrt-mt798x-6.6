@@ -1,6 +1,6 @@
 --- a/mt_wifi/common/cmm_data.c
 +++ b/mt_wifi/common/cmm_data.c
-@@ -25,6 +25,41 @@
+@@ -25,6 +25,85 @@
  
  
  #include "rt_config.h"
@@ -39,10 +39,54 @@
 +};
 +module_param_cb(whnat_force_rx_sw_packets, &whnat_force_rx_sw_packets_ops,
 +		&whnat_force_rx_sw_packets, 0444);
++
++/* Aggregate reports across all adapters/stations, not per speedtest flow.
++ * No firmware query, RX profiling, report enable or read-clear operation.
++ */
++void be14_whnat_fw_tx_diag_add(u32 total, u32 failed);
++void be14_whnat_txs_diag_add(bool me, bool re, bool le, bool be,
++                           bool txop, bool baf);
++#define BE14_TX_COUNTER(name) \
++    static atomic64_t whnat_tx_diag_##name = ATOMIC64_INIT(0); \
++    module_param_cb(whnat_tx_diag_##name, &whnat_force_rx_sw_packets_ops, \
++                    &whnat_tx_diag_##name, 0444)
++BE14_TX_COUNTER(fw_reports);
++BE14_TX_COUNTER(fw_total);
++BE14_TX_COUNTER(fw_fail);
++BE14_TX_COUNTER(txs_reports);
++BE14_TX_COUNTER(txs_me);
++BE14_TX_COUNTER(txs_re);
++BE14_TX_COUNTER(txs_le);
++BE14_TX_COUNTER(txs_be);
++BE14_TX_COUNTER(txs_txop);
++BE14_TX_COUNTER(txs_baf);
++
++void be14_whnat_fw_tx_diag_add(u32 total, u32 failed)
++{
++    if (!unlikely(READ_ONCE(whnat_force_rx_diag_enable)))
++        return;
++    atomic64_inc(&whnat_tx_diag_fw_reports);
++    atomic64_add(total, &whnat_tx_diag_fw_total);
++    atomic64_add(failed, &whnat_tx_diag_fw_fail);
++}
++
++void be14_whnat_txs_diag_add(bool me, bool re, bool le, bool be,
++                           bool txop, bool baf)
++{
++    if (!unlikely(READ_ONCE(whnat_force_rx_diag_enable)))
++        return;
++    atomic64_inc(&whnat_tx_diag_txs_reports);
++    if (me) atomic64_inc(&whnat_tx_diag_txs_me);
++    if (re) atomic64_inc(&whnat_tx_diag_txs_re);
++    if (le) atomic64_inc(&whnat_tx_diag_txs_le);
++    if (be) atomic64_inc(&whnat_tx_diag_txs_be);
++    if (txop) atomic64_inc(&whnat_tx_diag_txs_txop);
++    if (baf) atomic64_inc(&whnat_tx_diag_txs_baf);
++}
  #include "txs.h"
  #ifdef TXRX_STAT_SUPPORT
  #include "hdev/hdev_basic.h"
-@@ -2955,8 +2990,11 @@
+@@ -2955,8 +3034,11 @@
  		}
  #endif
  #ifdef CONFIG_FAST_NAT_SUPPORT
@@ -55,3 +99,44 @@
  #endif
  		announce_802_3_packet(pAd, pPacket, op_mode);
  	} else {
+--- a/mt_wifi/chip/mcu/cmm_fw_uni_event.c
++++ b/mt_wifi/chip/mcu/cmm_fw_uni_event.c
+@@ -16,6 +16,8 @@
+ 
+ #ifdef WIFI_UNIFIED_COMMAND
+ #include "rt_config.h"
++void be14_whnat_fw_tx_diag_add(u32 total, u32 failed);
++
+ #include "epcs_cmm.h"
+ #include "dot11be_eht.h"
+ 
+@@ -7456,6 +7458,9 @@
+ 		if (pEntry && pEntry->wdev && pEntry->Sst == SST_ASSOC &&
+ 		(IS_ENTRY_CLIENT(pEntry) || IS_ENTRY_PEER_AP(pEntry) || IS_ENTRY_REPEATER(pEntry)))
+ 		{
++			be14_whnat_fw_tx_diag_add(
++				le2cpu32(prTxStatResult->u4TotalTxCount),
++				le2cpu32(prTxStatResult->u4TotalTxFailCount));
+ 			/* sta counter */
+ 			pEntry->mpdu_attempts.QuadPart += le2cpu32(prTxStatResult->u4TotalTxCount);
+ 			pEntry->mpdu_retries.QuadPart += le2cpu32(prTxStatResult->u4TotalTxFailCount);
+--- a/mt_wifi/chip/mac_mt/mt_fmac.c
++++ b/mt_wifi/chip/mac_mt/mt_fmac.c
+@@ -16,6 +16,9 @@
+ */
+ 
+ #include "rt_config.h"
++void be14_whnat_txs_diag_add(bool me, bool re, bool le, bool be,
++                           bool txop, bool baf);
++
+ #include "mac_mt/fmac/mt_fmac.h"
+ 
+ 
+@@ -2780,6 +2783,7 @@
+ 
+ 			if (baf)
+ 				tr_cnt->baf[tid]++;
++			be14_whnat_txs_diag_add(me, re, le, be, txop_limit_error, baf);
+ 
+ 			MTWF_DBG(NULL, DBG_CAT_TX, CATTX_TMAC, dbg_prn,
+ 					"\t\tME/RE/LE/BE/TxOPLimitErr/BA-Fail = %d/%d/%d/%d/%d/%d, PS = %d, Pid = %d\n",

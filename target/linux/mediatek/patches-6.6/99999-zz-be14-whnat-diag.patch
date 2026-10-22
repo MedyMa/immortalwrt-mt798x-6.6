@@ -1,6 +1,6 @@
 --- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
 +++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
-@@ -35,6 +35,59 @@
+@@ -35,6 +35,67 @@
  
  #include "nf_hnat_mtk.h"
  #include "hnat.h"
@@ -56,20 +56,86 @@
 +HNAT_DIAG_COUNTER(cpu_wifi_gso);
 +HNAT_DIAG_COUNTER(cpu_wifi_gso_errors);
 +HNAT_DIAG_COUNTER(cpu_wifi_segments_queued);
++HNAT_DIAG_COUNTER(cpu_wifi_no_device_drop);
++HNAT_DIAG_COUNTER(cpu_wifi_vlan_drop);
++HNAT_DIAG_COUNTER(cpu_wifi_headroom_drop);
++HNAT_DIAG_COUNTER(cpu_wifi_xmit_calls);
++HNAT_DIAG_COUNTER(cpu_wifi_xmit_ok);
++HNAT_DIAG_COUNTER(cpu_wifi_xmit_cn);
++HNAT_DIAG_COUNTER(cpu_wifi_xmit_drop);
++HNAT_DIAG_COUNTER(cpu_wifi_xmit_other);
 +
  
  #include "../mtk_eth_soc.h"
  #include "../mtk_eth_reset.h"
-@@ -1027,6 +1080,8 @@
+@@ -1027,39 +1088,64 @@
  static void hnat_cpu_to_ge_xmit(struct sk_buff *skb)
  {
  	u16 vlan_id;
-+	if (unlikely(READ_ONCE(hnat_diag_enable)))
++	int ret;
++	bool diag = unlikely(READ_ONCE(hnat_diag_enable));
++	/* Legacy counter: helper entry, before the drop guards below. */
++	if (diag)
 +		atomic64_inc(&hnat_diag_cpu_wifi_segments_queued);
  
  	if (unlikely(!hnat_priv || !hnat_priv->g_ppdev)) {
++		if (diag)
++			atomic64_inc(&hnat_diag_cpu_wifi_no_device_drop);
  		dev_kfree_skb_any(skb);
-@@ -1068,6 +1123,8 @@
+ 		return;
+ 	}
+ 
+ 	vlan_id = skb_vlan_tag_get_id(skb);
+ 
+ 	if (unlikely(vlan_id)) {
+ 		skb = vlan_insert_tag(skb, skb->vlan_proto, skb->vlan_tci);
+-		if (!skb)
++		if (!skb) {
++			if (diag)
++				atomic64_inc(&hnat_diag_cpu_wifi_vlan_drop);
+ 			return;
++		}
+ 	}
+ 
+ 	/* vlan_insert_tag() may replace skb->head.  Initialize the vendor
+ 	 * metadata only after it, so every segment queued to PPE owns a valid
+ 	 * descriptor at the beginning of its current head allocation.
+ 	 */
+ 	if (unlikely(skb_cow_head(skb, FOE_INFO_LEN))) {
++		if (diag)
++			atomic64_inc(&hnat_diag_cpu_wifi_headroom_drop);
+ 		dev_kfree_skb_any(skb);
+ 		return;
+ 	}
+ 
+ 	memset(skb_hnat_info(skb), 0, FOE_INFO_LEN);
+ 	skb_hnat_alg(skb) = 0;
+ 	skb_hnat_magic_tag(skb) = HNAT_MAGIC_TAG;
+ 	skb_hnat_filled(skb) = 0;
+ 	set_to_ppe(skb);
+ 
+ 	/* Set where the reinjected packet came from. */
+ 	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+ 			       VLAN_CFI_MASK | (1234 & VLAN_VID_MASK));
+ 	skb->dev = hnat_priv->g_ppdev;
+-	dev_queue_xmit(skb);
++	if (diag)
++		atomic64_inc(&hnat_diag_cpu_wifi_xmit_calls);
++	ret = dev_queue_xmit(skb);
++	/* skb is consumed. Never read or retry it after dev_queue_xmit(). */
++	if (diag) {
++		if (ret == NET_XMIT_SUCCESS)
++			atomic64_inc(&hnat_diag_cpu_wifi_xmit_ok);
++		else if (ret == NET_XMIT_CN)
++			atomic64_inc(&hnat_diag_cpu_wifi_xmit_cn);
++		else if (ret == NET_XMIT_DROP)
++			atomic64_inc(&hnat_diag_cpu_wifi_xmit_drop);
++		else
++			atomic64_inc(&hnat_diag_cpu_wifi_xmit_other);
++	}
+ }
+ 
+@@ -1068,6 +1154,8 @@
  	struct sk_buff *segs, *seg, *next;
  	netdev_features_t features;
  
@@ -78,7 +144,7 @@
  	if (unlikely(skb_shinfo(skb)->frag_list))
  		return -1;
  	if (unlikely(skb_cow_head(skb, FOE_INFO_LEN + ETH_HLEN)))
-@@ -1100,6 +1157,8 @@
+@@ -1100,6 +1188,8 @@
  		return 0;
  	}
  
@@ -87,7 +153,7 @@
  	/* QDMA/PPE/WED can reorder consecutive hardware-TSO batches.
  	 * Produce wire-sized skbs here while retaining SG and checksum
  	 * offload.  GSO uses skb->cb[32..47] and allocates fresh skb
-@@ -1109,6 +1168,8 @@
+@@ -1109,6 +1199,8 @@
  	features = hnat_priv->g_ppdev->features & ~NETIF_F_GSO_MASK;
  	segs = skb_gso_segment(skb, features);
  	if (IS_ERR(segs)) {
@@ -96,7 +162,7 @@
  		pr_warn_ratelimited("HNAT: CPU-to-WiFi GSO segmentation failed: %ld\n",
  				    PTR_ERR(segs));
  		dev_kfree_skb_any(skb);
-@@ -2726,20 +2787,49 @@
+@@ -2726,20 +2818,49 @@
  
  int mtk_sw_nat_hook_rx(struct sk_buff *skb)
  {

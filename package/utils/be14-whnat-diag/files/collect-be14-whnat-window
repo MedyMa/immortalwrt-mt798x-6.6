@@ -38,7 +38,7 @@ mkdir -m 700 "$work" 2>/dev/null || {
 : > "$work/errors.txt"
 : > "$switches"
 : > "$touched"
-printf 'coverage=hnat,pci_rx,wifi_swpath,accounting\nomitted=ethernet_builtin,dtb\nstarted_utc=%s\nwindow_seconds=%s\n' \
+printf 'diagnostic_revision=2\ncoverage=hnat,pci_rx,wifi_swpath,wifi_tx_reports,accounting\nomitted=ethernet_builtin,dtb\nstarted_utc=%s\nwindow_seconds=%s\n' \
 	"$(date -u +%FT%TZ 2>/dev/null || printf unavailable)" "$WINDOW_SECONDS" > "$work/run.txt"
 
 restore_switches() {
@@ -128,8 +128,8 @@ case "$WINDOW_SECONDS" in *[!0-9]*|'') fail 'WINDOW_SECONDS must be an integer' 
 [ "$WINDOW_SECONDS" -ge 1 ] && [ "$WINDOW_SECONDS" -le 60 ] || \
 	fail 'sampling window must be between 1 and 60 seconds'
 
-# Exact module_param_cb names from diagnostic patch 96a7d0bcb28d...d377b.
-# mtk_eth_soc.c is linked into mtk_eth. Each original value is saved first.
+# Exact module_param_cb names from the matching module-only diagnostic build.
+# WiFi TX reports share the WiFi switch. Each original value is saved first.
 preflight_switch module/mtkhnat/parameters/hnat_diag_enable
 preflight_switch module/mtk_pci/parameters/whnat_rx_diag_enable
 preflight_switch module/mt_wifi/parameters/whnat_force_rx_diag_enable
@@ -151,6 +151,7 @@ read_module_counters mtkhnat \
 	hnat_diag_rx_no_hnat_private hnat_diag_rx_bad_entry hnat_diag_rx_bad_ppe \
 	hnat_diag_cpu_wifi_attempts hnat_diag_cpu_wifi_gso \
 	hnat_diag_cpu_wifi_gso_errors hnat_diag_cpu_wifi_segments_queued \
+		hnat_diag_cpu_wifi_no_device_drop hnat_diag_cpu_wifi_vlan_drop hnat_diag_cpu_wifi_headroom_drop hnat_diag_cpu_wifi_xmit_calls hnat_diag_cpu_wifi_xmit_ok hnat_diag_cpu_wifi_xmit_cn hnat_diag_cpu_wifi_xmit_drop hnat_diag_cpu_wifi_xmit_other \
 	> "$work/counter-interface-check.txt"
 read_module_counters mtk_pci \
 	whnat_rx_diag_desc_total whnat_rx_diag_desc_ppe_valid \
@@ -162,7 +163,7 @@ read_module_counters mtk_pci \
 	whnat_rx_diag_skb_built whnat_rx_diag_skb_hw_path \
 	whnat_rx_diag_skb_no_hw_path whnat_rx_diag_bus_handoff \
 	whnat_rx_diag_fifo_enqueued whnat_rx_diag_fifo_drop >> "$work/counter-interface-check.txt"
-read_module_counters mt_wifi whnat_force_rx_sw_packets >> "$work/counter-interface-check.txt"
+read_module_counters mt_wifi whnat_force_rx_sw_packets whnat_tx_diag_fw_reports whnat_tx_diag_fw_total whnat_tx_diag_fw_fail whnat_tx_diag_txs_reports whnat_tx_diag_txs_me whnat_tx_diag_txs_re whnat_tx_diag_txs_le whnat_tx_diag_txs_be whnat_tx_diag_txs_txop whnat_tx_diag_txs_baf >> "$work/counter-interface-check.txt"
 cat "$accounting_path" > "$work/accounting-interface-check.txt" 2> "$work/accounting-interface-error.txt" || \
 	fail 'cannot read verified software accounting debugfs endpoint'
 printf 'counter_interface_preflight=complete\naccounting_counter_path=/sys/%s\n' \
@@ -204,7 +205,8 @@ capture() {
 			hnat_diag_rx_wed0 hnat_diag_rx_wed1 hnat_diag_rx_wed2 \
 			hnat_diag_rx_no_hnat_private hnat_diag_rx_bad_entry hnat_diag_rx_bad_ppe \
 			hnat_diag_cpu_wifi_attempts hnat_diag_cpu_wifi_gso \
-			hnat_diag_cpu_wifi_gso_errors hnat_diag_cpu_wifi_segments_queued
+			hnat_diag_cpu_wifi_gso_errors hnat_diag_cpu_wifi_segments_queued \
+		hnat_diag_cpu_wifi_no_device_drop hnat_diag_cpu_wifi_vlan_drop hnat_diag_cpu_wifi_headroom_drop hnat_diag_cpu_wifi_xmit_calls hnat_diag_cpu_wifi_xmit_ok hnat_diag_cpu_wifi_xmit_cn hnat_diag_cpu_wifi_xmit_drop hnat_diag_cpu_wifi_xmit_other
 		read_module_counters mtk_pci \
 			whnat_rx_diag_desc_total whnat_rx_diag_desc_ppe_valid \
 			whnat_rx_diag_desc_no_ppe_valid whnat_rx_diag_desc_hw_path \
@@ -215,7 +217,7 @@ capture() {
 			whnat_rx_diag_skb_built whnat_rx_diag_skb_hw_path \
 			whnat_rx_diag_skb_no_hw_path whnat_rx_diag_bus_handoff \
 			whnat_rx_diag_fifo_enqueued whnat_rx_diag_fifo_drop
-		read_module_counters mt_wifi whnat_force_rx_sw_packets
+		read_module_counters mt_wifi whnat_force_rx_sw_packets whnat_tx_diag_fw_reports whnat_tx_diag_fw_total whnat_tx_diag_fw_fail whnat_tx_diag_txs_reports whnat_tx_diag_txs_me whnat_tx_diag_txs_re whnat_tx_diag_txs_le whnat_tx_diag_txs_be whnat_tx_diag_txs_txop whnat_tx_diag_txs_baf
 	} > "$work/${label}.module-counters" || fail "module counter read failed for $label"
 	cat "$accounting_path" > "$work/${label}.accounting-software-counters" 2> "$work/${label}.accounting-error" || \
 		fail "accounting software counter read failed for $label"
