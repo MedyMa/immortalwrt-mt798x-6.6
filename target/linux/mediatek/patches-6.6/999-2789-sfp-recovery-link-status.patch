@@ -1,0 +1,130 @@
+From: MT7988 maintainers
+Subject: [PATCH] sfp: expose cached link evidence for bounded boot recovery
+
+Provide a cache-only recovery predicate through the existing state file.
+Keep unknown media/PHY states out of automatic link-loss escalation, honour
+effective LOS polarity and quirks, and snapshot SFP fields under their locks.
+Never wait for the PHY lock under SFP locks or perform I2C/MDIO reads here.
+
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -1829,9 +1829,109 @@
+ }
+ 
+ #if IS_ENABLED(CONFIG_DEBUG_FS)
++/* Only recognise ordinary Ethernet optics with a known optical connector.
++ * Copper media converters, DACs and modules with ambiguous IDs stay unknown.
++ * Use the already parsed/fixed-up ID; never issue an EEPROM read here.
++ */
++static bool sfp_recovery_is_optical(const struct sfp_eeprom_id *id)
++{
++	if (id->base.e1000_base_t || id->base.e1000_base_cx ||
++	    id->base.if_1x_copper_active || id->base.if_1x_copper_passive ||
++	    id->base.sfp_ct_active || id->base.sfp_ct_passive ||
++	    id->base.e_base_px)
++		return false;
++
++	switch (id->base.extended_cc) {
++	case SFF8024_ECC_10GBASE_T_SFI:
++	case SFF8024_ECC_10GBASE_T_SR:
++	case SFF8024_ECC_5GBASE_T:
++	case SFF8024_ECC_2_5GBASE_T:
++		return false;
++	}
++
++	switch (id->base.connector) {
++	case SFF8024_CONNECTOR_SC:
++	case SFF8024_CONNECTOR_FIBERJACK:
++	case SFF8024_CONNECTOR_LC:
++	case SFF8024_CONNECTOR_MT_RJ:
++	case SFF8024_CONNECTOR_MU:
++	case SFF8024_CONNECTOR_OPTICAL_PIGTAIL:
++	case SFF8024_CONNECTOR_MPO_1X12:
++	case SFF8024_CONNECTOR_MPO_2X16:
++		break;
++	default:
++		return false;
++	}
++
++	return id->base.e10g_base_sr || id->base.e10g_base_lr ||
++	       id->base.e10g_base_lrm || id->base.e10g_base_er ||
++	       id->base.e1000_base_sx || id->base.e1000_base_lx ||
++	       id->base.e100_base_fx || id->base.e100_base_lx ||
++	       id->base.e_base_bx10;
++}
++
++/* Caller holds sm_mutex and st_mutex. phy_link is a separately locked PHY
++ * cache sample: -1 unknown, 0 down, 1 up. This does not freeze physical state.
++ */
++static const char *sfp_recovery_link(struct sfp *sfp, int phy_link)
++{
++	const __be16 inverted = cpu_to_be16(SFP_OPTIONS_LOS_INVERTED);
++	const __be16 normal = cpu_to_be16(SFP_OPTIONS_LOS_NORMAL);
++	__be16 options = sfp->id.ext.options & (inverted | normal);
++	bool los;
++
++	if (sfp->sm_mod_state != SFP_MOD_PRESENT ||
++	    sfp->sm_dev_state != SFP_DEV_UP || sfp->sm_state != SFP_S_LINK_UP ||
++	    !(sfp->state & SFP_F_PRESENT) ||
++	    sfp->state & (SFP_F_TX_DISABLE | SFP_F_TX_FAULT))
++		return "unknown";
++
++	/* A PHY takes precedence: never turn unknown/down into LOS-based UP. */
++	if (sfp->mod_phy)
++		return phy_link < 0 ? "unknown" : phy_link ? "phy_up" : "phy_down";
++
++	/* A failed soft LOS read can leave an older cached bit. Restrict this
++	 * recovery decision to a real, non-ignored hardware LOS input.
++	 */
++	if (sfp->no_rollball_bridge || !sfp_recovery_is_optical(&sfp->id) ||
++	    !(sfp->state_hw_mask & SFP_F_LOS) ||
++	    sfp->state_ignore_mask & SFP_F_LOS)
++		return "unknown";
++
++	if (options == normal)
++		los = !!(sfp->state & SFP_F_LOS);
++	else if (options == inverted)
++		los = !(sfp->state & SFP_F_LOS);
++	else
++		return "unknown";
++
++	return los ? "los_asserted" : "los_clear";
++}
++
+ static int sfp_debug_state_show(struct seq_file *s, void *data)
+ {
+ 	struct sfp *sfp = s->private;
++	int phy_link = -1;
++
++	/* Recovery reads must not wait behind module/I2C state transitions. */
++	if (!mutex_trylock(&sfp->sm_mutex))
++		return -EAGAIN;
++	if (!mutex_trylock(&sfp->st_mutex)) {
++		mutex_unlock(&sfp->sm_mutex);
++		return -EAGAIN;
++	}
++	/* PHY start/stop can call into SFP while holding the PHY lock. Never
++	 * block on that lock here: busy/transitioning PHY state is unknown.
++	 * sm_mutex protects mod_phy against detach/free during the sample.
++	 */
++	if (sfp->mod_phy && mutex_trylock(&sfp->mod_phy->lock)) {
++		if (sfp->mod_phy->state == PHY_RUNNING && sfp->mod_phy->link)
++			phy_link = 1;
++		else if ((sfp->mod_phy->state == PHY_RUNNING ||
++			  sfp->mod_phy->state == PHY_NOLINK) && !sfp->mod_phy->link)
++			phy_link = 0;
++		mutex_unlock(&sfp->mod_phy->lock);
++	}
+ 
+ 	seq_printf(s, "Module state: %s\n",
+ 		   mod_state_to_str(sfp->sm_mod_state));
+@@ -1855,6 +1955,9 @@
+ 	seq_printf(s, "tx_disable: %d\n", !!(sfp->state & SFP_F_TX_DISABLE));
+ 	seq_printf(s, "rs0: %d\n", !!(sfp->state & SFP_F_RS0));
+ 	seq_printf(s, "rs1: %d\n", !!(sfp->state & SFP_F_RS1));
++	seq_printf(s, "Recovery link: %s\n", sfp_recovery_link(sfp, phy_link));
++	mutex_unlock(&sfp->st_mutex);
++	mutex_unlock(&sfp->sm_mutex);
+ 	return 0;
+ }
+ DEFINE_SHOW_ATTRIBUTE(sfp_debug_state);
