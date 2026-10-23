@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Owner-scoped read-clear accounting with a bounded MIB poller. */
 #include <linux/module.h>
-#include <linux/moduleparam.h>
 #include <linux/atomic.h>
 #include <linux/slab.h>
 #include <linux/rcupdate.h>
@@ -49,129 +48,6 @@ module_param(account_poll_budget, uint, 0444);
 MODULE_PARM_DESC(account_poll_interval_ms, "MIB polling interval, 0=off or 100..60000 ms");
 MODULE_PARM_DESC(account_poll_budget, "Maximum slots examined per poll across all PPEs, 1..64");
 #define HNAT_ACCOUNT_POLL_TIME_NS 2000000ULL
-
-/* Default-off timing counters to distinguish accounting lock/MIB stalls from
- * the separate Wi-Fi metadata and PPE handoff paths. These are aggregates only.
- */
-static bool hnat_account_lock_diag_enable;
-static int hnat_account_diag_enable_get(char *buf, const struct kernel_param *kp)
-{
-	return scnprintf(buf, PAGE_SIZE, "%c\n",
-			  READ_ONCE(*(bool *)kp->arg) ? 'Y' : 'N');
-}
-static int hnat_account_diag_enable_set(const char *val,
-					const struct kernel_param *kp)
-{
-	bool enable;
-	int err = kstrtobool(val, &enable);
-
-	if (err)
-		return err;
-	WRITE_ONCE(*(bool *)kp->arg, enable);
-	return 0;
-}
-static const struct kernel_param_ops hnat_account_diag_enable_ops = {
-	.set = hnat_account_diag_enable_set,
-	.get = hnat_account_diag_enable_get,
-};
-module_param_cb(hnat_account_lock_diag_enable, &hnat_account_diag_enable_ops,
-		&hnat_account_lock_diag_enable, 0600);
-MODULE_PARM_DESC(hnat_account_lock_diag_enable,
-		 "Enable aggregate HNAT accounting lock/MIB timing counters");
-static atomic64_t account_diag_lock_waits = ATOMIC64_INIT(0);
-static atomic64_t account_diag_lock_wait_ns = ATOMIC64_INIT(0);
-static atomic64_t account_diag_lock_wait_gt_10us = ATOMIC64_INIT(0);
-static atomic64_t account_diag_lock_wait_gt_100us = ATOMIC64_INIT(0);
-static atomic64_t account_diag_lock_holds = ATOMIC64_INIT(0);
-static atomic64_t account_diag_lock_hold_ns = ATOMIC64_INIT(0);
-static atomic64_t account_diag_lock_hold_gt_100us = ATOMIC64_INIT(0);
-static atomic64_t account_diag_lock_hold_gt_500us = ATOMIC64_INIT(0);
-static atomic64_t account_diag_mib_reads = ATOMIC64_INIT(0);
-static atomic64_t account_diag_mib_ns = ATOMIC64_INIT(0);
-static atomic64_t account_diag_mib_gt_100us = ATOMIC64_INIT(0);
-static atomic64_t account_diag_mib_gt_500us = ATOMIC64_INIT(0);
-static atomic64_t account_diag_mib_errors = ATOMIC64_INIT(0);
-
-struct account_diag_lock_sample {
-	bool enabled;
-	u64 start, acquired, released;
-};
-struct account_diag_mib_sample {
-	bool enabled, error;
-	u64 start, end;
-};
-
-static void account_diag_lock_start(struct account_diag_lock_sample *sample)
-{
-	sample->enabled = READ_ONCE(hnat_account_lock_diag_enable);
-	if (sample->enabled)
-		sample->start = ktime_get_ns();
-}
-static void account_diag_lock_acquired(struct account_diag_lock_sample *sample)
-{
-	if (sample->enabled)
-		sample->acquired = ktime_get_ns();
-}
-static void account_diag_lock_release(struct account_diag_lock_sample *sample)
-{
-	if (sample->enabled)
-		sample->released = ktime_get_ns();
-}
-/* Call only after spin_unlock_bh(): aggregate atomics never extend the lock. */
-static void account_diag_record_lock(const struct account_diag_lock_sample *sample)
-{
-	u64 wait, hold;
-
-	if (!sample->enabled)
-		return;
-	wait = sample->acquired - sample->start;
-	hold = sample->released - sample->acquired;
-	atomic64_inc(&account_diag_lock_waits);
-	atomic64_add(wait, &account_diag_lock_wait_ns);
-	if (wait > 10000)
-		atomic64_inc(&account_diag_lock_wait_gt_10us);
-	if (wait > 100000)
-		atomic64_inc(&account_diag_lock_wait_gt_100us);
-	atomic64_inc(&account_diag_lock_holds);
-	atomic64_add(hold, &account_diag_lock_hold_ns);
-	if (hold > 100000)
-		atomic64_inc(&account_diag_lock_hold_gt_100us);
-	if (hold > 500000)
-		atomic64_inc(&account_diag_lock_hold_gt_500us);
-}
-static void account_diag_mib_start(struct account_diag_mib_sample *sample)
-{
-	sample->enabled = READ_ONCE(hnat_account_lock_diag_enable);
-	if (sample->enabled)
-		sample->start = ktime_get_ns();
-}
-static void account_diag_mib_end(struct account_diag_mib_sample *sample,
-				  bool error)
-{
-	if (!sample->enabled)
-		return;
-	sample->end = ktime_get_ns();
-	sample->error = error;
-}
-/* Called after the caller drops the PPE spinlock. This measures the existing
- * SER transaction; it never issues an additional MIB read.
- */
-static void account_diag_record_mib(const struct account_diag_mib_sample *sample)
-{
-	u64 elapsed;
-
-	if (!sample->enabled)
-		return;
-	elapsed = sample->end - sample->start;
-	atomic64_inc(&account_diag_mib_reads);
-	atomic64_add(elapsed, &account_diag_mib_ns);
-	if (elapsed > 100000)
-		atomic64_inc(&account_diag_mib_gt_100us);
-	if (elapsed > 500000)
-		atomic64_inc(&account_diag_mib_gt_500us);
-	if (sample->error)
-		atomic64_inc(&account_diag_mib_errors);
-}
 
 static unsigned int account_net_id;
 struct hnat_account_net { bool exiting; };
@@ -311,8 +187,7 @@ static bool owner_live(struct mtk_hnat *h, u32 ppe, u32 slot)
 
 /* Caller holds per-PPE lock across the complete SER transaction and ledger. */
 static int drain_locked(struct mtk_hnat *h, u32 ppe, u32 slot,
-			struct hnat_accounting *delta,
-			struct account_diag_mib_sample *diag_mib)
+			struct hnat_accounting *delta)
 {
 	struct hnat_account_ppe *p = &h->account->ppe[ppe];
 	struct hnat_slot *s = &p->slots[slot];
@@ -337,11 +212,9 @@ static int drain_locked(struct mtk_hnat *h, u32 ppe, u32 slot,
 		p->mismatch++;
 		retire_locked(p, s);
 	}
-	account_diag_mib_start(diag_mib);
 	writel(slot | BIT(16), base + PPE_MIB_SER_CR);
 	err = readx_poll_timeout_atomic(readl, base + PPE_MIB_SER_CR,
 				       val, !(val & BIT_MIB_BUSY), 20, 1000);
-	account_diag_mib_end(diag_mib, err != 0);
 	if (err) {
 		p->read_error++;
 		p->unknown_loss++;
@@ -382,24 +255,17 @@ int hnat_account_drain(struct mtk_hnat *h, u32 ppe, u32 slot,
 {
 	struct hnat_accounting d;
 	struct hnat_account_ppe *p;
-	struct account_diag_lock_sample diag_lock = {};
-	struct account_diag_mib_sample diag_mib = {};
 	int err;
 	if (!account_valid(h, ppe, slot))
 		return -EINVAL;
 	p = &h->account->ppe[ppe];
-	account_diag_lock_start(&diag_lock);
 	spin_lock_bh(&p->lock);
-	account_diag_lock_acquired(&diag_lock);
-	err = drain_locked(h, ppe, slot, &d, &diag_mib);
+	err = drain_locked(h, ppe, slot, &d);
 	if (!err && total)
 		*total = h->acct[ppe][slot];
 	if (delta)
 		*delta = d;
-	account_diag_lock_release(&diag_lock);
 	spin_unlock_bh(&p->lock);
-	account_diag_record_lock(&diag_lock);
-	account_diag_record_mib(&diag_mib);
 	return err;
 }
 
@@ -407,20 +273,15 @@ bool hnat_account_entry_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 				 struct foe_entry *entry, u64 *generation)
 {
 	struct hnat_account_ppe *p;
-	struct account_diag_lock_sample diag_lock = {};
 	if (!account_valid(h, ppe, slot))
 		return false;
 	p = &h->account->ppe[ppe];
-	account_diag_lock_start(&diag_lock);
 	spin_lock_bh(&p->lock);
-	account_diag_lock_acquired(&diag_lock);
 	*entry = h->foe_table_cpu[ppe][slot];
 	*generation = p->slots[slot].generation;
 	if (p->paused)
 		entry->bfib1.state = BIND; /* caller skips publication */
-	account_diag_lock_release(&diag_lock);
 	spin_unlock_bh(&p->lock);
-	account_diag_record_lock(&diag_lock);
 	return true;
 }
 
@@ -430,18 +291,13 @@ bool hnat_account_clear_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 				 struct foe_entry *entry, u64 *generation)
 {
 	struct hnat_account_ppe *p;
-	struct account_diag_lock_sample diag_lock = {};
 	if (!entry || !generation || !account_valid(h, ppe, slot))
 		return false;
 	p = &h->account->ppe[ppe];
-	account_diag_lock_start(&diag_lock);
 	spin_lock_bh(&p->lock);
-	account_diag_lock_acquired(&diag_lock);
 	*entry = h->foe_table_cpu[ppe][slot];
 	*generation = p->slots[slot].generation;
-	account_diag_lock_release(&diag_lock);
 	spin_unlock_bh(&p->lock);
-	account_diag_record_lock(&diag_lock);
 	return true;
 }
 
@@ -459,8 +315,6 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 	enum ip_conntrack_info info;
 	struct nf_conn *ct = skb ? nf_ct_get(skb, &info) : NULL;
 	struct foe_entry *foe;
-	struct account_diag_lock_sample diag_lock = {};
-	struct account_diag_mib_sample diag_mib = {};
 	int err;
 
 	if (!account_valid(h, ppe, slot))
@@ -483,9 +337,7 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			o->seen = jiffies;
 		}
 	}
-	account_diag_lock_start(&diag_lock);
 	spin_lock_bh(&p->lock);
-	account_diag_lock_acquired(&diag_lock);
 	if (o && READ_ONCE(((struct hnat_account_net *)net_generic(o->net, account_net_id))->exiting)) {
 		call_rcu(&o->rcu, owner_free);
 		o = NULL;
@@ -493,18 +345,12 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 	if (p->paused) {
 		if (o)
 			call_rcu(&o->rcu, owner_free);
-		account_diag_lock_release(&diag_lock);
 		spin_unlock_bh(&p->lock);
-		account_diag_record_lock(&diag_lock);
-		account_diag_record_mib(&diag_mib);
 		return true; /* blocked publication during reset/stop */
 	}
 	if (confirm && s->generation != expected_generation) {
 		p->mismatch++;
-		account_diag_lock_release(&diag_lock);
 		spin_unlock_bh(&p->lock);
-		account_diag_record_lock(&diag_lock);
-		account_diag_record_mib(&diag_mib);
 		return true;
 	}
 	if (confirm) {
@@ -513,7 +359,7 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		    (ct && (ct != s->owner->ct || CTINFO2DIR(info) != s->owner->dir))) {
 			retire_locked(p, s);
 			p->untracked++;
-		} else if (drain_locked(h, ppe, slot, &d, &diag_mib) || !s->owner) {
+		} else if (drain_locked(h, ppe, slot, &d) || !s->owner) {
 			retire_locked(p, s);
 			p->untracked++;
 		} else {
@@ -525,7 +371,7 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		/* Clear old hardware residue BEFORE installing a new owner. If the
  * read cannot complete, this entire epoch stays untracked, never guessed.
  */
-		err = drain_locked(h, ppe, slot, &d, &diag_mib);
+		err = drain_locked(h, ppe, slot, &d);
 		memset(&h->acct[ppe][slot], 0, sizeof(h->acct[ppe][slot]));
 		s->generation++;
 		if (err && o) {
@@ -546,10 +392,7 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 	dma_wmb();
 	if (s->owner)
 		s->owner->identity = *foe;
-	account_diag_lock_release(&diag_lock);
 	spin_unlock_bh(&p->lock);
-	account_diag_record_lock(&diag_lock);
-	account_diag_record_mib(&diag_mib);
 	return true;
 }
 
@@ -566,8 +409,6 @@ bool hnat_account_publish_delta(struct mtk_hnat *h, u32 ppe, u32 slot,
 	enum ip_conntrack_info ctinfo;
 	unsigned int dir;
 	bool published = false;
-	struct account_diag_lock_sample diag_lock = {};
-	struct account_diag_mib_sample diag_mib = {};
 
 	if (!skb)
 		return false;
@@ -585,9 +426,7 @@ bool hnat_account_publish_delta(struct mtk_hnat *h, u32 ppe, u32 slot,
 		goto zero;
 	p = &h->account->ppe[ppe];
 	s = &p->slots[slot];
-	account_diag_lock_start(&diag_lock);
 	spin_lock_bh(&p->lock);
-	account_diag_lock_acquired(&diag_lock);
 	if (p->paused || !owner_live(h, ppe, slot))
 		goto out;
 	zone = nf_ct_zone(ct);
@@ -597,7 +436,7 @@ bool hnat_account_publish_delta(struct mtk_hnat *h, u32 ppe, u32 slot,
 		p->mismatch++;
 		goto out;
 	}
-	if (drain_locked(h, ppe, slot, &d, &diag_mib))
+	if (drain_locked(h, ppe, slot, &d))
 		goto out;
 	/* Hardware may have changed identity during SER; drain can retire it. */
 	if (!owner_live(h, ppe, slot) || s->owner->ct != ct ||
@@ -618,10 +457,7 @@ bool hnat_account_publish_delta(struct mtk_hnat *h, u32 ppe, u32 slot,
 	s->owner->seen = jiffies;
 	published = true;
 out:
-	account_diag_lock_release(&diag_lock);
 	spin_unlock_bh(&p->lock);
-	account_diag_record_lock(&diag_lock);
-	account_diag_record_mib(&diag_mib);
 zero:
 	nf_hnat_packet_accounting_finish_zero(skb);
 	return published;
@@ -633,44 +469,32 @@ zero:
 void hnat_account_invalidate(struct mtk_hnat *h, u32 ppe, u32 slot)
 {
 	struct hnat_account_ppe *p;
-	struct account_diag_lock_sample diag_lock = {};
 	if (!account_valid(h, ppe, slot))
 		return;
 	p = &h->account->ppe[ppe];
-	account_diag_lock_start(&diag_lock);
 	spin_lock_bh(&p->lock);
-	account_diag_lock_acquired(&diag_lock);
 	retire_locked(p, &p->slots[slot]);
 	p->slots[slot].generation++;
 	/* No retirement MIB read: hardware tail remains explicitly uncertain. */
 	p->unknown_loss++;
-	account_diag_lock_release(&diag_lock);
 	spin_unlock_bh(&p->lock);
-	account_diag_record_lock(&diag_lock);
 }
 
 static bool account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase,
 			  bool conditional, u64 generation, bool stopping)
 {
 	struct hnat_account_ppe *p;
-	struct account_diag_lock_sample diag_lock = {};
 	if (!account_valid(h, ppe, slot))
 		return false;
 	p = &h->account->ppe[ppe];
-	account_diag_lock_start(&diag_lock);
 	spin_lock_bh(&p->lock);
-	account_diag_lock_acquired(&diag_lock);
 	/* A stale request is handled: never fall back to an unguarded clear. */
 	if (conditional && p->slots[slot].generation != generation) {
-		account_diag_lock_release(&diag_lock);
 		spin_unlock_bh(&p->lock);
-		account_diag_record_lock(&diag_lock);
 		return true;
 	}
 	if (stopping && h->foe_table_cpu[ppe][slot].bfib1.state != BIND) {
-		account_diag_lock_release(&diag_lock);
 		spin_unlock_bh(&p->lock);
-		account_diag_record_lock(&diag_lock);
 		return true;
 	}
 	retire_locked(p, &p->slots[slot]);
@@ -692,9 +516,7 @@ static bool account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase,
 		}
 	}
 	dma_wmb();
-	account_diag_lock_release(&diag_lock);
 	spin_unlock_bh(&p->lock);
-	account_diag_record_lock(&diag_lock);
 	return true;
 }
 
@@ -847,7 +669,6 @@ static void account_poll(struct work_struct *work)
 		struct hnat_account_ppe *p;
 		struct hnat_slot *s;
 		struct hnat_accounting d;
-		struct account_diag_mib_sample diag_mib = {};
 		u32 ppe = ctx->poll_ppe % ppe_count;
 		u32 slot = ctx->poll_slot % slot_count;
 		int err = 0;
@@ -885,7 +706,7 @@ static void account_poll(struct work_struct *work)
 				p->unknown_loss++;
 				retire_locked(p, s);
 			} else {
-				err = drain_locked(h, ppe, slot, &d, &diag_mib);
+				err = drain_locked(h, ppe, slot, &d);
 				if (!err) {
 					p->poll_reads++;
 					if (owner_live(h, ppe, slot) &&
@@ -897,7 +718,6 @@ static void account_poll(struct work_struct *work)
 			}
 		}
 		spin_unlock_bh(&p->lock);
-		account_diag_record_mib(&diag_mib);
 		/* Abort on busy, quarantine or timeout instead of burning the budget. */
 		if (err)
 			break;
@@ -1032,22 +852,6 @@ int hnat_account_show(struct seq_file *m, void *unused)
 	struct mtk_hnat *h = m->private;
 	u32 ppe;
 	seq_printf(m, "experimental_enabled=%u\n", hnat_account_enabled(h));
-	seq_puts(m, "diag_scope=drain,entry_snapshot,clear_snapshot,commit,publish_delta,invalidate,clear; background/reset/debugfs locks excluded; atomic64 counters wrap at signed limit\n");
-	seq_printf(m, "diag_lock_enabled=%u lock_samples=%lld lock_wait_ns=%lld lock_wait_gt_10us=%lld lock_wait_gt_100us=%lld lock_holds=%lld lock_hold_ns=%lld lock_hold_gt_100us=%lld lock_hold_gt_500us=%lld mib_reads=%lld mib_ns=%lld mib_gt_100us=%lld mib_gt_500us=%lld mib_errors=%lld\n",
-		   READ_ONCE(hnat_account_lock_diag_enable),
-		   atomic64_read(&account_diag_lock_waits),
-		   atomic64_read(&account_diag_lock_wait_ns),
-		   atomic64_read(&account_diag_lock_wait_gt_10us),
-		   atomic64_read(&account_diag_lock_wait_gt_100us),
-		   atomic64_read(&account_diag_lock_holds),
-		   atomic64_read(&account_diag_lock_hold_ns),
-		   atomic64_read(&account_diag_lock_hold_gt_100us),
-		   atomic64_read(&account_diag_lock_hold_gt_500us),
-		   atomic64_read(&account_diag_mib_reads),
-		   atomic64_read(&account_diag_mib_ns),
-		   atomic64_read(&account_diag_mib_gt_100us),
-		   atomic64_read(&account_diag_mib_gt_500us),
-		   atomic64_read(&account_diag_mib_errors));
 	if (!hnat_account_enabled(h))
 		return 0;
 	seq_printf(m, "poll_interval_ms=%u poll_slot_budget=%u poll_service_budget_ns=%llu\n",
