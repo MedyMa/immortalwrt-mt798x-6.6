@@ -1,50 +1,30 @@
 #!/bin/sh /etc/rc.common
-# BPI-R4 SFP+ cage boot recovery and diagnostics.
+# Standard BPI-R4 SFP boot recovery, once per boot.
 #
-# Why this exists
-# ---------------
-# On a warm reboot the two SFP+ cages can come up late (observed: link_up at
-# t+56s) or not at all, while netifd has already finished configuring the
-# bridges they belong to.  The old attempt at this was a hotplug handler
-# (patches/filogic/99-bpi-r4-sfp-retrain) that never ran, for two reasons:
+# No carrier alone is normal with no light, no cable or a powered-off peer.
+# Only a stable, explicit failure reported by the existing kernel SFP state
+# machine permits automatic recovery. Unknown/missing state is left alone.
+# This existing debugfs file copies cached software state; do not mount
+# debugfs, read EEPROM or infer effective LOS from the raw GPIO bit.
 #
-#   1. it only accepted interfaces reporting "Port: FIBRE" or named sfp-*, but
-#      the copper modules this board uses report "Port: Twisted Pair" and the
-#      interfaces are eth1/eth2, so its guard always rejected them;
-#   2. it hooked the hotplug "ifup" event for a netdev name, while eth1/eth2 are
-#      members of br-lan/br-wan - there is no evidence such an event fires for
-#      a bridge member at all.
-#
-# So this runs once per boot instead, after the network is up, and for each cage:
-#
-#   1. waits for the netdev to appear (the module may still be probing),
-#   2. if the module never appears, re-probes the SFP device so the kernel runs
-#      its warm-boot recovery again (sfp_warm_boot_recover: EEPROM wait,
-#      TX_DISABLE pulse, I2C bus recovery),
-#   3. if the netdev exists but has no carrier, retrains it a few times,
-#   4. then forces link down/up, then re-probes the SFP device once more,
-#   5. logs every step, so `logread | grep sfp-recover` shows what happened even
-#      when nobody could log in to ask.
-#
-# Scope: this helps a late or stuck link.  A module whose management interface
-# is wedged needs its 3.3V cycled, which this board cannot do (its SFP nodes
-# have no power-gpios), so that case still needs the power unplugged.  The log
-# says which case it was, which is the point: it turns "it did not boot" into
-# either "carrier was late" or "module unrecovered".
+# Preserve bounded retraining and one re-probe for confirmed failures.
+# Do not cycle netdev admin state: a later forced UP could override a user
+# shutting down the port. Rebinding SFP does not force the netdev admin-UP.
+# State checks are not atomic with kernel/hotplug changes, so recheck before
+# every recovery action and stop when the failure evidence changes.
 #
 # Manual re-run: rm -f /var/run/sfp_recover_done; /etc/init.d/sfp-recover start
 
 START=98
 
-# cage netdev : SFP platform device.  From the DTS: &gmac1 { sfp = <&sfp2>; }
-# and &gmac2 { sfp = <&sfp1>; }, i.e. eth1 carries the SFP2 cage and eth2 the
-# SFP1 cage.  Overridable so the logic can be exercised in tests.
+# Standard R4: gmac1/eth1 -> sfp2; gmac2/eth2 -> sfp1.
 : "${SFP_CAGES:=eth1:sfp2 eth2:sfp1}"
 : "${SFP_IFACE_WAIT:=60}"
 : "${SFP_RETRIES:=5}"
 : "${SFP_RETRY_DELAY:=3}"
 : "${SFP_NET_SYSFS:=/sys/class/net}"
 : "${SFP_DRV_DIR:=/sys/bus/platform/drivers/sfp}"
+: "${SFP_DEBUGFS_ROOT:=/sys/kernel/debug}"
 : "${SFP_STAMP_DIR:=/var/run}"
 
 sfp_log() {
@@ -56,25 +36,109 @@ sfp_iface_exists() {
 }
 
 sfp_have_carrier() {
-	ethtool "$1" 2>/dev/null | grep -q 'Link detected: yes'
+	local carrier
+	read -r carrier < "$SFP_NET_SYSFS/$1/carrier" 2>/dev/null &&
+		[ "$carrier" = 1 ]
 }
 
-sfp_port_type() {
-	ethtool "$1" 2>/dev/null | sed -n 's/^[[:space:]]*Port: //p' | head -n 1
-}
+# Set SFP_FAILURE only for the two terminal failures defined in sfp.c.
+# The state file is a short seq_file of cached fields, not an I2C operation.
+sfp_failure_evidence() { # $1 = iface, $2 = SFP platform device
+	local flags digits carrier snapshot parsed module device main present
+	SFP_FAILURE=
+	SFP_SKIP_REASON="state unavailable"
 
-# Re-probe the SFP device so the kernel re-runs its warm-boot recovery.
-sfp_reprobe() {
-	[ -e "$SFP_DRV_DIR/$1" ] || {
-		sfp_log "$1: no entry under $SFP_DRV_DIR, cannot re-probe"
+	case "$1:$2" in
+		*[!a-zA-Z0-9_.:-]*) SFP_SKIP_REASON="invalid cage name"; return 1 ;;
+	esac
+	read -r flags < "$SFP_NET_SYSFS/$1/flags" 2>/dev/null || return 1
+	case "$flags" in
+		0) SFP_SKIP_REASON="administratively down"; return 1 ;;
+		0x*) digits="${flags#0x}" ;;
+		*) return 1 ;;
+	esac
+	case "$digits" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+	[ "${#digits}" -le 8 ] || return 1
+	[ "$((flags & 1))" -eq 1 ] || {
+		SFP_SKIP_REASON="administratively down"
 		return 1
 	}
-	sfp_log "$1: re-probing so the kernel re-runs its warm-boot recovery"
-	echo "$1" > "$SFP_DRV_DIR/unbind" 2>/dev/null || return 1
-	sleep 1
-	echo "$1" > "$SFP_DRV_DIR/bind" 2>/dev/null || return 1
+	read -r carrier < "$SFP_NET_SYSFS/$1/carrier" 2>/dev/null || return 1
+	case "$carrier" in
+		1) SFP_SKIP_REASON="carrier present"; return 1 ;;
+		0) ;;
+		*) return 1 ;;
+	esac
+	[ -e "$SFP_DRV_DIR/$2" ] || return 1
+
+	# sfp_debug_state_show() currently emits 14 lines. Bound the snapshot,
+	# reject duplicate/missing fields, and accept only known state tuples.
+	snapshot="$(head -n 20 "$SFP_DEBUGFS_ROOT/$2/state" 2>/dev/null)" || return 1
+	parsed="$(printf '%s\n' "$snapshot" | awk -F ': ' '
+		$1 == "Module state" || $1 == "Device state" ||
+		$1 == "Main state" || $1 == "moddef0" { if (NF != 2) bad = 1 }
+		$1 == "Module state" { m = $2; mc++ }
+		$1 == "Device state" { d = $2; dc++ }
+		$1 == "Main state" { s = $2; sc++ }
+		$1 == "moddef0" { p = $2; pc++ }
+		END {
+			if (bad || mc != 1 || dc != 1 || sc != 1 || pc != 1) exit 1
+			printf "%s|%s|%s|%s\n", m, d, s, p
+		}')" || return 1
+	IFS='|' read -r module device main present <<EOF
+$parsed
+EOF
+	[ "$present" = 1 ] || {
+		SFP_SKIP_REASON="module absent or presence unknown"
+		return 1
+	}
+	[ "$device" = up ] || {
+		SFP_SKIP_REASON="SFP device not up"
+		return 1
+	}
+	case "$module:$main" in
+		error:down) SFP_FAILURE="module-error" ;;
+		present:fail) SFP_FAILURE="module-fail" ;;
+		*)
+			SFP_SKIP_REASON="no terminal SFP failure ($module/$main)"
+			return 1
+			;;
+	esac
 	return 0
 }
+
+sfp_same_failure() { # $1 = iface, $2 = device, $3 = expected failure
+	sfp_failure_evidence "$1" "$2" && [ "$SFP_FAILURE" = "$3" ]
+}
+
+sfp_reprobe() ( # $1 = iface, $2 = device, $3 = expected failure
+	local iface="$1" dev="$2" pending=0
+	sfp_same_failure "$iface" "$dev" "$3" || exit 1
+	# Scope the cleanup traps to this child shell, preserving rc.common's
+	# caller traps. A caught signal must not leave the driver detached.
+	restore_sfp_binding() {
+		[ "$pending" = 1 ] && [ ! -e "$SFP_DRV_DIR/$dev" ] || return 0
+		printf '%s\n' "$dev" > "$SFP_DRV_DIR/bind" 2>/dev/null ||
+			sfp_log "$iface: failed to restore SFP binding for $dev"
+	}
+	trap 'restore_sfp_binding' EXIT
+	trap 'exit 1' HUP INT TERM
+	sfp_log "$iface: re-probing $dev after stable $3"
+	pending=1
+	printf '%s\n' "$dev" > "$SFP_DRV_DIR/unbind" 2>/dev/null || {
+		pending=0
+		exit 1
+	}
+	sleep 1
+	# Restore binding even if an administrator took the netdev down in the
+	# meantime. Binding alone must not force the netdev admin-UP.
+	printf '%s\n' "$dev" > "$SFP_DRV_DIR/bind" 2>/dev/null || {
+		sfp_log "$iface: failed to restore SFP binding for $dev"
+		exit 1
+	}
+	pending=0
+	exit 0
+)
 
 sfp_wait_iface() { # $1 = iface, $2 = seconds
 	local i=0
@@ -87,58 +151,54 @@ sfp_wait_iface() { # $1 = iface, $2 = seconds
 }
 
 sfp_recover_cage() { # $1 = iface, $2 = platform device
-	local iface="$1" dev="$2" i
+	local iface="$1" dev="$2" i failure
 
 	if ! sfp_iface_exists "$iface"; then
 		sfp_log "$iface: waiting up to ${SFP_IFACE_WAIT}s for the netdev"
 		sfp_wait_iface "$iface" "$SFP_IFACE_WAIT" || {
-			sfp_log "$iface: netdev still missing (SFP probe did not complete)"
-			sfp_reprobe "$dev"
-			if sfp_wait_iface "$iface" 20; then
-				sfp_log "$iface: netdev appeared after re-probing $dev"
-			else
-				sfp_log "$iface: STILL MISSING after re-probe - module needs a power cycle"
-				return 1
-			fi
+			sfp_log "$iface: netdev missing; no admin/module evidence, skipping"
+			return 0
 		}
 	fi
 
-	if sfp_have_carrier "$iface"; then
-		sfp_log "$iface: carrier present at boot (Port: $(sfp_port_type "$iface"))"
+	if ! sfp_failure_evidence "$iface" "$dev"; then
+		sfp_log "$iface: skipping recovery: $SFP_SKIP_REASON"
 		return 0
 	fi
-
-	sfp_log "$iface: no carrier at boot (Port: $(sfp_port_type "$iface")), retraining up to ${SFP_RETRIES} times"
-	i=0
-	while [ "$i" -lt "$SFP_RETRIES" ]; do
-		i=$((i + 1))
-		ethtool -r "$iface" >/dev/null 2>&1
-		sleep "$SFP_RETRY_DELAY"
-		if sfp_have_carrier "$iface"; then
-			sfp_log "$iface: carrier up after retrain ${i}"
-			return 0
-		fi
-	done
-
-	sfp_log "$iface: retrain did not help, forcing link down/up"
-	ip link set "$iface" down 2>/dev/null
-	sleep 1
-	ip link set "$iface" up 2>/dev/null
+	failure="$SFP_FAILURE"
+	# A second observation avoids acting on a single transitional snapshot.
 	sleep "$SFP_RETRY_DELAY"
-	if sfp_have_carrier "$iface"; then
-		sfp_log "$iface: carrier up after link down/up"
+	if ! sfp_same_failure "$iface" "$dev" "$failure"; then
+		sfp_log "$iface: failure evidence changed; leaving normal state machine"
 		return 0
 	fi
 
-	sfp_reprobe "$dev"
+	# EEPROM/module errors need a new probe, not link autonegotiation.
+	if [ "$failure" = module-fail ]; then
+		i=0
+		while [ "$i" -lt "$SFP_RETRIES" ]; do
+			sfp_same_failure "$iface" "$dev" "$failure" || return 0
+			i=$((i + 1))
+			ethtool -r "$iface" >/dev/null 2>&1
+			sleep "$SFP_RETRY_DELAY"
+			if sfp_have_carrier "$iface"; then
+				sfp_log "$iface: carrier up after retrain ${i}"
+				return 0
+			fi
+		done
+	fi
+
+	if ! sfp_reprobe "$iface" "$dev" "$failure"; then
+		sfp_log "$iface: re-probe skipped or failed; no forced link cycling"
+		return 1
+	fi
 	sleep "$SFP_RETRY_DELAY"
 	if sfp_have_carrier "$iface"; then
 		sfp_log "$iface: carrier up after re-probing $dev"
 		return 0
 	fi
-
-	sfp_log "$iface: UNRECOVERED - module likely wedged, needs its power cycled"
-	return 1
+	sfp_log "$iface: re-probed $dev; no carrier does not establish module failure"
+	return 0
 }
 
 sfp_recover_all() {
@@ -150,7 +210,6 @@ sfp_recover_all() {
 }
 
 start() {
-	# Once per boot: the retrain path is slow and touches live links.
 	[ -e "$SFP_STAMP_DIR/sfp_recover_done" ] && return 0
 	: > "$SFP_STAMP_DIR/sfp_recover_done"
 	( sfp_recover_all ) &
