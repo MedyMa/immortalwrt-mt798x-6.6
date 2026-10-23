@@ -9,17 +9,16 @@ driver can reach it from a recover_bus callback, and expose the reset
 pulse as bus recovery on every mux child adapter. i2c_recover_bus() from
 the SFP driver then pulses RESET instead of being a no-op on MTK I2C.
 
+Use logical GPIO values to assert and then release RESET, and synchronize
+the channel cache after resetting the mux.
+
 Signed-off-by: medyma <aneylovemzy@gmail.com>
 ---
- drivers/i2c/i2c-mux.c                | 1 ++
- drivers/i2c/muxes/i2c-mux-pca954x.c | 30 +++++++++++++++++++++++++++++++
- 2 files changed, 31 insertions(+), 6 deletions(-)
 
 diff --git a/drivers/i2c/i2c-mux.c b/drivers/i2c/i2c-mux.c
-index 57ff09f..09d57e2 100644
 --- a/drivers/i2c/i2c-mux.c
 +++ b/drivers/i2c/i2c-mux.c
-@@ -332,6 +332,7 @@ int i2c_mux_add_adapter(struct i2c_mux_core *muxc,
+@@ -332,6 +332,7 @@
  	priv->adap.algo = &priv->algo;
  	priv->adap.algo_data = priv;
  	priv->adap.dev.parent = &parent->dev;
@@ -28,10 +27,9 @@ index 57ff09f..09d57e2 100644
  	priv->adap.timeout = parent->timeout;
  	priv->adap.quirks = parent->quirks;
 diff --git a/drivers/i2c/muxes/i2c-mux-pca954x.c b/drivers/i2c/muxes/i2c-mux-pca954x.c
-index 2219062..5abc567 100644
 --- a/drivers/i2c/muxes/i2c-mux-pca954x.c
 +++ b/drivers/i2c/muxes/i2c-mux-pca954x.c
-@@ -102,6 +102,7 @@ struct pca954x {
+@@ -102,6 +102,7 @@
  	unsigned int irq_mask;
  	raw_spinlock_t lock;
  	struct regulator *supply;
@@ -39,7 +37,7 @@ index 2219062..5abc567 100644
  };
  
  /* Provide specs for the MAX735x, PCA954x and PCA984x types we know about */
-@@ -338,6 +339,29 @@ static int pca954x_deselect_mux(struct i2c_mux_core *muxc, u32 chan)
+@@ -338,6 +339,30 @@
  	return 0;
  }
  
@@ -51,25 +49,26 @@ index 2219062..5abc567 100644
 +	if (!data || !data->reset)
 +		return -EOPNOTSUPP;
 +
-+	/* Assert RESET (active low): deselect all channels and release a
-+	 * downstream bus stuck in a low state, per the PCA9545 reset
-+	 * semantics. */
-+	gpiod_set_value_cansleep(data->reset, 0);
-+	usleep_range(1000, 2000);
++	/* GPIO descriptor values account for polarity: 1 asserts RESET. */
 +	gpiod_set_value_cansleep(data->reset, 1);
 +	usleep_range(1000, 2000);
++	gpiod_set_value_cansleep(data->reset, 0);
++	usleep_range(1000, 2000);
++
++	/* RESET disconnects all channels, including the cached selection. */
++	data->last_chan = 0;
 +
 +	return 0;
 +}
 +
-+static const struct i2c_bus_recovery_info pca954x_bus_recovery = {
++static struct i2c_bus_recovery_info pca954x_bus_recovery = {
 +	.recover_bus = pca954x_recover_bus,
 +};
 +
  static ssize_t idle_state_show(struct device *dev,
  				    struct device_attribute *attr,
  				    char *buf)
-@@ -485,7 +509,6 @@ static int pca954x_probe(struct i2c_client *client)
+@@ -485,7 +510,6 @@
  	const struct i2c_device_id *id = i2c_client_get_device_id(client);
  	struct i2c_adapter *adap = client->adapter;
  	struct device *dev = &client->dev;
@@ -77,7 +76,7 @@ index 2219062..5abc567 100644
  	struct i2c_mux_core *muxc;
  	struct pca954x *data;
  	int num;
-@@ -514,14 +537,14 @@ static int pca954x_probe(struct i2c_client *client)
+@@ -514,14 +538,14 @@
  				     "Failed to enable vdd supply\n");
  
  	/* Reset the mux if a reset GPIO is specified. */
@@ -97,7 +96,7 @@ index 2219062..5abc567 100644
  		/* Give the chip some time to recover. */
  		udelay(1);
  	}
-@@ -576,6 +599,7 @@ static int pca954x_probe(struct i2c_client *client)
+@@ -576,6 +600,7 @@
  		ret = i2c_mux_add_adapter(muxc, 0, num, 0);
  		if (ret)
  			goto fail_cleanup;
