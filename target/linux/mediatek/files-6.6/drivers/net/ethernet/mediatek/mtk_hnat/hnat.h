@@ -16,6 +16,7 @@
 #include <linux/string.h>
 #include <linux/if.h>
 #include <linux/if_ether.h>
+#include <linux/list.h>
 #include <net/netevent.h>
 #include <linux/mod_devicetable.h>
 #include "hnat_mcast.h"
@@ -861,6 +862,16 @@ struct foe_entry {
 	};
 };
 
+struct hnat_flow_entry {
+	struct hlist_node list;
+	struct foe_entry data;
+	unsigned long last_update;
+	u16 ppe_index;
+	u16 hash;
+	u64 generation;
+	u64 sequence;
+};
+
 /* If user wants to change default FOE entry number, both DEF_ETRY_NUM and
  * DEF_ETRY_NUM_CFG need to be modified.
  */
@@ -944,6 +955,7 @@ struct mtk_hnat {
 	struct mib_entry *foe_mib_cpu[MAX_PPE_NUM];
 	dma_addr_t foe_mib_dev[MAX_PPE_NUM];
 	struct hnat_accounting *acct[MAX_PPE_NUM];
+	struct hlist_head *foe_flow[MAX_PPE_NUM];
 	const struct mtk_hnat_data *data;
 
 	/*devices we plays for*/
@@ -979,6 +991,7 @@ struct mtk_hnat {
 	spinlock_t		cah_lock;
 	struct xlat_conf xlat;
 	spinlock_t		entry_lock;
+	spinlock_t		flow_entry_lock;
 	bool ipv6_en;
 	bool guest_en;
 	bool dscp_en;
@@ -1276,7 +1289,7 @@ enum FoeIpAct {
 extern const struct of_device_id of_hnat_match[];
 extern struct mtk_hnat *hnat_priv;
 
-static inline int is_hnat_pre_filled(struct foe_entry *entry)
+static inline int is_hnat_pre_filled(const struct foe_entry *entry)
 {
 	u32 udf = 0;
 
@@ -1325,6 +1338,12 @@ int ext_if_add(struct extdev_entry *ext_entry);
 int ext_if_del(struct extdev_entry *ext_entry);
 void cr_set_field(void __iomem *reg, u32 field, u32 val);
 int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no);
+void hnat_flow_entry_clear(u32 ppe_id);
+bool hnat_flow_entry_match(const struct foe_entry *entry,
+			   const struct foe_entry *data);
+void hnat_flow_entry_delete(struct hnat_flow_entry *flow_entry);
+bool hnat_flow_entry_unbind_match(const struct foe_entry *entry,
+				  const struct foe_entry *live);
 int mtk_sw_nat_hook_rx(struct sk_buff *skb);
 void foe_clear_all_bind_entries(void);
 void mtk_ppe_dev_register_hook(struct net_device *dev);

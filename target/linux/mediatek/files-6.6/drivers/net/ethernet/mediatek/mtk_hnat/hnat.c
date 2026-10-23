@@ -22,6 +22,7 @@
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/rtnetlink.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <net/netlink.h>
@@ -560,7 +561,9 @@ static int hnat_start(u32 ppe_id)
 {
 	u32 foe_table_sz;
 	u32 foe_mib_tb_sz;
+	u32 foe_flow_sz;
 	int etry_num_cfg;
+	int i;
 
 	if (ppe_id >= CFG_PPE_NUM)
 		return -EINVAL;
@@ -573,17 +576,36 @@ static int hnat_start(u32 ppe_id)
 				hnat_priv->dev, foe_table_sz,
 				&hnat_priv->foe_table_dev[ppe_id], GFP_KERNEL);
 
-		if (hnat_priv->foe_table_cpu[ppe_id])
-			break;
+		if (!hnat_priv->foe_table_cpu[ppe_id])
+			continue;
+
+		if (hnat_priv->data->whnat && !hnat_priv->foe_flow[ppe_id]) {
+			foe_flow_sz = (hnat_priv->foe_etry_num / 4) *
+				sizeof(struct hlist_head);
+			hnat_priv->foe_flow[ppe_id] = devm_kzalloc(
+				hnat_priv->dev, foe_flow_sz, GFP_KERNEL);
+			if (!hnat_priv->foe_flow[ppe_id]) {
+				dma_free_coherent(hnat_priv->dev, foe_table_sz,
+						  hnat_priv->foe_table_cpu[ppe_id],
+						  hnat_priv->foe_table_dev[ppe_id]);
+				hnat_priv->foe_table_cpu[ppe_id] = NULL;
+				return -ENOMEM;
+			}
+		}
+		break;
 	}
 
-	if (!hnat_priv->foe_table_cpu[ppe_id])
+	if (!hnat_priv->foe_table_cpu[ppe_id] ||
+	    (hnat_priv->data->whnat && !hnat_priv->foe_flow[ppe_id]))
 		return -1;
 	dev_info(hnat_priv->dev, "PPE%d entry number = %d\n",
 		 ppe_id, hnat_priv->foe_etry_num);
 
 	writel(hnat_priv->foe_table_dev[ppe_id], hnat_priv->ppe_base[ppe_id] + PPE_TB_BASE);
 	memset(hnat_priv->foe_table_cpu[ppe_id], 0, foe_table_sz);
+	if (hnat_priv->data->whnat)
+		for (i = 0; i < hnat_priv->foe_etry_num / 4; i++)
+			INIT_HLIST_HEAD(&hnat_priv->foe_flow[ppe_id][i]);
 
 	if (hnat_priv->data->version == MTK_HNAT_V1_1)
 		exclude_boundary_entry(hnat_priv->foe_table_cpu[ppe_id]);
@@ -697,6 +719,7 @@ static void hnat_stop(u32 ppe_id)
 	cr_set_field(hnat_priv->ppe_base[ppe_id] + PPE_TB_CFG, FIN_AGE, 0);
 
 	/* free the FOE table */
+	hnat_flow_entry_clear(ppe_id);
 	foe_table_sz = hnat_priv->foe_etry_num * sizeof(struct foe_entry);
 	if (hnat_priv->foe_table_cpu[ppe_id])
 		dma_free_coherent(hnat_priv->dev, foe_table_sz,
@@ -883,6 +906,8 @@ static int __hnat_warm_init(void)
 		if (!hnat_account_reset_table(hnat_priv, ppe_id))
 			memset(hnat_priv->foe_table_cpu[ppe_id], 0, foe_table_sz);
 
+		hnat_flow_entry_clear(ppe_id);
+
 		if (hnat_priv->data->version == MTK_HNAT_V1_1)
 			exclude_boundary_entry(hnat_priv->foe_table_cpu[ppe_id]);
 
@@ -948,6 +973,7 @@ static int hnat_probe(struct platform_device *pdev)
 	/* Warm initialization must not reinitialize locks held by live hooks. */
 	spin_lock_init(&hnat_priv->cah_lock);
 	spin_lock_init(&hnat_priv->entry_lock);
+	spin_lock_init(&hnat_priv->flow_entry_lock);
 	atomic64_set(&hnat_priv->invalid_foe, 0);
 	atomic64_set(&hnat_priv->invalid_ppe, 0);
 	atomic64_set(&hnat_priv->software_fallback, 0);
@@ -1178,6 +1204,9 @@ static int hnat_remove(struct platform_device *pdev)
 		hnat_netevent_registered = false;
 	}
 	hnat_disable_hook();
+	synchronize_net();
+	for (i = 0; i < CFG_PPE_NUM; i++)
+		hnat_flow_entry_clear(i);
 	timer_shutdown_sync(&hnat_priv->hnat_sma_build_entry_timer);
 	if (hnat_priv->data->version == MTK_HNAT_V1_3)
 		timer_shutdown_sync(&hnat_priv->hnat_reset_timestamp_timer);

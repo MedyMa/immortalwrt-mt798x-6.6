@@ -181,8 +181,8 @@ static bool owner_live(struct mtk_hnat *h, u32 ppe, u32 slot)
 
 	return o && !nf_ct_is_dying(o->ct) &&
 		o->generation == h->account->ppe[ppe].slots[slot].generation &&
-		(o->prefill ? is_hnat_pre_filled(entry) : entry->bfib1.state == BIND) &&
-		account_identity(&o->identity, entry);
+		(o->prefill ? hnat_flow_entry_unbind_match(&o->identity, entry) :
+		 entry->bfib1.state == BIND && account_identity(&o->identity, entry));
 }
 
 /* Caller holds per-PPE lock across the complete SER transaction and ledger. */
@@ -285,6 +285,24 @@ bool hnat_account_entry_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 	return true;
 }
 
+bool hnat_account_generation_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
+				      u64 *generation)
+{
+	struct hnat_account_ppe *p;
+
+	if (!generation || !account_valid(h, ppe, slot))
+		return false;
+	p = &h->account->ppe[ppe];
+	spin_lock_bh(&p->lock);
+	if (p->paused) {
+		spin_unlock_bh(&p->lock);
+		return false;
+	}
+	*generation = p->slots[slot].generation;
+	spin_unlock_bh(&p->lock);
+	return true;
+}
+
 /* Conditional deletion observes the descriptor and token under the same PPE lock.
  * Unlike the publication snapshot, this preserves the actual state when paused. */
 bool hnat_account_clear_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
@@ -301,22 +319,29 @@ bool hnat_account_clear_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 	return true;
 }
 
-/* Own the publication itself: readers cannot see an owner paired with old FOE.
- * confirm may use the captured WHNAT owner when TX skb has lost its ct.
+/* Own the accounting epoch. A WHNAT prefill records its owner while leaving
+ * the hardware descriptor UNBIND; confirm drains and revalidates immediately
+ * before publishing. Return true means accounting handled the operation (so
+ * callers must not fall through to an unguarded memcpy). accepted distinguishes
+ * an accepted prefill/publish from a handled rejection.
  */
 bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			 struct sk_buff *skb, const struct foe_entry *entry,
-			 bool prefill, bool confirm, u64 expected_generation)
+			 bool prefill, bool confirm, u64 expected_generation,
+			 bool *accepted)
 {
 	struct hnat_account_ppe *p;
 	struct hnat_slot *s;
 	struct hnat_owner *o = NULL;
+	struct hnat_owner *confirm_owner;
 	struct hnat_accounting d;
 	enum ip_conntrack_info info;
 	struct nf_conn *ct = skb ? nf_ct_get(skb, &info) : NULL;
 	struct foe_entry *foe;
 	int err;
 
+	if (accepted)
+		*accepted = false;
 	if (!account_valid(h, ppe, slot))
 		return false;
 	p = &h->account->ppe[ppe];
@@ -346,25 +371,50 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		if (o)
 			call_rcu(&o->rcu, owner_free);
 		spin_unlock_bh(&p->lock);
-		return true; /* blocked publication during reset/stop */
+		return true; /* handled: block publication during reset/stop */
 	}
 	if (confirm && s->generation != expected_generation) {
 		p->mismatch++;
 		spin_unlock_bh(&p->lock);
-		return true;
+		return true; /* handled: stale software epoch must not publish */
 	}
 	if (confirm) {
-		if (s->generation != expected_generation ||
-		    !owner_live(h, ppe, slot) || !s->owner->prefill ||
-		    (ct && (ct != s->owner->ct || CTINFO2DIR(info) != s->owner->dir))) {
-			retire_locked(p, s);
+		confirm_owner = s->owner;
+		if ((confirm_owner &&
+		     (!owner_live(h, ppe, slot) || !confirm_owner->prefill ||
+		      (ct && (nf_ct_is_template(ct) || nf_ct_is_dying(ct) ||
+			      ct != confirm_owner->ct ||
+			      CTINFO2DIR(info) != confirm_owner->dir ||
+			      nf_ct_net(ct) != confirm_owner->net ||
+			      nf_ct_zone(ct)->id != confirm_owner->zone.id ||
+			      nf_ct_zone(ct)->dir != confirm_owner->zone.dir ||
+			      nf_ct_zone(ct)->flags != confirm_owner->zone.flags)))) ||
+		    !hnat_flow_entry_unbind_match(entry, foe)) {
+			p->mismatch++;
+			if (confirm_owner)
+				retire_locked(p, s);
 			p->untracked++;
-		} else if (drain_locked(h, ppe, slot, &d) || !s->owner) {
-			retire_locked(p, s);
+			spin_unlock_bh(&p->lock);
+			return true; /* handled: do not fall through to direct FOE write */
+		}
+		err = drain_locked(h, ppe, slot, &d);
+		if (err || s->generation != expected_generation ||
+		    s->owner != confirm_owner ||
+		    (confirm_owner &&
+		     (!owner_live(h, ppe, slot) || !confirm_owner->prefill)) ||
+		    !hnat_flow_entry_unbind_match(entry, foe)) {
+			p->mismatch++;
+			if (s->owner)
+				retire_locked(p, s);
 			p->untracked++;
+			spin_unlock_bh(&p->lock);
+			return true; /* drain may retire/change the owner; refuse publication */
+		}
+		if (confirm_owner) {
+			confirm_owner->prefill = false;
+			confirm_owner->seen = jiffies;
 		} else {
-			s->owner->prefill = false;
-			s->owner->seen = jiffies;
+			p->untracked++;
 		}
 	} else {
 		retire_locked(p, s);
@@ -378,20 +428,44 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			call_rcu(&o->rcu, owner_free);
 			o = NULL;
 		}
+		if ((prefill || entry->bfib1.state == BIND) &&
+		    !hnat_flow_entry_unbind_match(entry, foe)) {
+			if (o)
+				call_rcu(&o->rcu, owner_free);
+			p->mismatch++;
+			p->untracked++;
+			spin_unlock_bh(&p->lock);
+			return true; /* handled: live slot changed before commit */
+		}
 		s->owner = o;
 		if (o)
 			o->generation = s->generation;
 		else
 			p->untracked++;
 	}
-	memcpy((u8 *)foe + sizeof(foe->bfib1),
-	       (const u8 *)entry + sizeof(entry->bfib1),
-	       sizeof(*entry) - sizeof(entry->bfib1));
-	wmb();
-	memcpy(&foe->bfib1, &entry->bfib1, sizeof(entry->bfib1));
-	dma_wmb();
+	if (!prefill) {
+		/* Recheck immediately before the descriptor writes. PPE is not
+		 * serialized by entry_lock or the accounting lock.
+		 */
+		if (!hnat_flow_entry_unbind_match(entry, foe)) {
+			p->mismatch++;
+			if (s->owner)
+				retire_locked(p, s);
+			p->untracked++;
+			spin_unlock_bh(&p->lock);
+			return true;
+		}
+		memcpy((u8 *)foe + sizeof(foe->bfib1),
+		       (const u8 *)entry + sizeof(entry->bfib1),
+		       sizeof(*entry) - sizeof(entry->bfib1));
+		wmb();
+		memcpy(&foe->bfib1, &entry->bfib1, sizeof(entry->bfib1));
+		dma_wmb();
+	}
 	if (s->owner)
 		s->owner->identity = *foe;
+	if (accepted)
+		*accepted = true;
 	spin_unlock_bh(&p->lock);
 	return true;
 }

@@ -1620,6 +1620,293 @@ static struct ethhdr *get_ipv6_ipip_ethhdr(struct sk_buff *skb,
 	return eth;
 }
 
+static atomic64_t hnat_flow_entry_sequence = ATOMIC64_INIT(0);
+
+static bool hnat_flow_entry_format_compatible(const struct foe_entry *entry,
+					     const struct foe_entry *data)
+{
+	u8 entry_type = entry->udib1.pkt_type;
+	u8 data_type = data->udib1.pkt_type;
+
+	return entry->udib1.udp == data->udib1.udp &&
+	       (entry_type == data_type ||
+		((entry_type == IPV6_HNAPT || entry_type == IPV6_HNAT) &&
+		 data_type == IPV6_5T_ROUTE));
+}
+
+bool hnat_flow_entry_match(const struct foe_entry *entry,
+			   const struct foe_entry *data)
+{
+	size_t offset, len;
+
+	if (!hnat_flow_entry_format_compatible(entry, data))
+		return false;
+
+	switch (entry->udib1.pkt_type) {
+	case IPV4_HNAPT:
+	case IPV4_HNAT:
+	case IPV4_DSLITE:
+	case IPV4_MAP_T:
+	case IPV4_MAP_E:
+		offset = offsetof(struct hnat_ipv4_hnapt, sip);
+		len = offsetof(struct hnat_ipv4_hnapt, info_blk2) - offset;
+		break;
+	case IPV6_3T_ROUTE:
+		offset = offsetof(struct hnat_ipv6_3t_route, ipv6_sip0);
+		len = offsetof(struct hnat_ipv6_3t_route, resv1) - offset;
+		break;
+	case IPV6_5T_ROUTE:
+	case IPV6_6RD:
+	case IPV6_HNAPT:
+	case IPV6_HNAT:
+		offset = offsetof(struct hnat_ipv6_5t_route, ipv6_sip0);
+		len = offsetof(struct hnat_ipv6_5t_route, resv1) - offset;
+		break;
+	default:
+		return false;
+	}
+
+	return !memcmp((const u8 *)entry + offset,
+		       (const u8 *)data + offset, len);
+}
+
+void hnat_flow_entry_delete(struct hnat_flow_entry *flow_entry)
+{
+	hlist_del_init(&flow_entry->list);
+	kfree(flow_entry);
+}
+
+/* Caller holds flow_entry_lock. Buckets follow the official PPE/slot hash
+ * chain; the saved key, rather than a hardware PRE_FILLED bit, is identity.
+ */
+static struct hnat_flow_entry *hnat_flow_entry_search(
+		const struct foe_entry *data, u16 ppe_index, u16 hash)
+{
+	struct hnat_flow_entry *flow_entry;
+	struct hlist_head *head;
+
+	if (ppe_index >= MAX_PPE_NUM || ppe_index >= CFG_PPE_NUM ||
+	    hash >= hnat_priv->foe_etry_num || !hnat_priv->foe_flow[ppe_index])
+		return NULL;
+
+	head = &hnat_priv->foe_flow[ppe_index][hash / 4];
+	hlist_for_each_entry(flow_entry, head, list) {
+		if (flow_entry->ppe_index == ppe_index &&
+		    flow_entry->hash == hash &&
+		    hnat_flow_entry_match(&flow_entry->data, data))
+			return flow_entry;
+	}
+
+	return NULL;
+}
+
+/* Software locks cannot prevent a concurrent PPE rewrite. This gate checks
+ * the live state and key as close as software can get to a publication.
+ */
+bool hnat_flow_entry_unbind_match(const struct foe_entry *entry,
+				  const struct foe_entry *live)
+{
+	u32 info_blk1 = READ_ONCE(live->ipv4_hnapt.info_blk1);
+
+	return ((info_blk1 >> 28) & 0x3) == UNBIND &&
+	       hnat_flow_entry_match(entry, live);
+}
+
+static bool hnat_flow_entry_store(const struct foe_entry *entry, u32 ppe,
+				  u32 slot, u64 generation)
+{
+	struct hnat_flow_entry *flow, *new_flow, *found = NULL;
+	struct hlist_head *head;
+	struct hlist_node *next;
+	struct foe_entry *live;
+	u64 seq;
+
+	if (ppe >= MAX_PPE_NUM || ppe >= CFG_PPE_NUM ||
+	    slot >= hnat_priv->foe_etry_num || !hnat_priv->foe_flow[ppe])
+		return false;
+
+	new_flow = kzalloc(sizeof(*new_flow), GFP_ATOMIC);
+	if (!new_flow)
+		return false;
+	INIT_HLIST_NODE(&new_flow->list);
+	memcpy(&new_flow->data, entry, sizeof(*entry));
+	new_flow->ppe_index = ppe;
+	new_flow->hash = slot;
+	new_flow->generation = generation;
+	new_flow->last_update = jiffies;
+	seq = atomic64_inc_return(&hnat_flow_entry_sequence);
+	if (!seq)
+		seq = atomic64_inc_return(&hnat_flow_entry_sequence);
+	new_flow->sequence = seq;
+
+	live = &hnat_priv->foe_table_cpu[ppe][slot];
+	head = &hnat_priv->foe_flow[ppe][slot / 4];
+	spin_lock_bh(&hnat_priv->flow_entry_lock);
+	if (!hnat_flow_entry_unbind_match(entry, live)) {
+		spin_unlock_bh(&hnat_priv->flow_entry_lock);
+		kfree(new_flow);
+		return false;
+	}
+
+	/* A PPE slot has one current key. Retire any old identity for this
+	 * slot before adding the new one, while preserving the bucket chain.
+	 */
+	hlist_for_each_entry_safe(flow, next, head, list) {
+		if (flow->ppe_index != ppe || flow->hash != slot)
+			continue;
+		if (hnat_flow_entry_match(&flow->data, entry) && !found) {
+			found = flow;
+			continue;
+		}
+		hnat_flow_entry_delete(flow);
+	}
+	if (found) {
+		memcpy(&found->data, entry, sizeof(*entry));
+		found->generation = generation;
+		found->last_update = jiffies;
+		found->sequence = seq;
+		kfree(new_flow);
+	} else {
+		hlist_add_head(&new_flow->list, head);
+	}
+	spin_unlock_bh(&hnat_priv->flow_entry_lock);
+	return true;
+}
+
+/* Caller holds entry_lock; success returns with flow_entry_lock held. */
+static bool hnat_flow_entry_lock_current(const struct foe_entry *key,
+					 u32 ppe, u32 slot,
+					 u64 generation, u64 sequence,
+					 struct hnat_flow_entry **result)
+{
+	struct hnat_flow_entry *flow;
+
+	spin_lock_bh(&hnat_priv->flow_entry_lock);
+	flow = hnat_flow_entry_search(key, ppe, slot);
+	if (!flow ||
+	    time_after_eq(jiffies, flow->last_update + 3 * HZ) ||
+	    flow->generation != generation || flow->sequence != sequence) {
+		if (flow && time_after_eq(jiffies, flow->last_update + 3 * HZ))
+			hnat_flow_entry_delete(flow);
+		spin_unlock_bh(&hnat_priv->flow_entry_lock);
+		return false;
+	}
+	*result = flow;
+	return true;
+}
+
+void hnat_flow_entry_clear(u32 ppe_id)
+{
+	struct hnat_flow_entry *flow_entry;
+	struct hlist_head *head;
+	struct hlist_node *n;
+	u32 index;
+
+	if (!hnat_priv || ppe_id >= MAX_PPE_NUM ||
+	    ppe_id >= CFG_PPE_NUM || !hnat_priv->foe_flow[ppe_id])
+		return;
+
+	spin_lock_bh(&hnat_priv->flow_entry_lock);
+	for (index = 0; index < hnat_priv->foe_etry_num / 4; index++) {
+		head = &hnat_priv->foe_flow[ppe_id][index];
+		hlist_for_each_entry_safe(flow_entry, n, head, list)
+			hnat_flow_entry_delete(flow_entry);
+	}
+	spin_unlock_bh(&hnat_priv->flow_entry_lock);
+}
+
+/* Only inspect unambiguously ordinary IPv4 packets. skb_header_pointer()
+ * safely handles non-linear data. Reject the generic encapsulation marker,
+ * fragments, malformed headers and unsupported protocols. This path does
+ * not infer proprietary TOPS tunnel metadata that this skb API does not expose.
+ */
+static bool hnat_flow_ipv4_tuple_match(const struct sk_buff *skb,
+				       const struct foe_entry *entry)
+{
+	struct iphdr iph_buf, *iph;
+	struct tcpudphdr ports_buf, *ports;
+	int offset = skb_network_offset(skb);
+	unsigned int ihl;
+	u16 total_len;
+
+	if (entry->udib1.pkt_type != IPV4_HNAPT &&
+	    entry->udib1.pkt_type != IPV4_HNAT)
+		return true;
+	if (skb->protocol != htons(ETH_P_IP) || offset < 0 ||
+	    (unsigned int)offset > skb->len || skb->encapsulation)
+		return false;
+
+	iph = skb_header_pointer(skb, offset, sizeof(iph_buf), &iph_buf);
+	if (!iph || iph->version != 4 || iph->ihl < 5 || ip_is_fragment(iph))
+		return false;
+	ihl = iph->ihl * 4;
+	total_len = ntohs(iph->tot_len);
+	if (total_len < ihl + sizeof(ports_buf) ||
+	    total_len > skb->len - (unsigned int)offset)
+		return false;
+	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
+		return false;
+	if ((iph->protocol == IPPROTO_UDP) != !!entry->udib1.udp)
+		return false;
+
+	ports = skb_header_pointer(skb, offset + ihl, sizeof(ports_buf),
+				   &ports_buf);
+	if (!ports)
+		return false;
+
+	return ntohl(iph->saddr) == entry->ipv4_hnapt.new_sip &&
+	       ntohl(iph->daddr) == entry->ipv4_hnapt.new_dip &&
+	       ntohs(ports->src) == entry->ipv4_hnapt.new_sport &&
+	       ntohs(ports->dst) == entry->ipv4_hnapt.new_dport;
+}
+
+/*
+ * WHNAT prefill starts with a hardware key and fills the translated side from
+ * the current skb.  For ordinary IPv4 TCP/UDP, require those two views to be
+ * one conntrack direction: key == tuple[dir], and current/post-NAT tuple ==
+ * reverse(tuple[!dir]).  Without a usable CT, only identity tuples are
+ * provable.  Encapsulated and other FOE formats remain outside this check.
+ */
+static bool hnat_flow_ipv4_ct_match(const struct sk_buff *skb,
+				    const struct foe_entry *entry,
+				    const struct nf_conn *ct,
+				    enum ip_conntrack_info ctinfo)
+{
+	const struct nf_conntrack_tuple *key, *translated;
+	u8 proto;
+	unsigned int dir;
+
+	if (entry->udib1.pkt_type != IPV4_HNAPT &&
+	    entry->udib1.pkt_type != IPV4_HNAT)
+		return true;
+
+	if (!hnat_flow_ipv4_tuple_match(skb, entry))
+		return false;
+	if (!ct || nf_ct_is_template(ct) || nf_ct_is_dying(ct))
+		return entry->ipv4_hnapt.sip == entry->ipv4_hnapt.new_sip &&
+		       entry->ipv4_hnapt.dip == entry->ipv4_hnapt.new_dip &&
+		       entry->ipv4_hnapt.sport == entry->ipv4_hnapt.new_sport &&
+		       entry->ipv4_hnapt.dport == entry->ipv4_hnapt.new_dport;
+
+	proto = entry->udib1.udp ? IPPROTO_UDP : IPPROTO_TCP;
+	dir = CTINFO2DIR(ctinfo);
+	key = nf_ct_tuple(ct, dir);
+	translated = nf_ct_tuple(ct, !dir);
+	if (key->src.l3num != NFPROTO_IPV4 ||
+	    translated->src.l3num != NFPROTO_IPV4 ||
+	    key->dst.protonum != proto || translated->dst.protonum != proto)
+		return false;
+
+	return ntohl(key->src.u3.ip) == entry->ipv4_hnapt.sip &&
+	       ntohl(key->dst.u3.ip) == entry->ipv4_hnapt.dip &&
+	       ntohs(key->src.u.all) == entry->ipv4_hnapt.sport &&
+	       ntohs(key->dst.u.all) == entry->ipv4_hnapt.dport &&
+	       ntohl(translated->dst.u3.ip) == entry->ipv4_hnapt.new_sip &&
+	       ntohl(translated->src.u3.ip) == entry->ipv4_hnapt.new_dip &&
+	       ntohs(translated->dst.u.all) == entry->ipv4_hnapt.new_sport &&
+	       ntohs(translated->src.u.all) == entry->ipv4_hnapt.new_dport;
+}
+
 static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 				     const struct net_device *dev,
 				     struct foe_entry *foe,
@@ -1638,6 +1925,8 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	enum ip_conntrack_info ctinfo;
 	int gmac = NR_DISCARD;
 	int udp = 0;
+	bool account_handled, accepted = false;
+	u64 account_generation = 0;
 	u32 qid = 0;
 	int port_id = 0;
 	u32 payload_len = 0;
@@ -1657,7 +1946,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	if (!hnat_priv->data->mcast && is_multicast_ether_addr(eth->h_dest))
 		return 0;
 
-	if (whnat && is_hnat_pre_filled(foe))
+	if (whnat && is_hnat_info_filled(skb))
 		return 0;
 
 	entry.bfib1.pkt_type = foe->udib1.pkt_type; /* Get packte type state*/
@@ -1777,7 +2066,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 			}
 
 			entry.ipv4_hnapt.bfib1.udp = udp;
-			if (IS_IPV4_HNAPT(foe)) {
+			if (IS_IPV4_HNAPT(foe) || IS_IPV4_HNAT(foe)) {
 				pptr = skb_header_pointer(skb, iph->ihl * 4,
 							  sizeof(_ports),
 							  &_ports);
@@ -2281,35 +2570,56 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 		}
 	}
 
-	/* The INFO2.port_mg and 2nd VLAN ID fields of PPE entry are redefined
-	 * by Wi-Fi whnat engine. These data and INFO2.dp will be updated and
-	 * the entry is set to BIND state in mtk_sw_nat_hook_tx().
+	/* WHNAT keeps the complete prepared entry in software.  The hardware slot
+	 * remains UNBIND until TX confirms this skb's flow identity.
 	 */
-	if (!whnat) {
-		entry.bfib1.ttl = 1;
-		entry.bfib1.state = BIND;
-	} else {
-		if (IS_IPV4_GRP(foe))
-			entry.ipv4_hnapt.act_dp |= UDF_HNAT_PRE_FILLED;
-		else
-			entry.ipv6_5t_route.act_dp |= UDF_HNAT_PRE_FILLED;
+	if (whnat) {
+		if (!hnat_flow_entry_unbind_match(&entry, foe) ||
+		    !hnat_flow_ipv4_ct_match(skb, &entry, ct, ctinfo))
+			return 0;
+		account_handled = hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
+						      skb_hnat_entry(skb), skb,
+						      &entry, true, false, 0,
+						      &accepted);
+		if ((account_handled && !accepted) ||
+		    (!account_handled && hnat_priv->data->per_flow_accounting))
+			return 0;
+		if (account_handled &&
+		    !hnat_account_generation_snapshot(hnat_priv,
+						     skb_hnat_ppe(skb),
+						     skb_hnat_entry(skb),
+						     &account_generation)) {
+			hnat_account_invalidate(hnat_priv, skb_hnat_ppe(skb),
+						skb_hnat_entry(skb));
+			return 0;
+		}
+		if (!hnat_flow_entry_store(&entry, skb_hnat_ppe(skb),
+					   skb_hnat_entry(skb), account_generation)) {
+			if (account_handled)
+				hnat_account_invalidate(hnat_priv, skb_hnat_ppe(skb),
+							skb_hnat_entry(skb));
+			return 0;
+		}
+		skb_hnat_filled(skb) = HNAT_INFO_FILLED;
+		return 0;
 	}
 
-	if (!hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
-				 skb_hnat_entry(skb), skb, &entry, whnat, false, 0)) {
-		/* Reset before BIND publication; software object is not mib_entry. */
-		if (hnat_priv->data->per_flow_accounting &&
-		    skb_hnat_entry(skb) < hnat_priv->foe_etry_num &&
-		    skb_hnat_ppe(skb) < CFG_PPE_NUM &&
-		    hnat_priv->acct[skb_hnat_ppe(skb)])
-			memset(&hnat_priv->acct[skb_hnat_ppe(skb)][skb_hnat_entry(skb)],
-			       0, sizeof(struct hnat_accounting));
-		memcpy((u8 *)foe + sizeof(entry.bfib1),
-		       (u8 *)&entry + sizeof(entry.bfib1),
-		       sizeof(entry) - sizeof(entry.bfib1));
-		wmb();
-		memcpy(&foe->bfib1, &entry.bfib1, sizeof(entry.bfib1));
-		dma_wmb();
+	entry.bfib1.ttl = 1;
+	entry.bfib1.state = BIND;
+	account_handled = hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
+						      skb_hnat_entry(skb), skb,
+						      &entry, false, false, 0,
+						      &accepted);
+	if (!account_handled) {
+		if (!hnat_priv->data->per_flow_accounting &&
+		    hnat_flow_entry_unbind_match(&entry, foe)) {
+			hnat_copy_foe_info(foe, &entry);
+			wmb();
+			memcpy(&foe->bfib1, &entry.bfib1, sizeof(entry.bfib1));
+			dma_wmb();
+		}
+	} else if (!accepted) {
+		return 0;
 	}
 	return 0;
 }
@@ -2317,44 +2627,62 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 {
 	struct foe_entry *hw_entry, entry;
-	u64 account_generation = 0;
+	struct hnat_flow_entry *flow;
+	struct nf_conn *ct;
+	enum ip_conntrack_info ctinfo;
+	u64 account_generation = 0, shadow_sequence;
+	bool account_handled, accepted = false;
 	struct ethhdr *eth;
 
-	if (skb_hnat_alg(skb) ||
+	if (skb_hnat_alg(skb) || !is_hnat_info_filled(skb) ||
 	    !is_magic_tag_valid(skb) || !IS_SPACE_AVAILABLE_HEAD(skb))
 		return NF_ACCEPT;
 
 	trace_printk(
 		"[%s]entry=%x reason=%x gmac_no=%x wdmaid=%x rxid=%x wcid=%x bssid=%x\n",
 		__func__, skb_hnat_entry(skb), skb_hnat_reason(skb), gmac_no,
-		skb_hnat_wdma_id(skb), skb_hnat_bss_id(skb),
-		skb_hnat_wc_id(skb), skb_hnat_rx_id(skb));
+		skb_hnat_wdma_id(skb), skb_hnat_rx_id(skb), skb_hnat_wc_id(skb),
+		skb_hnat_bss_id(skb));
 
 	if ((gmac_no != NR_WDMA0_PORT) && (gmac_no != NR_WDMA1_PORT) &&
 	    (gmac_no != NR_WDMA2_PORT) && (gmac_no != NR_WHNAT_WDMA_PORT))
 		return NF_ACCEPT;
-
-	if (unlikely(!skb_mac_header_was_set(skb)))
-		return NF_ACCEPT;
-
-	if (!skb_hnat_is_hashed(skb))
-		return NF_ACCEPT;
-
-	if (skb_hnat_entry(skb) >= hnat_priv->foe_etry_num ||
-	    skb_hnat_ppe(skb) >= CFG_PPE_NUM)
+	if (unlikely(!skb_mac_header_was_set(skb)) ||
+	    !skb_hnat_is_hashed(skb) ||
+	    skb_hnat_entry(skb) >= hnat_priv->foe_etry_num ||
+	    skb_hnat_ppe(skb) >= CFG_PPE_NUM ||
+	    skb_hnat_reason(skb) != HIT_UNBIND_RATE_REACH)
 		return NF_ACCEPT;
 
 	hw_entry = &hnat_priv->foe_table_cpu[skb_hnat_ppe(skb)][skb_hnat_entry(skb)];
-	if (!hnat_account_entry_snapshot(hnat_priv, skb_hnat_ppe(skb),
-					 skb_hnat_entry(skb), &entry, &account_generation))
-		memcpy(&entry, hw_entry, sizeof(entry));
-	if (entry.bfib1.state == BIND)
+	if (hnat_priv->data->per_flow_accounting &&
+	    !hnat_account_generation_snapshot(hnat_priv, skb_hnat_ppe(skb),
+					      skb_hnat_entry(skb),
+					      &account_generation))
 		return NF_ACCEPT;
 
-	if (skb_hnat_reason(skb) != HIT_UNBIND_RATE_REACH)
+	/* Follow the official flow-key chain. Only the skb marked by the
+	 * matching software prefill may consume the saved full entry.
+	 */
+	spin_lock_bh(&hnat_priv->flow_entry_lock);
+	flow = hnat_flow_entry_search(hw_entry, skb_hnat_ppe(skb),
+				      skb_hnat_entry(skb));
+	if (!flow ||
+	    time_after_eq(jiffies, flow->last_update + 3 * HZ) ||
+	    flow->generation != account_generation ||
+	    !hnat_flow_entry_unbind_match(&flow->data, hw_entry)) {
+		if (flow && time_after_eq(jiffies, flow->last_update + 3 * HZ))
+			hnat_flow_entry_delete(flow);
+		spin_unlock_bh(&hnat_priv->flow_entry_lock);
 		return NF_ACCEPT;
+	}
+	memcpy(&entry, &flow->data, sizeof(entry));
+	shadow_sequence = flow->sequence;
+	spin_unlock_bh(&hnat_priv->flow_entry_lock);
 
-	if (!is_hnat_pre_filled(&entry))
+	ct = nf_ct_get(skb, &ctinfo);
+	if (ct ? !hnat_flow_ipv4_ct_match(skb, &entry, ct, ctinfo) :
+		 !hnat_flow_ipv4_tuple_match(skb, &entry))
 		return NF_ACCEPT;
 
 	eth = eth_hdr(skb);
@@ -2370,7 +2698,6 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 			entry.ipv6_5t_route.iblk2.mcast = 0;
 	}
 
-	spin_lock(&hnat_priv->entry_lock);
 	/* Some mt_wifi virtual interfaces, such as apcli,
 	 * will change the smac for specail purpose.
 	 */
@@ -2572,21 +2899,63 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 		entry.ipv6_5t_route.iblk2.dp = gmac_no;
 	}
 
+	entry.bfib1.time_stamp =
+		(hnat_priv->data->version == MTK_HNAT_V2 ||
+		 hnat_priv->data->version == MTK_HNAT_V3) ?
+		(readl(hnat_priv->fe_base + 0x0010) & 0xFF) :
+		(readl(hnat_priv->fe_base + 0x0010) & 0x7FFF);
 	entry.bfib1.ttl = 1;
 	entry.bfib1.state = BIND;
 	if (IS_IPV4_GRP(&entry))
 		entry.ipv4_hnapt.act_dp &= ~UDF_HNAT_PRE_FILLED;
 	else
 		entry.ipv6_5t_route.act_dp &= ~UDF_HNAT_PRE_FILLED;
-	if (!hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
-				 skb_hnat_entry(skb), skb, &entry, false, true, account_generation)) {
-		memcpy((u8 *)hw_entry + sizeof(entry.bfib1),
-		       (u8 *)&entry + sizeof(entry.bfib1),
-		       sizeof(entry) - sizeof(entry.bfib1));
+
+	spin_lock_bh(&hnat_priv->entry_lock);
+	if (!hnat_flow_entry_lock_current(&entry, skb_hnat_ppe(skb),
+					  skb_hnat_entry(skb),
+					  account_generation, shadow_sequence,
+					  &flow)) {
+		spin_unlock_bh(&hnat_priv->entry_lock);
+		return NF_ACCEPT;
+	}
+	if (!hnat_flow_entry_unbind_match(&flow->data, hw_entry) ||
+	    !hnat_flow_entry_unbind_match(&entry, hw_entry)) {
+		hnat_flow_entry_delete(flow);
+		spin_unlock_bh(&hnat_priv->flow_entry_lock);
+		spin_unlock_bh(&hnat_priv->entry_lock);
+		return NF_ACCEPT;
+	}
+
+	account_handled = hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
+					      skb_hnat_entry(skb), skb, &entry,
+					      false, true, account_generation,
+					      &accepted);
+	if (account_handled && !accepted) {
+		hnat_flow_entry_delete(flow);
+		spin_unlock_bh(&hnat_priv->flow_entry_lock);
+		spin_unlock_bh(&hnat_priv->entry_lock);
+		return NF_ACCEPT;
+	}
+	if (!account_handled) {
+		/* Missing accounting is a legal path only when accounting is
+		 * disabled. Never turn a failed accounting gate into fallback.
+		 */
+		if (hnat_priv->data->per_flow_accounting ||
+		    !hnat_flow_entry_unbind_match(&entry, hw_entry)) {
+			hnat_flow_entry_delete(flow);
+			spin_unlock_bh(&hnat_priv->flow_entry_lock);
+			spin_unlock_bh(&hnat_priv->entry_lock);
+			return NF_ACCEPT;
+		}
+		hnat_copy_foe_info(hw_entry, &entry);
 		wmb();
-		memcpy(&hw_entry->bfib1, &entry.bfib1, sizeof(entry.bfib1));
+		memcpy(&hw_entry->bfib1, &entry.bfib1,
+		       sizeof(entry.bfib1));
 		dma_wmb();
 	}
+	hnat_flow_entry_delete(flow);
+	spin_unlock_bh(&hnat_priv->flow_entry_lock);
 
 #if defined(CONFIG_MEDIATEK_NETSYS_V3)
 	if (debug_level >= 7) {
@@ -2641,7 +3010,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 		}
 	}
 #endif
-	spin_unlock(&hnat_priv->entry_lock);
+	spin_unlock_bh(&hnat_priv->entry_lock);
 	return NF_ACCEPT;
 }
 
@@ -3099,7 +3468,7 @@ int mtk_464xlat_post_process(struct sk_buff *skb, const struct net_device *out)
 	/* We must ensure all info has been updated before set to hw */
 	wmb();
 	if (!hnat_account_commit(hnat_priv, headroom_ppe(headroom[hash]),
-				 hash, NULL, &entry, false, false, 0))
+				 hash, NULL, &entry, false, false, 0, NULL))
 		memcpy(foe, &entry, sizeof(struct foe_entry));
 
 	return 0;

@@ -488,6 +488,7 @@
 	pca9545: i2c-switch@70 {
 		reg = <0x70>;
 		compatible = "nxp,pca9545";
+		i2c-mux-idle-disconnect;
 		#address-cells = <1>;
 		#size-cells = <0>;
 

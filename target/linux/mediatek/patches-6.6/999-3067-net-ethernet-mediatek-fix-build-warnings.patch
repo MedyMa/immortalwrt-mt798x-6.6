@@ -10,10 +10,12 @@ this target.  Limit the loop to the actual array size to avoid undefined
 behavior.
 
 The HNAT hook intentionally copies the foe_entry payload starting after
-bfib1 and writes bfib1 last to avoid exposing a BIND entry before the rest
-of the entry is ready.  Use an object-base plus offsetof helper for that
-copy so FORTIFY can see that the access is bounded by the whole struct
-foe_entry rather than by the ipv6_sip0 field.
+the first control word and writes that word last to avoid exposing a BIND
+entry before the rest of the entry is ready.  Use an object-base plus
+offsetof helper for that copy so FORTIFY can see that the access is bounded
+by the whole struct foe_entry.  The WHNAT functional overlay already uses
+the helper at its changed publication sites; this patch supplies the shared
+helper and include to the prepared kernel source.
 
 The RBUS Wi-Fi utility copies a constant pinctrl state name into a local
 buffer.  Use strscpy() with the destination buffer size so the compiler
@@ -60,28 +62,6 @@ index 3c265f9..6d45922 100644
  static unsigned int skb_to_hnat_info(struct sk_buff *skb,
  				     const struct net_device *dev,
  				     struct foe_entry *foe,
-@@ -2305,9 +2315,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
- 		    hnat_priv->acct[skb_hnat_ppe(skb)])
- 			memset(&hnat_priv->acct[skb_hnat_ppe(skb)][skb_hnat_entry(skb)],
- 			       0, sizeof(struct hnat_accounting));
--		memcpy((u8 *)foe + sizeof(entry.bfib1),
--		       (u8 *)&entry + sizeof(entry.bfib1),
--		       sizeof(entry) - sizeof(entry.bfib1));
-+		hnat_copy_foe_info(foe, &entry);
- 		wmb();
- 		memcpy(&foe->bfib1, &entry.bfib1, sizeof(entry.bfib1));
- 		dma_wmb();
-@@ -2581,9 +2589,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
- 		entry.ipv6_5t_route.act_dp &= ~UDF_HNAT_PRE_FILLED;
- 	if (!hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
- 				 skb_hnat_entry(skb), skb, &entry, false, true, account_generation)) {
--		memcpy((u8 *)hw_entry + sizeof(entry.bfib1),
--		       (u8 *)&entry + sizeof(entry.bfib1),
--		       sizeof(entry) - sizeof(entry.bfib1));
-+		hnat_copy_foe_info(hw_entry, &entry);
- 		wmb();
- 		memcpy(&hw_entry->bfib1, &entry.bfib1, sizeof(entry.bfib1));
- 		dma_wmb();
 diff --git a/drivers/net/wireless/wifi_utility/pci_mediatek_rbus.c b/drivers/net/wireless/wifi_utility/pci_mediatek_rbus.c
 index 840834d..515a3ab 100644
 --- a/drivers/net/wireless/wifi_utility/pci_mediatek_rbus.c

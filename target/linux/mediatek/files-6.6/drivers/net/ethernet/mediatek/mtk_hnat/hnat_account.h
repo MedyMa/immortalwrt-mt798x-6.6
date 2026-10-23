@@ -13,9 +13,15 @@ int hnat_account_drain(struct mtk_hnat *h, u32 ppe, u32 slot,
 		       struct hnat_accounting *total, struct hnat_accounting *delta);
 bool hnat_account_entry_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 				 struct foe_entry *entry, u64 *generation);
+bool hnat_account_generation_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
+				      u64 *generation);
+/* true return means accounting handled the request; accepted distinguishes a
+ * valid prefill/publication from a handled rejection that must not fall back.
+ */
 bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			 struct sk_buff *skb, const struct foe_entry *entry,
-			 bool prefill, bool confirm, u64 expected_generation);
+			 bool prefill, bool confirm, u64 expected_generation,
+			 bool *accepted);
 void hnat_account_invalidate(struct mtk_hnat *h, u32 ppe, u32 slot);
 bool hnat_account_stop_entry(struct mtk_hnat *h, u32 ppe, u32 slot);
 bool hnat_account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase);

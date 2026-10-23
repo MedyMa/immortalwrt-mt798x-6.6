@@ -3026,7 +3026,8 @@ static ssize_t hnat_static_entry_write(struct file *file,
 
 	/* We must ensure all info has been updated before set to hw */
 	wmb();
-	if (!hnat_account_commit(hnat_priv, ppe_id, hash, NULL, &entry, false, false, 0))
+	if (!hnat_account_commit(hnat_priv, ppe_id, hash, NULL, &entry, false,
+				 false, 0, NULL))
 		memcpy(foe, &entry, sizeof(entry));
 
 	debug_level = 7;
