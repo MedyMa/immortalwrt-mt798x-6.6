@@ -1,0 +1,23 @@
+Subject: [PATCH] net: phy: aquantia: distinguish MDIO errors from an OFF timeout
+
+phy_read_mmd_poll_timeout returns -ETIMEDOUT both when the positive OFF
+status persists until the polling deadline and when the MDIO read itself
+returns -ETIMEDOUT. Only the first case is an expected not-yet-ready
+interface. Check the final register result before allowing that timeout.
+
+Keep normal OFF handling, valid interface selection and rate adaptation.
+Do not issue rate-register reads after an unsuccessful status-register
+transaction, and preserve the original transport error for the caller.
+This is a local follow-up to upstream 7e5b547cac7a, not an upstream patch.
+---
+--- a/drivers/net/phy/aquantia/aquantia_main.c
++++ b/drivers/net/phy/aquantia/aquantia_main.c
+@@ -360,6 +360,8 @@
+ 					AQR107_OP_IN_PROG_SLEEP,
+ 					AQR107_OP_IN_PROG_TIMEOUT, false);
++	if (val < 0)
++		return val;
+ 	if (ret && ret != -ETIMEDOUT)
+ 		return ret;
+ 
+ 	switch (FIELD_GET(MDIO_PHYXS_VEND_IF_STATUS_TYPE_MASK, val)) {
