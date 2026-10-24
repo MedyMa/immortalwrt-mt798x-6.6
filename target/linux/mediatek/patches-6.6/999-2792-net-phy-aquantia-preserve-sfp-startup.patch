@@ -1,0 +1,98 @@
+Subject: [PATCH] net: phy: aquantia: wait for firmware and preserve SFP provisioning
+
+Wait for the firmware ID before deciding that an image is missing, using
+the bounded readiness polling introduced upstream by 194ef9d0de90 and its
+prerequisite reset-wait work. Keep the local loader ABI and distinguish an
+MDIO transport error (including -ETIMEDOUT) from a polling deadline with a
+zero ID by checking the final read result before entering the fallback.
+This avoids trying NVMEM/file firmware providers after a bus read failure.
+Retain the existing provider order after a genuine not-ready timeout.
+
+The PHY on an SFP module is provisioned by the module controller. Do not
+apply the vendor board-only POR reset or default external LED mapping to
+it after firmware readiness, matching the upstream AQR initialization
+scope. Preserve these vendor operations for non-SFP PHYs, and retain all
+explicit LED controls, MIB/accounting, host interfaces and advertisements.
+
+Reference: Linux 194ef9d0de9021df4a0ba8b112f91e56adaddd22.
+SFP flag lifetime: sfp_sm_probe_phy sets is_on_sfp_module before registering
+(and probing) the PHY. No SFP state-machine or LOS policy is changed.
+---
+--- a/drivers/net/phy/aquantia/aquantia_main.c
++++ b/drivers/net/phy/aquantia/aquantia_main.c
+@@ -188,6 +188,10 @@
+ {
+ 	int err;
+ 
++	/* The SFP controller owns the embedded PHY LED wiring. */
++	if (phydev->is_on_sfp_module)
++		return 0;
++
+ 	/* LED0 */
+ 	err = aqr_phy_led_hw_control_set(phydev, 0,
+ 					 BIT(TRIGGER_NETDEV_LINK_10000));
+@@ -853,7 +857,9 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	aqr107_phy_reset(phydev);
++	/* Preserve provisioning managed by the SFP module controller. */
++	if (!phydev->is_on_sfp_module)
++		aqr107_phy_reset(phydev);
+ 
+ 	ret = aqr_mib_probe(phydev);
+ 	if (ret)
+--- a/drivers/net/phy/aquantia/aquantia_firmware.c
++++ b/drivers/net/phy/aquantia/aquantia_firmware.c
+@@ -3,6 +3,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/of.h>
+ #include <linux/firmware.h>
++#include <linux/iopoll.h>
+ #include <linux/crc-ccitt.h>
+ #include <linux/nvmem-consumer.h>
+ 
+@@ -351,24 +352,25 @@
+ 
+ int aqr_firmware_load(struct phy_device *phydev)
+ {
+-	int ret;
+-
+-	/* Check if the firmware is not already loaded by pooling
+-	 * the current version returned by the PHY. If 0 is returned,
+-	 * no firmware is loaded.
+-	 */
+-	ret = phy_read_mmd(phydev, MDIO_MMD_VEND1, VEND1_GLOBAL_FW_ID);
+-	if (ret > 0)
+-		goto exit;
++	int ret, val;
++
++	/* A valid PHY ID can be visible before the running firmware ID.
++	 * Wait before treating zero as missing firmware. An MDIO read error,
++	 * including a transport timeout, must not authorize firmware loading.
++	 * A quiet polling deadline with a zero ID keeps the normal board
++	 * NVMEM/file fallback available.
++	 */
++	ret = read_poll_timeout(phy_read_mmd, val, val != 0,
++				20000, 2000000, false, phydev,
++				MDIO_MMD_VEND1, VEND1_GLOBAL_FW_ID);
++	if (val < 0)
++		return val;
++	if (!ret)
++		return 0;
+ 
+ 	ret = aqr_firmware_load_nvmem(phydev);
+ 	if (!ret)
+-		goto exit;
+-
+-	ret = aqr_firmware_load_fs(phydev);
+-	if (ret)
+-		return ret;
+-
+-exit:
+-	return 0;
+-}
++		return 0;
++
++	return aqr_firmware_load_fs(phydev);
++}
