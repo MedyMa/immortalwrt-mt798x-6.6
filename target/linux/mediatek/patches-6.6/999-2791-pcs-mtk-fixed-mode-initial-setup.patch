@@ -1,0 +1,63 @@
+Subject: [PATCH] net: pcs: mtk-usxgmii: complete fixed-mode PMA setup in config
+
+Like the upstream OpenWrt/ImmortalWrt USXGMII PCS implementation, program
+the XFI TPHY mode in pcs_config for every supported interface. The vendor
+6.6 implementation resets the TPHY but formerly completed mode setup only
+from a later fixed-mode status retry or link-up callback. SFP LOS gating
+can prevent those later callbacks while the host lane remains unconfigured.
+
+Keep fixed 5GBASE-R/10GBASE-R down retries and link-up reset sequences.
+Their existing external set-mode calls are absorbed into pcs_config, so
+those paths still perform exactly one complete setup in the same order.
+Keep the established-USXGMII link-up early return. Propagate initial TPHY
+setup errors for fixed modes as already done for USXGMII.
+
+Reference: ImmortalWrt e695009c15c623f4f6a83376b505faaf7a4ae5b5,
+739-05 PCS patch, pcs_config "Setup PMA/PMD". No DTS or line-speed changes.
+---
+--- a/drivers/net/pcs/pcs-mtk-usxgmii.c
++++ b/drivers/net/pcs/pcs-mtk-usxgmii.c
+@@ -212,12 +212,10 @@
+ 	if (an_ctrl & USXGMII_AN_ENABLE)
+ 		mtk_m32(mpcs, RG_PHY_TOP_SPEED_CTRL1, USXGMII_IF_FORCE_EN, 0);
+ 
+-	/* Complete USXGMII PMA/PMD setup before reporting in-band link. */
+-	if (interface == PHY_INTERFACE_MODE_USXGMII) {
+-		ret = phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET, interface);
+-		if (ret)
+-			return ret;
+-	}
++	/* Complete PMA/PMD setup before the first status/LOS decision. */
++	ret = phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET, interface);
++	if (ret)
++		return ret;
+ 
+ 	return mode_changed;
+ }
+@@ -309,9 +307,6 @@
+ 	if (!state->link) {
+ 		mtk_usxgmii_pcs_config(pcs, mpcs->neg_mode,
+ 				       state->interface, NULL, false);
+-		if (state->interface != PHY_INTERFACE_MODE_USXGMII)
+-			phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET,
+-					 state->interface);
+ 		return;
+ 	}
+ 
+@@ -332,8 +327,6 @@
+ 				    phy_interface_t interface,
+ 				    int speed, int duplex)
+ {
+-	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
+-
+ 	/* Preserve the USXGMII link already established through in-band AN. */
+ 	if (interface == PHY_INTERFACE_MODE_USXGMII)
+ 		return;
+@@ -342,7 +335,6 @@
+ 	 * after the line side link up.
+ 	 */
+ 	mtk_usxgmii_pcs_config(pcs, neg_mode, interface, NULL, false);
+-	phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET, interface);
+ }
+ 
+ static int mtk_usxgmii_pcs_enable(struct phylink_pcs *pcs)

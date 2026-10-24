@@ -1,0 +1,31 @@
+Subject: [PATCH] net: phy: restart AN through Clause 45-only MDIO bridges
+
+The PHY package bitmap describes the PHY, not the bridge. A device may
+advertise Clause 22 registers while its MDIO bridge provides only Clause
+45 callbacks, as with MDIO_I2C_ROLLBALL. Choosing Clause 22 in that case
+makes an otherwise supported AN restart return -EOPNOTSUPP.
+
+Keep the existing selection for Clause 22 PHYs, dual-protocol buses, and
+Clause 45 PHYs without an AN MMD or without both required bus callbacks.
+For a Clause 45-only transport with an AN MMD, use the normal Clause 45
+restart helper. No advertisement or PHY firmware settings are changed.
+---
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -182,7 +182,15 @@
+ {
+ 	int ret;
+ 
+-	if (phydev->is_c45 && !(phydev->c45_ids.devices_in_package & BIT(0)))
++	/* A Clause 45 PHY can also advertise Clause 22 registers, but an
++	 * MDIO bridge may only transport Clause 45 transactions. Use the
++	 * available AN MMD instead of issuing unsupported Clause 22 I/O.
++	 */
++	if (phydev->is_c45 &&
++	    (!(phydev->c45_ids.devices_in_package & BIT(0)) ||
++	     ((!phydev->mdio.bus->read || !phydev->mdio.bus->write) &&
++	      phydev->mdio.bus->read_c45 && phydev->mdio.bus->write_c45 &&
++	      (phydev->c45_ids.mmds_present & MDIO_DEVS_AN))))
+ 		ret = genphy_c45_restart_aneg(phydev);
+ 	else
+ 		ret = genphy_restart_aneg(phydev);
