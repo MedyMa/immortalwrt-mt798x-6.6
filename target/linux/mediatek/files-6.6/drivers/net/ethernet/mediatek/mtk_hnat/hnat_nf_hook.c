@@ -1907,6 +1907,78 @@ static bool hnat_flow_ipv4_ct_match(const struct sk_buff *skb,
 	       ntohs(translated->src.u.all) == entry->ipv4_hnapt.new_dport;
 }
 
+/* Classify only a header-only TCP packet whose complete headers are readable.
+ * Do not change skb header offsets: later consumers still own those offsets.
+ */
+static bool hnat_tcp_no_payload(const struct sk_buff *skb, u16 h_proto)
+{
+	struct iphdr iph_buf, *iph;
+	struct ipv6hdr ip6h_buf, *ip6h;
+	struct tcphdr tcp_buf, *tcp;
+	int offset = skb_network_offset(skb);
+	u32 len, l3_len, l4_len;
+
+	if (offset < 0 || (unsigned int)offset > skb->len || skb->encapsulation)
+		return false;
+	if (h_proto == ETH_P_IP) {
+		iph = skb_header_pointer(skb, offset, sizeof(iph_buf), &iph_buf);
+		if (!iph || iph->version != 4 || iph->ihl < 5 ||
+		    iph->protocol != IPPROTO_TCP || ip_is_fragment(iph))
+			return false;
+		l3_len = iph->ihl * 4;
+		len = ntohs(iph->tot_len);
+	} else if (h_proto == ETH_P_IPV6) {
+		ip6h = skb_header_pointer(skb, offset, sizeof(ip6h_buf), &ip6h_buf);
+		if (!ip6h || ip6h->version != 6 || ip6h->nexthdr != IPPROTO_TCP)
+			return false;
+		l3_len = sizeof(ip6h_buf);
+		len = l3_len + ntohs(ip6h->payload_len);
+	} else {
+		return false;
+	}
+	if (len > skb->len - (unsigned int)offset ||
+	    len < l3_len + sizeof(tcp_buf))
+		return false;
+	tcp = skb_header_pointer(skb, offset + l3_len, sizeof(tcp_buf), &tcp_buf);
+	if (!tcp || tcp->doff < 5)
+		return false;
+	l4_len = tcp->doff * 4;
+	return len == l3_len + l4_len;
+}
+
+static u32 hnat_select_qid(const struct sk_buff *skb,
+			   const struct net_device *dev, int port_id,
+			   u8 dscp, u16 h_proto)
+{
+	u32 mark = skb->mark & MTK_QDMA_TX_MASK;
+	u32 qid;
+
+	/* A selected queue (including a routing mark's low bits) is already a
+	 * complete QID, never a per-port offset. Adding a PSE destination to it
+	 * can exceed MTK_QDMA_TX_MASK, e.g. 0x50535731 + GMAC3 selects QID 64.
+	 */
+	if (IS_HQOS_MODE)
+		return dscp && hnat_priv->dscp_en ? (dscp >> 2) & MTK_QDMA_TX_MASK : mark;
+	/* PPPQ uses the Ethernet driver's queue map, not the wider manual
+	 * HNAT/HQoS namespace. Keep unrelated high routing-mark bits out of it.
+	 */
+	if (IS_PPPQ_MODE)
+		mark &= MTK_QDMA_NUM_QUEUES - 1;
+	if (mark >= MAX_PPPQ_PORT_NUM)
+		return mark;
+	if (!IS_PPPQ_MODE || !IS_PPPQ_PATH(dev, skb) ||
+	    port_id < 0 || port_id >= MAX_PPPQ_PORT_NUM)
+		return 0;
+
+	/* PPPQ data queues 0..5 and TCP ACK queues 6..11. A PSE destination
+	 * such as GMAC3 (15) is not a QDMA queue offset.
+	 */
+	qid = port_id;
+	if (hnat_tcp_no_payload(skb, h_proto))
+		qid += MAX_PPPQ_PORT_NUM;
+	return qid & MTK_QDMA_TX_MASK;
+}
+
 static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 				     const struct net_device *dev,
 				     struct foe_entry *foe,
@@ -1929,7 +2001,6 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	u64 account_generation = 0;
 	u32 qid = 0;
 	int port_id = 0;
-	u32 payload_len = 0;
 	int mape = 0;
 	u8  dscp = 0;
 
@@ -2450,39 +2521,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 				   skb_hnat_iface(skb), dev->name);
  		return 0;
  	}
-	if (IS_HQOS_MODE || (skb->mark & MTK_QDMA_TX_MASK) >= MAX_PPPQ_PORT_NUM)
-		qid = skb->mark & (MTK_QDMA_TX_MASK);
-	else if (IS_PPPQ_MODE && IS_PPPQ_PATH(dev, skb))
-		qid = port_id & MTK_QDMA_TX_MASK;
-	else
-		qid = 0;
-	if ((IS_HQOS_MODE) && (dscp!=0) &&(hnat_priv->dscp_en))
-		qid = (dscp>>2)& (MTK_QDMA_TX_MASK);
-
-	if (IS_PPPQ_MODE) {
-		qid+= gmac;
-		if (gmac == 0) qid+= 12;
-		if (ntohs(eth->h_proto) == ETH_P_IP) {
-			iph = ip_hdr(skb);
-			if (iph->protocol == IPPROTO_TCP) {
-				skb_set_transport_header(skb, sizeof(struct iphdr));
-				payload_len = be16_to_cpu(iph->tot_len) -
-					      skb_transport_offset(skb) - tcp_hdrlen(skb);
-				/* Dispatch ACK packets to high priority queue */
-				if (payload_len == 0)
-					qid += 6;
-			}
-		} else if (ntohs(eth->h_proto) == ETH_P_IPV6) {
-			ip6h = ipv6_hdr(skb);
-			if (ip6h->nexthdr == NEXTHDR_TCP) {
-				skb_set_transport_header(skb, sizeof(struct ipv6hdr));
-				payload_len = be16_to_cpu(ip6h->payload_len) - tcp_hdrlen(skb);
-				/* Dispatch ACK packets to high priority queue */
-				if (payload_len == 0)
-					qid += 6;
-			}
-		}
-	}
+	qid = hnat_select_qid(skb, dev, port_id, dscp, ntohs(eth->h_proto));
 
 	if (IS_IPV4_GRP(foe)) {
 		entry.ipv4_hnapt.iblk2.dp = gmac;
@@ -2573,6 +2612,16 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	/* WHNAT keeps the complete prepared entry in software.  The hardware slot
 	 * remains UNBIND until TX confirms this skb's flow identity.
 	 */
+	/* WED RX -> GMAC binds here, without the WHNAT TX shadow confirmation.
+	 * For ordinary IPv4, also prove that the PPE key and post-NAT skb belong
+	 * to the same CT direction.  Encapsulation needs its own identity parser;
+	 * this check does not infer an inner tuple or change those existing paths.
+	 */
+	if (FROM_WED(skb) && skb->protocol == htons(ETH_P_IP) &&
+	    !skb->encapsulation &&
+	    !hnat_flow_ipv4_ct_match(skb, &entry, ct, ctinfo))
+		return 0;
+
 	if (whnat) {
 		if (!hnat_flow_entry_unbind_match(&entry, foe) ||
 		    !hnat_flow_ipv4_ct_match(skb, &entry, ct, ctinfo))
@@ -3022,6 +3071,8 @@ int mtk_sw_nat_hook_rx(struct sk_buff *skb)
 	}
 
 	skb_hnat_alg(skb) = 0;
+	/* This is a new RX packet, never a software-prefilled TX confirmation. */
+	skb_hnat_filled(skb) = 0;
 	skb_hnat_magic_tag(skb) = HNAT_MAGIC_TAG;
 
 	if (skb_hnat_iface(skb) == FOE_MAGIC_WED0)
