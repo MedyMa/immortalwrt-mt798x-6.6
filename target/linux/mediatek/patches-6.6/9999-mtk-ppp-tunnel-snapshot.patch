@@ -1,0 +1,213 @@
+Subject: [PATCH] ppp: copy L2TPv2 tunnel identity under channel locks
+
+--- a/include/linux/ppp_channel.h
++++ b/include/linux/ppp_channel.h
+@@ -24,6 +24,15 @@
+ struct net_device_path_ctx;
+ struct ppp_channel;
+ 
++/* Scalar snapshot only. No channel, session or socket pointer escapes. */
++struct ppp_tunnel_info {
++	u16 version;
++	u16 tunnel_id, peer_tunnel_id;
++	u16 session_id, peer_session_id;
++};
++struct net_device;
++int ppp_netdev_get_tunnel_info(struct net_device *dev, struct ppp_tunnel_info *info);
++
+ struct ppp_channel_ops {
+ 	/* Send a packet (or multilink fragment) on this channel.
+ 	   Returns 1 if it was accepted, 0 if not. */
+@@ -32,6 +41,10 @@
+ 	int	(*ioctl)(struct ppp_channel *, unsigned int, unsigned long);
+ #if IS_ENABLED(CONFIG_NF_FLOW_TABLE)
+ 	int	(*flow_offload_check)(struct ppp_channel *, struct flow_offload_hw_path *);
++#endif
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	/* Called under the generic PPP unit/channel transmit locks. */
++	int (*get_tunnel_info)(struct ppp_channel *, struct ppp_tunnel_info *);
+ #endif
+ 	int	(*fill_forward_path)(struct net_device_path_ctx *,
+ 				     struct net_device_path *,
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -1608,25 +1608,60 @@
+ 		ppp_destroy_interface(ppp);
+ }
+ 
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++int ppp_netdev_get_tunnel_info(struct net_device *dev, struct ppp_tunnel_info *info)
++{
++	struct ppp *ppp;
++	struct channel *pch;
++	struct ppp_channel *chan;
++	int ret = -EOPNOTSUPP;
++
++	if (!dev || !info || dev->netdev_ops != &ppp_netdev_ops)
++		return -EINVAL;
++	memset(info, 0, sizeof(*info));
++	ppp = netdev_priv(dev);
++	/* ppp_disconnect_channel removes the channel under this unit lock.
++	 * ppp_unregister_channel clears pch->chan under downl before releasing
++	 * the protocol's private data. The callback copies immutable scalar IDs.
++	 */
++	ppp_xmit_lock(ppp);
++	if ((ppp->flags & SC_MULTILINK) || ppp->n_channels != 1 ||
++	    list_empty(&ppp->channels))
++		goto unlock;
++	pch = list_first_entry(&ppp->channels, struct channel, clist);
++	spin_lock(&pch->downl);
++	chan = pch->chan;
++	if (chan && chan->ops->get_tunnel_info)
++		ret = chan->ops->get_tunnel_info(chan, info);
++	spin_unlock(&pch->downl);
++unlock:
++	ppp_xmit_unlock(ppp);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ppp_netdev_get_tunnel_info);
++#endif
++
+ #if IS_ENABLED(CONFIG_NF_FLOW_TABLE)
+ static int ppp_flow_offload_check(struct flow_offload_hw_path *path)
+ {
+ 	struct ppp *ppp = netdev_priv(path->dev);
+ 	struct ppp_channel *chan;
+ 	struct channel *pch;
+-
+-	if (ppp->flags & SC_MULTILINK)
+-		return -EOPNOTSUPP;
+-
+-	if (list_empty(&ppp->channels))
+-		return -ENODEV;
+-
++	int ret = -EOPNOTSUPP;
++
++	ppp_xmit_lock(ppp);
++	if ((ppp->flags & SC_MULTILINK) || ppp->n_channels != 1 ||
++	    list_empty(&ppp->channels))
++		goto unlock;
+ 	pch = list_first_entry(&ppp->channels, struct channel, clist);
++	spin_lock(&pch->downl);
+ 	chan = pch->chan;
+-	if (!chan->ops->flow_offload_check)
+-		return -EOPNOTSUPP;
+-
+-	return chan->ops->flow_offload_check(chan, path);
++	if (chan && chan->ops->flow_offload_check)
++		ret = chan->ops->flow_offload_check(chan, path);
++	spin_unlock(&pch->downl);
++unlock:
++	ppp_xmit_unlock(ppp);
++	return ret;
+ }
+ #endif /* CONFIG_NF_FLOW_TABLE */
+ 
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -129,8 +129,40 @@
+ static int l2tp_ppp_flow_offload_check(struct ppp_channel *chan,
+ 				       struct flow_offload_hw_path *path);
+ 
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++static int pppol2tp_get_tunnel_info(struct ppp_channel *chan,
++				  struct ppp_tunnel_info *info)
++{
++	struct sock *sk = chan->private;
++	struct l2tp_session *session;
++	struct l2tp_tunnel *tunnel;
++
++	/* pppol2tp_release unregisters this channel before clearing sk_user_data
++	 * or releasing the socket/session. downl serializes that unregister.
++	 */
++	if (!sk || !(READ_ONCE(sk->sk_state) & PPPOX_CONNECTED))
++		return -ENOTCONN;
++	session = READ_ONCE(sk->sk_user_data);
++	if (!session || session->magic != L2TP_SESSION_MAGIC)
++		return -ENOTCONN;
++	tunnel = session->tunnel;
++	if (tunnel->version != 2 || tunnel->encap != L2TP_ENCAPTYPE_UDP ||
++	    session->send_seq || session->recv_seq)
++		return -EOPNOTSUPP;
++	info->version = 2;
++	info->tunnel_id = tunnel->tunnel_id;
++	info->peer_tunnel_id = tunnel->peer_tunnel_id;
++	info->session_id = session->session_id;
++	info->peer_session_id = session->peer_session_id;
++	return 0;
++}
++#endif
++
+ static const struct ppp_channel_ops pppol2tp_chan_ops = {
+ 	.start_xmit =  pppol2tp_xmit,
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	.get_tunnel_info = pppol2tp_get_tunnel_info,
++#endif
+ #if IS_ENABLED(CONFIG_NF_FLOW_TABLE)
+ 	.flow_offload_check = l2tp_ppp_flow_offload_check,
+ #endif /* IS_ENABLED(CONFIG_NF_FLOW_TABLE) */
+@@ -340,19 +372,24 @@
+ static int l2tp_ppp_flow_offload_check(struct ppp_channel *chan,
+ 				       struct flow_offload_hw_path *path)
+ {
+-	struct sock *sk = (struct sock *)chan->private;
++	struct sock *sk = chan->private;
+ 	struct l2tp_session *session;
++	int ret = -EOPNOTSUPP;
+ 
+ 	if (path->flags & BIT(DEV_PATH_TNL))
+ 		return -EEXIST;
+-
+ 	session = pppol2tp_sock_to_session(sk);
+ 	if (!session)
+-		return -EINVAL;
+-
+-	path->flags |= BIT(DEV_PATH_TNL);
+-
+-	return 0;
++		return -ENOTCONN;
++	if (session->tunnel->version == 2 &&
++	    session->tunnel->encap == L2TP_ENCAPTYPE_UDP) {
++		path->flags |= BIT(DEV_PATH_TNL);
++		path->tnl_type = FLOW_OFFLOAD_TNL_L2TP_V2;
++		ret = 0;
++	}
++	/* pppol2tp_sock_to_session acquired this reference. */
++	sock_put(sk);
++	return ret;
+ }
+ #endif /* IS_ENABLED(CONFIG_NF_FLOW_TABLE) */
+ 
+@@ -395,6 +432,17 @@
+ 		   2;			/* 2 bytes for PPP_ALLSTATIONS & PPP_UI */
+ 	if (skb_cow_head(skb, headroom))
+ 		goto abort_put_sess;
++
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	/* Keep an explicit inner-header marker for final TOPS/CT confirmation.
++	 * pskb_expand_head already preserves this tree's 16-byte FOE metadata.
++	 */
++	if (!skb->encapsulation && skb->protocol == htons(ETH_P_IP)) {
++		skb_reset_inner_headers(skb);
++		skb->encapsulation = 1;
++		skb_set_inner_protocol(skb, htons(ETH_P_IP));
++	}
++#endif
+ 
+ 	/* Setup PPP header */
+ 	__skb_push(skb, 2);
+--- a/drivers/net/ppp/Kconfig
++++ b/drivers/net/ppp/Kconfig
+@@ -210,3 +210,12 @@
+ endif # TTY
+ 
+ endif # PPP
++
++config MTK_PPP_TUNNEL_INFO
++	bool "PPP scalar tunnel metadata for MT7988 TOPS"
++	depends on PPP
++	default n
++	help
++	  Copy tunnel IDs under the existing PPP/channel locks without exporting
++	  borrowed socket pointers. Changes the PPP channel operations ABI; all
++	  PPP channel providers must be rebuilt with this configuration.

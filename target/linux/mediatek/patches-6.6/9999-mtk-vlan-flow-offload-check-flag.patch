@@ -1,0 +1,18 @@
+Subject: [PATCH] net: vlan: test the native hardware-path flag as a bit
+
+flow_offload_hw_path.flags uses BIT(DEV_PATH_*). Testing the enum value
+instead of its bit allowed a second VLAN ndo callback to overwrite the
+single VLAN ID/protocol in the native path. Refuse unrepresentable stacked
+tags instead of silently publishing the wrong egress tag.
+---
+--- a/net/8021q/vlan_dev.c
++++ b/net/8021q/vlan_dev.c
+@@ -790,7 +790,7 @@ static int vlan_dev_flow_offload_check(struct flow_offload_hw_path *path)
+ 	struct net_device *dev = path->dev;
+ 	struct vlan_dev_priv *vlan = vlan_dev_priv(dev);
+ 
+-	if (path->flags & DEV_PATH_VLAN)
++	if (path->flags & BIT(DEV_PATH_VLAN))
+ 		return -EEXIST;
+ 
+ 	path->flags |= BIT(DEV_PATH_VLAN);

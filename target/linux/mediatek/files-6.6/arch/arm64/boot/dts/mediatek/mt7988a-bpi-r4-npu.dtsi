@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/* MT7988 register, IRQ and clock data from the MediaTek NPU implementation. */
+#include <dt-bindings/power/mt7988-power.h>
+
+&topmisc {
+	#power-domain-cells = <1>;
+};
+
+/ {
+	soc {
+		pce: pce {
+			compatible = "mediatek,pce";
+			fe_mem = <&eth>;
+		};
+
+		mtk_npu: npu@9100000 {
+			compatible = "mediatek,npu";
+			reg = <0 0x09100000 0 0x01000000>;
+			reg-names = "npu-base";
+			clocks = <&topckgen CLK_TOP_BUS_TOPS_SEL>,
+				 <&topckgen CLK_TOP_TOPS_P2_26M_SEL>,
+				 <&topckgen CLK_TOP_NETSYS_TOPS_400M_SEL>,
+				 <&topckgen CLK_TOP_NPU_TOPS_SEL>,
+				 <&topckgen CLK_TOP_NPU_SEL>;
+			clock-names = "bus", "sram", "xdma", "offload", "mgmt";
+			power-domains = <&topmisc MT7988_POWER_DOMAIN_TOPS0>,
+					<&topmisc MT7988_POWER_DOMAIN_TOPS1>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SPI 196 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 280 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 281 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "tdma-tx-pause", "mbox", "wdt";
+			fe_mem = <&eth>;
+			hnat = <&hnat>;
+			pce = <&pce>;
+		};
+
+		npu_ocd: npu-ocd@e500000 {
+			compatible = "mediatek,npu-ocd";
+			reg = <0 0x0e500000 0 0x15000>;
+			reg-names = "npu-ocd-base";
+			clocks = <&infracfg CLK_INFRA_AUD_L>;
+			clock-names = "debugsys";
+		};
+	};
+};

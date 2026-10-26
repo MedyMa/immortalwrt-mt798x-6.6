@@ -1,0 +1,126 @@
+#!/bin/sh
+# Bounded, passive software status. No debugfs mount, device setting, MIB
+# drain, service installation, counter reset, conntrack scan or FOE dump.
+. /usr/share/libubox/jshn.sh
+
+bounded_read() {
+	local value rc
+	READ_COVERAGE=missing
+	READ_VALUE=
+	[ -r "$1" ] || return 1
+	command -v timeout >/dev/null 2>&1 || {
+		READ_COVERAGE=no_timeout_tool
+		return 1
+	}
+	value=$(timeout 2 head -c "$(( $2 + 1 ))" "$1" 2>/dev/null)
+	rc=$?
+	[ "$rc" -eq 0 ] || {
+		READ_COVERAGE="read_exit_$rc"
+		return 1
+	}
+	[ "${#value}" -le "$2" ] || {
+		READ_COVERAGE=truncated
+		return 1
+	}
+	READ_VALUE=$value
+	READ_COVERAGE=complete
+}
+
+npu_present=0
+npu_ready=0
+npu_alive=0
+npu_types=0
+npu_coverage=missing
+for node in /sys/bus/platform/drivers/mediatek,npu/*/npu/mcu/state; do
+	[ -r "$node" ] || continue
+	npu_present=1
+	if bounded_read "$node" 1024; then
+		if json_load "$READ_VALUE"; then
+			json_get_var npu_ready firmware_ready
+			json_get_var npu_alive mcu_alive
+			json_get_var npu_types registered_tunnel_types
+		else
+			READ_COVERAGE=invalid_json
+		fi
+	fi
+	npu_coverage=$READ_COVERAGE
+	break
+done
+case "$npu_ready" in 1) ;; *) npu_ready=0 ;; esac
+case "$npu_alive" in 1) ;; *) npu_alive=0 ;; esac
+case "$npu_types" in ''|*[!0-9]*) npu_types=0 ;; esac
+
+ct_acct=0
+if bounded_read /proc/sys/net/netfilter/nf_conntrack_acct 32; then
+	[ "$READ_VALUE" = 1 ] && ct_acct=1
+fi
+ct_coverage=$READ_COVERAGE
+
+# hnat_account_show snapshots only its in-memory ledger under a spinlock.
+# It does not read hardware MIB/FOE. Never substitute all_entry for this node.
+account_text=
+if bounded_read /sys/kernel/debug/hnat/accounting 4096; then
+	account_text=$READ_VALUE
+fi
+account_coverage=$READ_COVERAGE
+
+tunnel_text=
+if bounded_read /proc/npu/tunnels 8192; then
+	tunnel_text=$READ_VALUE
+fi
+tunnel_coverage=$READ_COVERAGE
+
+json_init
+json_add_int schema 2
+json_add_object npu
+json_add_boolean status_node_present "$npu_present"
+json_add_boolean firmware_ready "$npu_ready"
+json_add_boolean mcu_alive "$npu_alive"
+json_add_int registered_tunnel_types "$npu_types"
+json_add_string coverage "$npu_coverage"
+json_add_boolean packet_offload_verified 0
+json_close_object
+json_add_object tunnels
+json_add_string coverage "$tunnel_coverage"
+json_add_string snapshot per_entry_software
+json_add_string unit metadata
+json_add_int capacity 32
+json_add_array entries
+while read -r ti tg tif tt tp ts tsp td tdp te tde tsy extra; do
+	case "$ti" in ''|\#*) continue ;; esac
+	[ -z "$extra" ] || continue
+	case "$ti$tg$tif$tt$tp$tsp$tdp$te$tde$tsy" in *[!0-9]*|'') continue ;; esac
+	case "$ts$td" in *[!0-9.]*|'') continue ;; esac
+	case "$tt" in 1) tname=gretap ;; 3) tname=l2tpv2 ;; 5) tname=vxlan ;; *) continue ;; esac
+	[ "$ti" -lt 32 ] 2>/dev/null || continue
+	json_add_object
+	json_add_int index "$ti"
+	json_add_string generation "$tg"
+	json_add_int ifindex "$tif"
+	json_add_string protocol "$tname"
+	json_add_int ip_protocol "$tp"
+	json_add_string local_address "$ts"
+	json_add_int local_port "$tsp"
+	json_add_string remote_address "$td"
+	json_add_int remote_port "$tdp"
+	json_add_boolean encapsulation "$te"
+	json_add_boolean decapsulation "$tde"
+	json_add_boolean synchronized "$tsy"
+	json_close_object
+done <<EOF
+$tunnel_text
+EOF
+json_close_array
+json_close_object
+json_add_object accounting
+json_add_boolean conntrack_accounting_enabled "$ct_acct"
+json_add_string conntrack_setting_coverage "$ct_coverage"
+json_add_string hnat_ledger_coverage "$account_coverage"
+json_add_string hnat_ledger_snapshot "$account_text"
+json_add_string app_byte_source conntrack_delta
+json_add_string wan_byte_source interface_counters
+json_add_string tops_counter_unit setup_events
+json_add_boolean add_tops_events_to_byte_totals 0
+json_add_boolean lossless_hardware_tail_proven 0
+json_close_object
+json_dump

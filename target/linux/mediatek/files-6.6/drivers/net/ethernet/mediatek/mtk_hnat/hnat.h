@@ -864,7 +864,11 @@ struct foe_entry {
 
 struct hnat_flow_entry {
 	struct hlist_node list;
+	struct rcu_head rcu;
 	struct foe_entry data;
+	struct net_device *tunnel_dev;
+	struct nf_conn *tunnel_ct;
+	u8 tunnel_ctinfo;
 	unsigned long last_update;
 	u16 ppe_index;
 	u16 hash;
@@ -1132,6 +1136,41 @@ enum FoeIpAct {
 #define entry_hnat_is_bound(e) (e->bfib1.state == BIND)
 #define entry_hnat_state(e) (e->bfib1.state)
 
+/* NETSYS v3 TOPS flow codes are 32..63; zero requests all TOPS flows. */
+int hnat_tunnel_flush(u32 tops_entry);
+
+/* Callbacks execute in packet context before entry_lock acquisition.  A
+ * backend unregisters and drains callbacks before freeing protocol state.
+ */
+struct hnat_tunnel_token {
+	u64 epoch, generation;
+	u32 index;
+	unsigned long irq_flags;
+	void *private;
+	const struct hnat_tunnel_ops *ops;
+	/* Host-side lease only; never part of the firmware parameter ABI. */
+	struct net_device *underlay, *egress;
+	u32 egress_flags;
+	u16 vlan_proto, vlan_tci, pppoe_sid;
+};
+struct hnat_tunnel_ops {
+	bool (*decap_offloadable)(struct sk_buff *skb);
+	int (*decap_offload)(struct sk_buff *skb);
+	int (*encap_offload)(struct sk_buff *skb, struct ethhdr *eth, struct net_device *dev,
+			     struct hnat_tunnel_token *token);
+	bool (*bind_lock)(struct net_device *dev, struct hnat_tunnel_token *token);
+	void (*bind_unlock)(struct hnat_tunnel_token *token);
+};
+int hnat_tunnel_register(const struct hnat_tunnel_ops *ops);
+void hnat_tunnel_unregister(const struct hnat_tunnel_ops *ops);
+bool hnat_tunnel_available(void);
+bool hnat_tunnel_decap_offloadable(struct sk_buff *skb);
+int hnat_tunnel_decap_offload(struct sk_buff *skb);
+int hnat_tunnel_encap_offload(struct sk_buff *skb, struct ethhdr *eth, struct net_device *dev,
+			      struct hnat_tunnel_token *token);
+bool hnat_tunnel_bind_lock(struct net_device *dev, struct hnat_tunnel_token *token);
+void hnat_tunnel_bind_unlock(struct hnat_tunnel_token *token);
+
 #if defined(CONFIG_MEDIATEK_NETSYS_V2) || defined(CONFIG_MEDIATEK_NETSYS_V3)
 #define skb_hnat_is_hashed(skb)                                                 \
 	(skb_hnat_entry(skb) != 0x7fff && skb_hnat_entry(skb) < hnat_priv->foe_etry_num)
@@ -1342,6 +1381,8 @@ void hnat_flow_entry_clear(u32 ppe_id);
 bool hnat_flow_entry_match(const struct foe_entry *entry,
 			   const struct foe_entry *data);
 void hnat_flow_entry_delete(struct hnat_flow_entry *flow_entry);
+void hnat_flow_gc_start(void);
+void hnat_flow_gc_stop(void);
 bool hnat_flow_entry_unbind_match(const struct foe_entry *entry,
 				  const struct foe_entry *live);
 int mtk_sw_nat_hook_rx(struct sk_buff *skb);

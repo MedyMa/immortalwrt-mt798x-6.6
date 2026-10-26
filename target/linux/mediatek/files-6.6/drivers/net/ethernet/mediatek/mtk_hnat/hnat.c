@@ -86,6 +86,116 @@ static void hnat_external_callbacks_stop(void)
 	wait_event(hnat_callback_wait, !atomic_read(&hnat_callback_users));
 }
 
+static DEFINE_MUTEX(hnat_tunnel_lock);
+static const struct hnat_tunnel_ops __rcu *hnat_tunnel_ops;
+static u64 hnat_tunnel_epoch;
+
+int hnat_tunnel_register(const struct hnat_tunnel_ops *ops)
+{
+	int ret = 0;
+
+	if (!ops || !ops->decap_offloadable || !ops->decap_offload ||
+	    !ops->encap_offload || !ops->bind_lock || !ops->bind_unlock)
+		return -EINVAL;
+	mutex_lock(&hnat_tunnel_lock);
+	if (!hnat_external_callback_enter())
+		ret = -ENODEV;
+	else {
+		if (rcu_access_pointer(hnat_tunnel_ops))
+			ret = -EBUSY;
+		else {
+			WRITE_ONCE(hnat_tunnel_epoch, hnat_tunnel_epoch + 1);
+			rcu_assign_pointer(hnat_tunnel_ops, ops);
+		}
+		hnat_external_callback_exit();
+	}
+	mutex_unlock(&hnat_tunnel_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(hnat_tunnel_register);
+
+void hnat_tunnel_unregister(const struct hnat_tunnel_ops *ops)
+{
+	mutex_lock(&hnat_tunnel_lock);
+	if (rcu_access_pointer(hnat_tunnel_ops) == ops) {
+		RCU_INIT_POINTER(hnat_tunnel_ops, NULL);
+		synchronize_net();
+	}
+	mutex_unlock(&hnat_tunnel_lock);
+}
+EXPORT_SYMBOL_GPL(hnat_tunnel_unregister);
+
+bool hnat_tunnel_available(void)
+{
+	return !!rcu_access_pointer(hnat_tunnel_ops);
+}
+
+bool hnat_tunnel_decap_offloadable(struct sk_buff *skb)
+{
+	const struct hnat_tunnel_ops *ops;
+	bool result = false;
+
+	rcu_read_lock_bh();
+	ops = rcu_dereference_bh(hnat_tunnel_ops);
+	if (ops)
+		result = ops->decap_offloadable(skb);
+	rcu_read_unlock_bh();
+	return result;
+}
+
+int hnat_tunnel_decap_offload(struct sk_buff *skb)
+{
+	const struct hnat_tunnel_ops *ops;
+	int ret = -EOPNOTSUPP;
+
+	rcu_read_lock_bh();
+	ops = rcu_dereference_bh(hnat_tunnel_ops);
+	if (ops)
+		ret = ops->decap_offload(skb);
+	rcu_read_unlock_bh();
+	return ret;
+}
+
+int hnat_tunnel_encap_offload(struct sk_buff *skb, struct ethhdr *eth, struct net_device *dev,
+			      struct hnat_tunnel_token *token)
+{
+	const struct hnat_tunnel_ops *ops;
+	int ret = -EOPNOTSUPP;
+
+	rcu_read_lock_bh();
+	ops = rcu_dereference_bh(hnat_tunnel_ops);
+	if (ops) {
+		token->epoch = READ_ONCE(hnat_tunnel_epoch);
+		ret = ops->encap_offload(skb, eth, dev, token);
+	}
+	rcu_read_unlock_bh();
+	return ret;
+}
+
+/* Success keeps BH/RCU and the NPU tunnel lock held across the final HNAT
+ * publication. Lock order is NPU tunnel -> HNAT entry -> flow -> accounting.
+ */
+bool hnat_tunnel_bind_lock(struct net_device *dev, struct hnat_tunnel_token *token)
+{
+	const struct hnat_tunnel_ops *ops;
+
+	rcu_read_lock_bh();
+	ops = rcu_dereference_bh(hnat_tunnel_ops);
+	if (ops && token->epoch == READ_ONCE(hnat_tunnel_epoch) &&
+	    ops->bind_lock(dev, token)) {
+		token->ops = ops;
+		return true;
+	}
+	rcu_read_unlock_bh();
+	return false;
+}
+
+void hnat_tunnel_bind_unlock(struct hnat_tunnel_token *token)
+{
+	token->ops->bind_unlock(token);
+	rcu_read_unlock_bh();
+}
+
 int (*ra_sw_nat_hook_rx)(struct sk_buff *skb) = NULL;
 EXPORT_SYMBOL(ra_sw_nat_hook_rx);
 int (*ra_sw_nat_hook_tx)(struct sk_buff *skb, int gmac_no) = NULL;
@@ -1156,6 +1266,8 @@ static int hnat_probe(struct platform_device *pdev)
 		pr_info("hnat roaming work fail\n");
 
 	INIT_LIST_HEAD(&hnat_priv->xlat.map_list);
+	platform_set_drvdata(pdev, hnat_priv);
+	hnat_flow_gc_start();
 
 	return 0;
 
@@ -1192,6 +1304,9 @@ err_out1:
 static int hnat_remove(struct platform_device *pdev)
 {
 	int i;
+
+	hnat_flow_gc_stop();
+	platform_set_drvdata(pdev, NULL);
 
 	hnat_deinit_debugfs(hnat_priv);
 	hnat_roaming_disable();
@@ -1289,7 +1404,21 @@ static struct platform_driver hnat_driver = {
 	},
 };
 
-module_platform_driver(hnat_driver);
+static int __init mtk_hnat_init(void)
+{
+	return platform_driver_register(&hnat_driver);
+}
+
+static void __exit mtk_hnat_exit(void)
+{
+	platform_driver_unregister(&hnat_driver);
+	/* Flow RCU callbacks release CT/dev references after all packet hooks,
+	 * workers and tables have been removed. Keep callback text alive.
+	 */
+	rcu_barrier();
+}
+module_init(mtk_hnat_init);
+module_exit(mtk_hnat_exit);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Sean Wang <sean.wang@mediatek.com>");

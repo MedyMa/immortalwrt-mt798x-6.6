@@ -22,7 +22,13 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			 struct sk_buff *skb, const struct foe_entry *entry,
 			 bool prefill, bool confirm, u64 expected_generation,
 			 bool *accepted);
+bool hnat_account_tunnel_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
+			       struct nf_conn *ct, u8 ctinfo,
+			       const struct foe_entry *entry, u64 generation,
+			       bool *accepted);
 void hnat_account_invalidate(struct mtk_hnat *h, u32 ppe, u32 slot);
+/* Caller holds entry_lock; preserves the validated pending CT delta. */
+bool hnat_account_tunnel_invalidate(struct mtk_hnat *h, u32 ppe, u32 slot);
 bool hnat_account_stop_entry(struct mtk_hnat *h, u32 ppe, u32 slot);
 bool hnat_account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase);
 /* True includes a stale token already handled without descriptor mutation. */

@@ -1,0 +1,13 @@
+Subject: [PATCH] pmdomain: mediatek: build the MT7988 TOPS power controller
+
+Use the MT7988-specific power domain provider carried as a source overlay.
+The TOPS domains keep their hardware default-off policy until a consumer
+attaches; Ethernet domain ownership and existing clocks are unchanged.
+---
+--- a/drivers/pmdomain/mediatek/Makefile
++++ b/drivers/pmdomain/mediatek/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ obj-$(CONFIG_MTK_SCPSYS)		+= mtk-scpsys.o
+ obj-$(CONFIG_MTK_SCPSYS_PM_DOMAINS) 	+= mtk-pm-domains.o
++obj-$(CONFIG_MTK_SCPSYS_PM_DOMAINS)	+= mtk-pm-domains-mt7988.o

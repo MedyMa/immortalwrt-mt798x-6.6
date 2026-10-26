@@ -325,18 +325,19 @@ bool hnat_account_clear_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
  * callers must not fall through to an unguarded memcpy). accepted distinguishes
  * an accepted prefill/publish from a handled rejection.
  */
-bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
+static bool account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			 struct sk_buff *skb, const struct foe_entry *entry,
 			 bool prefill, bool confirm, u64 expected_generation,
-			 bool *accepted)
+			 bool *accepted, struct nf_conn *saved_ct,
+			 enum ip_conntrack_info saved_info)
 {
 	struct hnat_account_ppe *p;
 	struct hnat_slot *s;
 	struct hnat_owner *o = NULL;
 	struct hnat_owner *confirm_owner;
 	struct hnat_accounting d;
-	enum ip_conntrack_info info;
-	struct nf_conn *ct = skb ? nf_ct_get(skb, &info) : NULL;
+	enum ip_conntrack_info info = saved_info;
+	struct nf_conn *ct = skb ? nf_ct_get(skb, &info) : saved_ct;
 	struct foe_entry *foe;
 	int err;
 
@@ -378,6 +379,12 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		spin_unlock_bh(&p->lock);
 		return true; /* handled: stale software epoch must not publish */
 	}
+	if (confirm && ct && (nf_ct_is_template(ct) || nf_ct_is_dying(ct) ||
+	    READ_ONCE(((struct hnat_account_net *)net_generic(nf_ct_net(ct), account_net_id))->exiting))) {
+		p->mismatch++;
+		spin_unlock_bh(&p->lock);
+		return true;
+	}
 	if (confirm) {
 		confirm_owner = s->owner;
 		if ((confirm_owner &&
@@ -398,7 +405,8 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			return true; /* handled: do not fall through to direct FOE write */
 		}
 		err = drain_locked(h, ppe, slot, &d);
-		if (err || s->generation != expected_generation ||
+		if (err || (ct && nf_ct_is_dying(ct)) ||
+		    s->generation != expected_generation ||
 		    s->owner != confirm_owner ||
 		    (confirm_owner &&
 		     (!owner_live(h, ppe, slot) || !confirm_owner->prefill)) ||
@@ -447,7 +455,8 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		/* Recheck immediately before the descriptor writes. PPE is not
 		 * serialized by entry_lock or the accounting lock.
 		 */
-		if (!hnat_flow_entry_unbind_match(entry, foe)) {
+		if ((confirm && ct && nf_ct_is_dying(ct)) ||
+		    !hnat_flow_entry_unbind_match(entry, foe)) {
 			p->mismatch++;
 			if (s->owner)
 				retire_locked(p, s);
@@ -468,6 +477,26 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		*accepted = true;
 	spin_unlock_bh(&p->lock);
 	return true;
+}
+
+bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
+			 struct sk_buff *skb, const struct foe_entry *entry,
+			 bool prefill, bool confirm, u64 generation, bool *accepted)
+{
+	return account_commit(h, ppe, slot, skb, entry, prefill, confirm,
+			      generation, accepted, NULL, 0);
+}
+
+bool hnat_account_tunnel_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
+			       struct nf_conn *ct, u8 ctinfo,
+			       const struct foe_entry *entry, u64 generation,
+			       bool *accepted)
+{
+	/* The flow shadow pins the verified INNER CT. Never replace the outer
+	 * skb's conntrack association or account its bytes a second time.
+	 */
+	return account_commit(h, ppe, slot, NULL, entry, false, true,
+			      generation, accepted, ct, ctinfo);
 }
 
 bool hnat_account_publish_delta(struct mtk_hnat *h, u32 ppe, u32 slot,
@@ -552,6 +581,47 @@ void hnat_account_invalidate(struct mtk_hnat *h, u32 ppe, u32 slot)
 	/* No retirement MIB read: hardware tail remains explicitly uncertain. */
 	p->unknown_loss++;
 	spin_unlock_bh(&p->lock);
+}
+
+bool hnat_account_tunnel_invalidate(struct mtk_hnat *h, u32 ppe, u32 slot)
+{
+	struct hnat_account_ppe *p;
+	struct hnat_accounting delta;
+	struct foe_entry before;
+	struct foe_entry *foe;
+	u32 info1;
+
+	if (!account_valid(h, ppe, slot))
+		return false;
+	lockdep_assert_held(&h->entry_lock);
+	p = &h->account->ppe[ppe];
+	foe = &h->foe_table_cpu[ppe][slot];
+	spin_lock_bh(&p->lock);
+	memcpy(&before, foe, sizeof(before));
+	/* drain_locked attributes only a live owner's verified identity.  The
+	 * return value never authorizes publishing data to a different owner.
+	 * A timeout remains quarantined and counted by the existing ledger.
+	 */
+	drain_locked(h, ppe, slot, &delta);
+	/* Hardware is not frozen by software locks.  Do not invalidate a slot
+	 * that was aged/relearned while the MIB transaction was in progress.
+	 */
+	if (foe->bfib1.state != BIND || !account_identity(&before, foe)) {
+		p->mismatch++;
+		spin_unlock_bh(&p->lock);
+		return true; /* handled: never fall through to an unguarded clear */
+	}
+	info1 = READ_ONCE(foe->ipv4_hnapt.info_blk1);
+	WRITE_ONCE(foe->ipv4_hnapt.info_blk1, info1 & ~GENMASK(29, 28));
+	dma_wmb();
+	retire_locked(p, &p->slots[slot]);
+	p->slots[slot].generation++;
+	/* PPE may finish an in-flight packet after the last MIB read.  Keep that
+	 * hardware tail explicitly uncertain instead of claiming lossless totals.
+	 */
+	p->unknown_loss++;
+	spin_unlock_bh(&p->lock);
+	return true;
 }
 
 static bool account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase,

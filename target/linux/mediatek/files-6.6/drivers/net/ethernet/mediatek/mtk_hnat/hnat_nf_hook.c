@@ -12,8 +12,11 @@
  */
 
 #include <linux/netfilter_bridge.h>
+#include <linux/workqueue.h>
+#include <linux/rcupdate.h>
 #include <linux/netfilter_ipv6.h>
 #include <linux/of.h>
+#include <linux/if_vlan.h>
 #include <net/arp.h>
 #include <net/neighbour.h>
 #include <net/netfilter/nf_conntrack_helper.h>
@@ -424,6 +427,8 @@ void ppd_dev_setting(void)
 		__func__, hnat_priv->g_ppdev->name, ppd_dev->name);
 }
 
+static void hnat_flow_drop_dev(struct net_device *dev);
+
 int nf_hnat_netdevice_event(struct notifier_block *unused, unsigned long event,
 			    void *ptr)
 {
@@ -470,6 +475,7 @@ int nf_hnat_netdevice_event(struct notifier_block *unused, unsigned long event,
 
 		break;
 	case NETDEV_UNREGISTER:
+		hnat_flow_drop_dev(dev);
 		ppd_dev_setting();
 		if (hnat_priv->g_ppdev == dev) {
 			hnat_priv->g_ppdev = NULL;
@@ -1159,6 +1165,8 @@ mtk_hnat_ipv6_nf_pre_routing(void *priv, struct sk_buff *skb,
         	if(unlikely(skb_cow(skb, FOE_INFO_LEN + ETH_HLEN)))
             	return NF_ACCEPT;
         }
+		if (!is_magic_tag_valid(skb))
+			hnat_tunnel_metadata_init(skb);
 		skb_hnat_alg(skb) = 0;
 		skb_hnat_magic_tag(skb) = HNAT_MAGIC_TAG;
 	}
@@ -1221,6 +1229,38 @@ drop:
 	return NF_DROP;
 }
 
+/* true means keep this software learning packet off the normal bind path. */
+static bool hnat_tunnel_pre_route(struct sk_buff *skb)
+{
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	struct flow_offload_hw_path path = { .dev = skb->dev, .virt_dev = skb->dev };
+
+	if (!hnat_tunnel_available() || !IS_SPACE_AVAILABLE_HEAD(skb))
+		return false;
+	/* A failed COW must not modify a descriptor shared with another skb.
+	 * Post-routing also refuses shared-head tunnel publication.
+	 */
+	if (skb_cow_head(skb, skb_headroom(skb)))
+		return true;
+	if (skb_hnat_tops(skb) && skb_hnat_is_decap(skb)) {
+		if (skb->dev->netdev_ops->ndo_flow_offload_check &&
+		    !skb->dev->netdev_ops->ndo_flow_offload_check(&path) &&
+		    (path.flags & BIT(DEV_PATH_TNL)))
+			hnat_tunnel_decap_offload(skb);
+		/* This skb still carries the outer packet's hardware slot.  Even a
+		 * successful decap setup must not bind its inner tuple into that slot.
+		 */
+		skb_hnat_alg(skb) = 1;
+		return true;
+	}
+	if (!skb_hnat_is_decap(skb) && hnat_tunnel_decap_offloadable(skb)) {
+		skb_hnat_is_decap(skb) = 1;
+		return true;
+	}
+#endif
+	return false;
+}
+
 static unsigned int
 mtk_hnat_ipv4_nf_pre_routing(void *priv, struct sk_buff *skb,
 			     const struct nf_hook_state *state)
@@ -1238,11 +1278,16 @@ mtk_hnat_ipv4_nf_pre_routing(void *priv, struct sk_buff *skb,
         	if(unlikely(skb_cow(skb, FOE_INFO_LEN + ETH_HLEN)))
             	return NF_ACCEPT;
         }
+		if (!is_magic_tag_valid(skb))
+			hnat_tunnel_metadata_init(skb);
 		skb_hnat_alg(skb) = 0;
 		skb_hnat_magic_tag(skb) = HNAT_MAGIC_TAG;
 	}
 
 	if (!is_magic_tag_valid(skb))
+		return NF_ACCEPT;
+
+	if (hnat_tunnel_pre_route(skb))
 		return NF_ACCEPT;
 
 	if (!is_ppe_support_type(skb)) {
@@ -1318,12 +1363,25 @@ mtk_hnat_br_nf_local_in(void *priv, struct sk_buff *skb,
         	if(unlikely(skb_cow(skb, FOE_INFO_LEN + ETH_HLEN)))
             	return NF_ACCEPT;
         }
+		if (!is_magic_tag_valid(skb))
+			hnat_tunnel_metadata_init(skb);
 		skb_hnat_alg(skb) = 0;
 		skb_hnat_magic_tag(skb) = HNAT_MAGIC_TAG;
 	}
 
 	if (!is_magic_tag_valid(skb))
 		return NF_ACCEPT;
+
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	/* Software GRETAP/VXLAN decap can enter a bridge without another IPv4
+	 * PRE_ROUTING pass. Only consume the outer packet's pending marker;
+	 * ordinary bridge frames and hardware-decapped (tops=0) frames retain
+	 * the original HNAT path. No bridge-netfilter sysctl is changed.
+	 */
+	if (IS_SPACE_AVAILABLE_HEAD(skb) && skb_hnat_tops(skb) &&
+	    skb_hnat_is_decap(skb) && hnat_tunnel_pre_route(skb))
+		return NF_ACCEPT;
+#endif
 
 	if (IS_HQOS_MODE && hnat_priv->data->whnat) {
 		veth = (struct vlan_ethhdr *)skb_mac_header(skb);
@@ -1671,10 +1729,21 @@ bool hnat_flow_entry_match(const struct foe_entry *entry,
 		       (const u8 *)data + offset, len);
 }
 
+static void hnat_flow_entry_free_rcu(struct rcu_head *head)
+{
+	struct hnat_flow_entry *flow = container_of(head, struct hnat_flow_entry, rcu);
+
+	if (flow->tunnel_ct)
+		nf_ct_put(flow->tunnel_ct);
+	if (flow->tunnel_dev)
+		dev_put(flow->tunnel_dev);
+	kfree(flow);
+}
+
 void hnat_flow_entry_delete(struct hnat_flow_entry *flow_entry)
 {
 	hlist_del_init(&flow_entry->list);
-	kfree(flow_entry);
+	call_rcu(&flow_entry->rcu, hnat_flow_entry_free_rcu);
 }
 
 /* Caller holds flow_entry_lock. Buckets follow the official PPE/slot hash
@@ -1701,6 +1770,71 @@ static struct hnat_flow_entry *hnat_flow_entry_search(
 	return NULL;
 }
 
+/* A tunnel is invalidated before its firmware table index can be reused.
+ * Keep descriptor mutation and retirement within HNAT's existing lock order.
+ * Callbacks into NPU are never made while entry_lock is held.
+ */
+int hnat_tunnel_flush(u32 tops_entry)
+{
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	struct hnat_flow_entry *flow;
+	struct hlist_node *next;
+	struct foe_entry *entry;
+	u32 ppe, slot, code, tport, count = 0;
+
+	if (tops_entry && (tops_entry < 32 || tops_entry >= 64))
+		return -EINVAL;
+	if (!hnat_external_callback_enter())
+		return -ENODEV;
+	for (ppe = 0; ppe < hnat_priv->ppe_num && ppe < CFG_PPE_NUM &&
+	     ppe < MAX_PPE_NUM; ppe++) {
+		if (!hnat_priv->foe_table_cpu[ppe])
+			continue;
+		for (slot = 0; slot < hnat_priv->foe_etry_num; slot++) {
+			spin_lock_bh(&hnat_priv->entry_lock);
+			entry = &hnat_priv->foe_table_cpu[ppe][slot];
+			if (entry->bfib1.state != BIND ||
+			    !(IS_IPV4_GRP(entry) || IS_IPV6_GRP(entry)))
+				goto next;
+			if (IS_IPV4_GRP(entry)) {
+				code = entry->ipv4_hnapt.tops_entry;
+				tport = entry->ipv4_hnapt.tport_id;
+			} else {
+				code = entry->ipv6_5t_route.tops_entry;
+				tport = entry->ipv6_5t_route.tport_id;
+			}
+			if (code < 32 || (tops_entry && code != tops_entry) ||
+			    (tport != 4 && tport != 5))
+				goto next;
+			if (!hnat_account_tunnel_invalidate(hnat_priv, ppe, slot)) {
+				u32 info1 = READ_ONCE(entry->ipv4_hnapt.info_blk1);
+
+				WRITE_ONCE(entry->ipv4_hnapt.info_blk1,
+					   info1 & ~GENMASK(29, 28));
+				dma_wmb();
+			}
+			spin_lock_bh(&hnat_priv->flow_entry_lock);
+			if (hnat_priv->foe_flow[ppe])
+				hlist_for_each_entry_safe(flow, next,
+					&hnat_priv->foe_flow[ppe][slot / 4], list)
+					if (flow->hash == slot)
+						hnat_flow_entry_delete(flow);
+			spin_unlock_bh(&hnat_priv->flow_entry_lock);
+			count++;
+		next:
+			spin_unlock_bh(&hnat_priv->entry_lock);
+		}
+	}
+	if (count)
+		hnat_cache_ebl(1);
+	hnat_external_callback_exit();
+	return count;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+EXPORT_SYMBOL_GPL(hnat_tunnel_flush);
+
 /* Software locks cannot prevent a concurrent PPE rewrite. This gate checks
  * the live state and key as close as software can get to a publication.
  */
@@ -1714,7 +1848,8 @@ bool hnat_flow_entry_unbind_match(const struct foe_entry *entry,
 }
 
 static bool hnat_flow_entry_store(const struct foe_entry *entry, u32 ppe,
-				  u32 slot, u64 generation)
+				  u32 slot, u64 generation, struct net_device *tunnel_dev,
+				  struct nf_conn *ct, enum ip_conntrack_info ctinfo)
 {
 	struct hnat_flow_entry *flow, *new_flow, *found = NULL;
 	struct hlist_head *head;
@@ -1730,6 +1865,15 @@ static bool hnat_flow_entry_store(const struct foe_entry *entry, u32 ppe,
 	if (!new_flow)
 		return false;
 	INIT_HLIST_NODE(&new_flow->list);
+	if (tunnel_dev) {
+		dev_hold(tunnel_dev);
+		new_flow->tunnel_dev = tunnel_dev;
+		if (ct) {
+			nf_conntrack_get(&ct->ct_general);
+			new_flow->tunnel_ct = ct;
+			new_flow->tunnel_ctinfo = ctinfo;
+		}
+	}
 	memcpy(&new_flow->data, entry, sizeof(*entry));
 	new_flow->ppe_index = ppe;
 	new_flow->hash = slot;
@@ -1745,7 +1889,7 @@ static bool hnat_flow_entry_store(const struct foe_entry *entry, u32 ppe,
 	spin_lock_bh(&hnat_priv->flow_entry_lock);
 	if (!hnat_flow_entry_unbind_match(entry, live)) {
 		spin_unlock_bh(&hnat_priv->flow_entry_lock);
-		kfree(new_flow);
+		hnat_flow_entry_delete(new_flow);
 		return false;
 	}
 
@@ -1766,12 +1910,67 @@ static bool hnat_flow_entry_store(const struct foe_entry *entry, u32 ppe,
 		found->generation = generation;
 		found->last_update = jiffies;
 		found->sequence = seq;
-		kfree(new_flow);
+		{
+			struct net_device *old_dev = found->tunnel_dev;
+			struct nf_conn *old_ct = found->tunnel_ct;
+
+			found->tunnel_dev = new_flow->tunnel_dev;
+			found->tunnel_ct = new_flow->tunnel_ct;
+			found->tunnel_ctinfo = new_flow->tunnel_ctinfo;
+			new_flow->tunnel_dev = old_dev;
+			new_flow->tunnel_ct = old_ct;
+		}
+		hnat_flow_entry_delete(new_flow);
 	} else {
 		hlist_add_head(&new_flow->list, head);
 	}
 	spin_unlock_bh(&hnat_priv->flow_entry_lock);
 	return true;
+}
+
+static void hnat_flow_sweep(struct net_device *dev)
+{
+	struct hnat_flow_entry *flow;
+	struct hlist_node *next;
+	u32 ppe, bucket;
+
+	for (ppe = 0; ppe < CFG_PPE_NUM && ppe < MAX_PPE_NUM; ppe++) {
+		if (!hnat_priv->foe_flow[ppe])
+			continue;
+		for (bucket = 0; bucket < DIV_ROUND_UP(hnat_priv->foe_etry_num, 4); bucket++) {
+			spin_lock_bh(&hnat_priv->flow_entry_lock);
+			hlist_for_each_entry_safe(flow, next,
+					&hnat_priv->foe_flow[ppe][bucket], list) {
+				if (dev ? flow->tunnel_dev == dev :
+				    time_after_eq(jiffies, flow->last_update + 3 * HZ))
+					hnat_flow_entry_delete(flow);
+			}
+			spin_unlock_bh(&hnat_priv->flow_entry_lock);
+		}
+	}
+}
+
+static void hnat_flow_drop_dev(struct net_device *dev)
+{
+	hnat_flow_sweep(dev);
+}
+
+static void hnat_flow_gc_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(hnat_flow_gc, hnat_flow_gc_work);
+static void hnat_flow_gc_work(struct work_struct *work)
+{
+	hnat_flow_sweep(NULL);
+	schedule_delayed_work(&hnat_flow_gc, 5 * HZ);
+}
+
+void hnat_flow_gc_start(void)
+{
+	schedule_delayed_work(&hnat_flow_gc, 5 * HZ);
+}
+
+void hnat_flow_gc_stop(void)
+{
+	cancel_delayed_work_sync(&hnat_flow_gc);
 }
 
 /* Caller holds entry_lock; success returns with flow_entry_lock held. */
@@ -1881,7 +2080,7 @@ static bool hnat_flow_ipv4_ct_match(const struct sk_buff *skb,
 	    entry->udib1.pkt_type != IPV4_HNAT)
 		return true;
 
-	if (!hnat_flow_ipv4_tuple_match(skb, entry))
+	if (skb && !hnat_flow_ipv4_tuple_match(skb, entry))
 		return false;
 	if (!ct || nf_ct_is_template(ct) || nf_ct_is_dying(ct))
 		return entry->ipv4_hnapt.sip == entry->ipv4_hnapt.new_sip &&
@@ -1989,6 +2188,11 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	struct foe_entry entry = { 0 };
 	struct mtk_mac *mac;
 	int whnat = IS_WHNAT(dev);
+	bool tunnel_prefill = false;
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	tunnel_prefill = skb_hnat_tops(skb) &&
+		(hw_path->flags & BIT(DEV_PATH_TNL));
+#endif
 	struct ethhdr *eth;
 	struct iphdr *iph;
 	struct ipv6hdr *ip6h;
@@ -2473,7 +2677,10 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	/* Fill Info Blk*/
 	entry = ppe_fill_info_blk(eth, entry, hw_path);
 
-	if (IS_LAN_GRP(dev) || IS_WAN(dev)) { /* Forward to GMAC Ports */
+	if (tunnel_prefill) {
+		/* Software-only prepared entry; final physical egress is filled later. */
+		gmac = NR_PDMA_PORT;
+	} else if (IS_LAN_GRP(dev) || IS_WAN(dev)) { /* Forward to GMAC Ports */
 		port_id = hnat_dsa_get_port(&master_dev);
 		if (port_id >= 0) {
 			if (hnat_dsa_fill_stag(dev, &entry, hw_path,
@@ -2623,7 +2830,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	    !hnat_flow_ipv4_ct_match(skb, &entry, ct, ctinfo))
 		return 0;
 
-	if (whnat) {
+	if (whnat || tunnel_prefill) {
 		if (!hnat_flow_entry_unbind_match(&entry, foe) ||
 		    !hnat_flow_ipv4_ct_match(skb, &entry, ct, ctinfo))
 			return 0;
@@ -2644,7 +2851,9 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 			return 0;
 		}
 		if (!hnat_flow_entry_store(&entry, skb_hnat_ppe(skb),
-					   skb_hnat_entry(skb), account_generation)) {
+					   skb_hnat_entry(skb), account_generation,
+					   tunnel_prefill ? (struct net_device *)dev : NULL,
+					   ct, ctinfo)) {
 			if (account_handled)
 				hnat_account_invalidate(hnat_priv, skb_hnat_ppe(skb),
 							skb_hnat_entry(skb));
@@ -2717,7 +2926,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 	spin_lock_bh(&hnat_priv->flow_entry_lock);
 	flow = hnat_flow_entry_search(hw_entry, skb_hnat_ppe(skb),
 				      skb_hnat_entry(skb));
-	if (!flow ||
+	if (!flow || flow->tunnel_dev ||
 	    time_after_eq(jiffies, flow->last_update + 3 * HZ) ||
 	    flow->generation != account_generation ||
 	    !hnat_flow_entry_unbind_match(&flow->data, hw_entry)) {
@@ -3074,6 +3283,7 @@ int mtk_sw_nat_hook_rx(struct sk_buff *skb)
 		return NF_ACCEPT;
 	}
 
+	hnat_tunnel_metadata_init(skb);
 	skb_hnat_alg(skb) = 0;
 	/* This is a new RX packet, never a software-prefilled TX confirmation. */
 	skb_hnat_filled(skb) = 0;
@@ -3558,6 +3768,301 @@ static bool hnat_invalid_index_fallback(struct sk_buff *skb)
 	return true;
 }
 
+/* Confirm the inner packet using an explicit kernel inner-header marker.
+ * Unknown encapsulations/offsets remain on the software forwarding path.
+ */
+static bool hnat_tunnel_inner_match(const struct sk_buff *skb,
+				  const struct foe_entry *entry)
+{
+	struct iphdr ip_copy;
+	struct tcpudphdr ports_copy;
+	const struct iphdr *ip;
+	const struct tcpudphdr *ports;
+	int offset;
+
+	if (!skb->encapsulation || skb_is_gso(skb) ||
+	    entry->bfib1.pkt_type != IPV4_HNAPT)
+		return false;
+	offset = skb_inner_network_header(skb) - skb->data;
+	if (offset < 0 || offset > skb->len || skb->len - offset < sizeof(ip_copy))
+		return false;
+	ip = skb_header_pointer(skb, offset, sizeof(ip_copy), &ip_copy);
+	if (!ip || ip->version != 4 || ip->ihl < 5 || ip_is_fragment(ip) ||
+	    ip->protocol != IPPROTO_TCP || ntohs(ip->tot_len) < ip->ihl * 4 + sizeof(struct tcphdr) ||
+	    ntohs(ip->tot_len) > skb->len - offset)
+		return false;
+	ports = skb_header_pointer(skb, offset + ip->ihl * 4,
+				   sizeof(ports_copy), &ports_copy);
+	return ports && !entry->bfib1.udp &&
+	       ntohl(ip->saddr) == entry->ipv4_hnapt.new_sip &&
+	       ntohl(ip->daddr) == entry->ipv4_hnapt.new_dip &&
+	       ntohs(ports->src) == entry->ipv4_hnapt.new_sport &&
+	       ntohs(ports->dst) == entry->ipv4_hnapt.new_dport;
+}
+
+/* Match a real MT7988 MAC by its driver's registered netdev array. Names
+ * such as eth1.10/bond0 are not proof that netdev_priv contains mtk_mac.
+ */
+static struct mtk_mac *hnat_tunnel_eth_mac(const struct net_device *dev)
+{
+	struct mtk_eth *eth;
+	unsigned int i;
+
+	if (!dev->dev.parent || !dev->dev.parent->of_node ||
+	    !of_device_is_compatible(dev->dev.parent->of_node, "mediatek,mt7988-eth"))
+		return NULL;
+	eth = dev_get_drvdata(dev->dev.parent);
+	if (!eth)
+		return NULL;
+	for (i = 0; i < MTK_MAX_DEVS; i++)
+		if (eth->netdev[i] == dev)
+			return eth->mac[i];
+	return NULL;
+}
+
+/* Only a verified saved INNER flow may retain offload eligibility across
+ * the kernel's LOCAL_OUT traversal of the newly encapsulated outer skb.
+ * This is not a publication: post-routing repeats identity checks after NAT.
+ */
+static bool hnat_tunnel_pending_outer(struct sk_buff *skb)
+{
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	struct hnat_flow_entry *flow;
+	struct foe_entry *live;
+	struct iphdr copy;
+	const struct iphdr *ip;
+	u64 generation = 0;
+	u32 ppe, slot, type;
+	bool valid = false;
+
+	if (!hnat_tunnel_available() || !IS_SPACE_AVAILABLE_HEAD(skb) ||
+	    skb_header_cloned(skb) || !is_magic_tag_valid(skb) ||
+	    !is_hnat_info_filled(skb) || skb_hnat_is_decap(skb) ||
+	    skb_hnat_reason(skb) != HIT_UNBIND_RATE_REACH)
+		return false;
+	type = skb_hnat_tops(skb);
+	if (type != FLOW_OFFLOAD_TNL_GRETAP + 1 &&
+	    type != FLOW_OFFLOAD_TNL_VXLAN + 1 &&
+	    type != FLOW_OFFLOAD_TNL_L2TP_V2 + 1)
+		return false;
+	ip = skb_header_pointer(skb, skb_network_offset(skb), sizeof(copy), &copy);
+	if (skb->protocol != htons(ETH_P_IP) || !ip || ip->version != 4 ||
+	    ip->ihl != 5 || ip_is_fragment(ip))
+		return false;
+	ppe = skb_hnat_ppe(skb);
+	slot = skb_hnat_entry(skb);
+	if (ppe >= CFG_PPE_NUM || ppe >= MAX_PPE_NUM ||
+	    slot >= hnat_priv->foe_etry_num || !hnat_priv->foe_table_cpu[ppe])
+		return false;
+	if (hnat_priv->data->per_flow_accounting &&
+	    !hnat_account_generation_snapshot(hnat_priv, ppe, slot, &generation))
+		return false;
+	live = &hnat_priv->foe_table_cpu[ppe][slot];
+	spin_lock_bh(&hnat_priv->flow_entry_lock);
+	flow = hnat_flow_entry_search(live, ppe, slot);
+	if (flow && flow->tunnel_dev && netif_running(flow->tunnel_dev) &&
+	    flow->generation == generation &&
+	    time_before(jiffies, flow->last_update + 3 * HZ) &&
+	    hnat_flow_entry_unbind_match(&flow->data, live) &&
+	    hnat_tunnel_inner_match(skb, &flow->data) &&
+	    hnat_flow_ipv4_ct_match(NULL, &flow->data, flow->tunnel_ct, flow->tunnel_ctinfo))
+		valid = true;
+	spin_unlock_bh(&hnat_priv->flow_entry_lock);
+	return valid;
+#else
+	return false;
+#endif
+}
+
+/* Resolve outer Ethernet parameters into a software copy. eth_hdr(skb) can
+ * still point at GRETAP/VXLAN's INNER Ethernet frame here; never rewrite it.
+ * Neighbour resolution continues normally in the software path on a miss.
+ */
+static bool hnat_tunnel_outer_neighbour(struct sk_buff *skb,
+					const struct net_device *out,
+					struct flow_offload_hw_path *path)
+{
+	struct dst_entry *dst = skb_dst(skb);
+	struct neighbour *neigh;
+	bool valid;
+
+	if (!dst || dst->dev != out || dst_xfrm(dst) ||
+	    skb->protocol != htons(ETH_P_IP))
+		return false;
+	/* PPPoE's live channel supplies the peer MAC and session under the
+	 * native PPP unit/channel locks. A PPP netdev has no ARP neighbour.
+	 */
+	if (path->flags & BIT(DEV_PATH_PPPOE))
+		return path->pppoe_sid &&
+		       is_valid_ether_addr(path->eth_dest) &&
+		       is_valid_ether_addr(path->eth_src);
+	neigh = dst_neigh_lookup_skb(dst, skb);
+	if (!neigh)
+		return false;
+	neigh_ha_snapshot(path->eth_dest, neigh, out);
+	valid = (READ_ONCE(neigh->nud_state) & NUD_VALID) &&
+		is_valid_ether_addr(path->eth_dest) && is_valid_ether_addr(out->dev_addr);
+	if (valid)
+		ether_addr_copy(path->eth_src, out->dev_addr);
+	neigh_release(neigh);
+	return valid;
+}
+
+/* One 802.1Q tag and/or a connected PPPoE channel, resolved by native ndo
+ * callbacks to an actual MT7988 MAC. Do not cast a virtual netdev's private
+ * storage to mtk_mac, or silently flatten QinQ/DSA/bridge paths.
+ */
+static bool hnat_tunnel_outer_path(const struct sk_buff *skb,
+				   const struct net_device *underlay,
+				   const struct flow_offload_hw_path *path,
+				   struct hnat_tunnel_token *token)
+{
+	u32 flags = BIT(DEV_PATH_ETHERNET) | BIT(DEV_PATH_VLAN) | BIT(DEV_PATH_PPPOE);
+	u16 tci = 0;
+
+	if (!path->dev || path->flags & ~flags ||
+	    !hnat_tunnel_eth_mac(path->dev) || netdev_uses_dsa(path->dev) ||
+	    !netif_running(underlay) || !netif_running(path->dev) ||
+	    dev_net(underlay) != &init_net || dev_net(path->dev) != &init_net)
+		return false;
+	if (path->flags & BIT(DEV_PATH_VLAN)) {
+		if (path->vlan_proto != htons(ETH_P_8021Q) ||
+		    path->vlan_id >= VLAN_VID_MASK || !path->virt_dev ||
+		    !is_vlan_dev(path->virt_dev) ||
+		    vlan_dev_real_dev(path->virt_dev) != path->dev ||
+		    vlan_dev_vlan_id(path->virt_dev) != path->vlan_id)
+			return false;
+		tci = path->vlan_id | vlan_dev_get_egress_qos_mask(path->virt_dev, skb->priority);
+	}
+	if ((path->flags & BIT(DEV_PATH_PPPOE)) && !path->pppoe_sid)
+		return false;
+	token->underlay = (struct net_device *)underlay;
+	token->egress = path->dev;
+	token->egress_flags = path->flags;
+	token->vlan_proto = path->flags & BIT(DEV_PATH_VLAN) ? path->vlan_proto : 0;
+	token->vlan_tci = tci;
+	token->pppoe_sid = path->flags & BIT(DEV_PATH_PPPOE) ? path->pppoe_sid : 0;
+	return true;
+}
+
+static void hnat_tunnel_outer_l2(struct foe_entry *entry,
+				 const struct hnat_tunnel_token *token)
+{
+	/* Native PPE actions insert PPPoE/VLAN; the TOPS firmware ABI remains
+	 * Ethernet plus IP/tunnel parameters, exactly as in the vendor path.
+	 */
+	entry->bfib1.psn = !!(token->egress_flags & BIT(DEV_PATH_PPPOE));
+	entry->bfib1.vlan_layer = !!(token->egress_flags & BIT(DEV_PATH_VLAN));
+	entry->bfib1.vpm = entry->bfib1.vlan_layer != 0;
+	entry->ipv4_hnapt.vlan1 = token->vlan_tci;
+	entry->ipv4_hnapt.vlan2 = 0;
+	entry->ipv4_hnapt.pppoe_id = token->pppoe_sid;
+}
+
+static void hnat_tunnel_confirm(struct sk_buff *skb, const struct net_device *out,
+				const struct flow_offload_hw_path *path)
+{
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	struct hnat_tunnel_token token = { 0 };
+	struct hnat_flow_entry *flow;
+	struct foe_entry entry, *live;
+	struct net_device *tunnel_dev = NULL;
+	struct nf_conn *ct = NULL;
+	struct mtk_mac *mac;
+	struct ethhdr eth = { .h_proto = htons(ETH_P_IP) };
+	u64 generation = 0, sequence;
+	u32 ppe = skb_hnat_ppe(skb), slot = skb_hnat_entry(skb);
+	u8 ctinfo = 0;
+	bool handled, accepted = false;
+
+	if (!hnat_tunnel_outer_path(skb, out, path, &token) ||
+	    !is_hnat_info_filled(skb) || ppe >= CFG_PPE_NUM || ppe >= MAX_PPE_NUM ||
+	    slot >= hnat_priv->foe_etry_num || !hnat_priv->foe_table_cpu[ppe] ||
+	    skb_hnat_reason(skb) != HIT_UNBIND_RATE_REACH)
+		goto reject;
+	mac = hnat_tunnel_eth_mac(path->dev);
+	if (hnat_priv->data->per_flow_accounting &&
+	    !hnat_account_generation_snapshot(hnat_priv, ppe, slot, &generation))
+		goto reject;
+	live = &hnat_priv->foe_table_cpu[ppe][slot];
+	spin_lock_bh(&hnat_priv->flow_entry_lock);
+	flow = hnat_flow_entry_search(live, ppe, slot);
+	if (!flow || !flow->tunnel_dev || flow->generation != generation ||
+	    time_after_eq(jiffies, flow->last_update + 3 * HZ) ||
+	    !hnat_flow_entry_unbind_match(&flow->data, live)) {
+		spin_unlock_bh(&hnat_priv->flow_entry_lock);
+		goto reject;
+	}
+	entry = flow->data;
+	sequence = flow->sequence;
+	tunnel_dev = flow->tunnel_dev;
+	dev_hold(tunnel_dev);
+	ct = flow->tunnel_ct;
+	ctinfo = flow->tunnel_ctinfo;
+	if (ct)
+		nf_conntrack_get(&ct->ct_general);
+	spin_unlock_bh(&hnat_priv->flow_entry_lock);
+	if (!hnat_tunnel_inner_match(skb, &entry) ||
+	    !hnat_flow_ipv4_ct_match(NULL, &entry, ct, ctinfo))
+		goto put;
+	ether_addr_copy(eth.h_dest, path->eth_dest);
+	ether_addr_copy(eth.h_source, path->eth_src);
+	if (hnat_tunnel_encap_offload(skb, &eth, tunnel_dev, &token) ||
+	    skb_hnat_tops(skb) != token.index + 32 ||
+	    !hnat_tunnel_bind_lock(tunnel_dev, &token))
+		goto put;
+	/* No NPU callback/lock is acquired inside entry_lock. Keep the tunnel
+	 * lease held until the actual descriptor publication has finished.
+	 */
+	spin_lock_bh(&hnat_priv->entry_lock);
+	if (!hnat_flow_entry_lock_current(&entry, ppe, slot, generation, sequence, &flow))
+		goto entry_unlock;
+	if (flow->tunnel_dev != tunnel_dev || flow->tunnel_ct != ct ||
+	    !hnat_flow_entry_unbind_match(&entry, live) ||
+	    !hnat_tunnel_inner_match(skb, &entry) ||
+	    !hnat_flow_ipv4_ct_match(NULL, &entry, ct, ctinfo))
+		goto flow_unlock;
+	entry.ipv4_hnapt.iblk2.dp = HNAT_GMAC_FP(mac->id);
+	entry.ipv4_hnapt.tops_entry = token.index + 32;
+	entry.ipv4_hnapt.tport_id = 5; /* official NR_TDMA_QDMA_TPORT */
+	entry.ipv4_hnapt.iblk2.qid = 14;
+	entry.ipv4_hnapt.iblk2.fqos = 1;
+	hnat_tunnel_outer_l2(&entry, &token);
+	entry.bfib1.state = BIND;
+	entry.bfib1.ttl = 1;
+	entry.bfib1.time_stamp = foe_timestamp(hnat_priv);
+	handled = hnat_account_tunnel_commit(hnat_priv, ppe, slot, ct, ctinfo,
+					     &entry, generation, &accepted);
+	if (!handled && !hnat_priv->data->per_flow_accounting &&
+	    (!ct || !nf_ct_is_dying(ct)) && hnat_flow_entry_unbind_match(&entry, live)) {
+		hnat_copy_foe_info(live, &entry);
+		wmb();
+		memcpy(&live->bfib1, &entry.bfib1, sizeof(entry.bfib1));
+		dma_wmb();
+		accepted = true;
+	}
+	if (accepted)
+		hnat_flow_entry_delete(flow);
+flow_unlock:
+	spin_unlock_bh(&hnat_priv->flow_entry_lock);
+entry_unlock:
+	spin_unlock_bh(&hnat_priv->entry_lock);
+	hnat_tunnel_bind_unlock(&token);
+put:
+	if (ct)
+		nf_ct_put(ct);
+	if (tunnel_dev)
+		dev_put(tunnel_dev);
+reject:
+	/* A failed hardware bind must never fall into ordinary outer-tuple
+	 * publication. The already software-encapsulated skb keeps forwarding.
+	 */
+	skb_hnat_alg(skb) = 1;
+	skb_hnat_filled(skb) = 0;
+	skb_hnat_tops(skb) = 0;
+#endif
+}
+
 static unsigned int mtk_hnat_nf_post_routing(
 	struct sk_buff *skb, const struct net_device *out,
 	unsigned int (*fn)(struct sk_buff *, const struct net_device *,
@@ -3569,6 +4074,20 @@ static unsigned int mtk_hnat_nf_post_routing(
 						.virt_dev = (struct net_device*)out,
 						.skb_hash = skb_hnat_entry(skb) };
 	const struct net_device *arp_dev = out;
+	const struct net_device *route_out = out;
+	int path_err = 0;
+
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	if (skb_header_cloned(skb) &&
+	    (hnat_tunnel_available() ||
+	     (IS_SPACE_AVAILABLE_HEAD(skb) && is_magic_tag_valid(skb) && skb_hnat_tops(skb))))
+		return 0;
+	if (is_magic_tag_valid(skb) && IS_SPACE_AVAILABLE_HEAD(skb) &&
+	    skb_hnat_tops(skb) && skb_hnat_is_decap(skb)) {
+		skb_hnat_alg(skb) = 1;
+		return 0;
+	}
+#endif
 
 	if (xlat_toggle && !mtk_464xlat_post_process(skb, out))
 		return 0;
@@ -3594,12 +4113,40 @@ static unsigned int mtk_hnat_nf_post_routing(
 		return 0;
 
 	if (out->netdev_ops->ndo_flow_offload_check) {
-		out->netdev_ops->ndo_flow_offload_check(&hw_path);
+		path_err = out->netdev_ops->ndo_flow_offload_check(&hw_path);
 		out = (IS_GMAC1_MODE) ? hw_path.virt_dev : hw_path.dev;
 	}
 
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	if ((hw_path.flags & BIT(DEV_PATH_TNL)) && hnat_tunnel_available()) {
+		struct iphdr copy;
+		const struct iphdr *ip = skb_header_pointer(skb, skb_network_offset(skb),
+							 sizeof(copy), &copy);
+
+		if (skb->protocol != htons(ETH_P_IP) || !ip || ip->version != 4 ||
+		    ip->ihl != 5 || ip->protocol != IPPROTO_TCP || ip_is_fragment(ip) ||
+		    skb_is_gso(skb) || dev_net(out) != &init_net ||
+		    (hw_path.tnl_type != FLOW_OFFLOAD_TNL_GRETAP &&
+		     hw_path.tnl_type != FLOW_OFFLOAD_TNL_VXLAN &&
+		     hw_path.tnl_type != FLOW_OFFLOAD_TNL_L2TP_V2)) {
+			skb_hnat_alg(skb) = 1;
+			return 0;
+		}
+		skb_hnat_tops(skb) = hw_path.tnl_type + 1;
+		skb_hnat_is_decap(skb) = 0;
+	} else if (skb_hnat_tops(skb) && is_hnat_info_filled(skb)) {
+		if (path_err || !hnat_tunnel_pending_outer(skb) ||
+		    !hnat_tunnel_outer_neighbour(skb, route_out, &hw_path))
+			return 0;
+		hnat_tunnel_confirm(skb, route_out, &hw_path);
+		return 0;
+	}
+	if (!skb_hnat_tops(skb) && !IS_LAN_GRP(out) && !IS_WAN(out) && !IS_EXT(out))
+		return 0;
+#else
 	if (!IS_LAN_GRP(out) && !IS_WAN(out) && !IS_EXT(out))
 		return 0;
+#endif
 	
 	if (!IS_WHNAT(out) && IS_EXT(out))
 		return 0;
@@ -3617,7 +4164,7 @@ static unsigned int mtk_hnat_nf_post_routing(
 		if (fn && !mtk_hnat_accel_type(skb))
 			break;
 
-		if (fn && fn(skb, arp_dev, &hw_path))
+		if (fn && !(hw_path.flags & BIT(DEV_PATH_TNL)) && fn(skb, arp_dev, &hw_path))
 			break;
 
 		spin_lock(&hnat_priv->entry_lock);
@@ -3894,6 +4441,9 @@ mtk_hnat_ipv4_nf_local_out(void *priv, struct sk_buff *skb,
 
 	if (skb_hnat_entry(skb) >= hnat_priv->foe_etry_num ||
 	    skb_hnat_ppe(skb) >= CFG_PPE_NUM)
+		return NF_ACCEPT;
+
+	if (hnat_tunnel_pending_outer(skb))
 		return NF_ACCEPT;
 
 	entry = &hnat_priv->foe_table_cpu[skb_hnat_ppe(skb)][skb_hnat_entry(skb)];

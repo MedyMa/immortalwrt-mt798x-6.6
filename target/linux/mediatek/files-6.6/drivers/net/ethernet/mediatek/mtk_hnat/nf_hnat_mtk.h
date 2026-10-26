@@ -44,7 +44,12 @@ struct hnat_desc {
 	u32 is_sp : 1;
 	u32 hf : 1;
 	u32 amsdu : 1;
-	u32 resv3 : 19;
+	u32 tops : 6;
+	u32 is_decap : 1;
+	u32 cdrt : 8;
+	u32 is_decrypt : 1;
+	u32 is_pppoe : 1;
+	u32 resv3 : 2;
 	u32 magic_tag_protect : 16;
 } __packed;
 #elif defined(CONFIG_MEDIATEK_NETSYS_RX_V2)
@@ -91,6 +96,33 @@ struct hnat_desc {
 #define FOE_INFO_LEN (10 + WIFI_INFO_LEN)
 #define IS_SPACE_AVAILABLE_HEAD(skb)                                           \
 	((((skb_headroom(skb) >= FOE_INFO_LEN) ? 1 : 0)))
+
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+static_assert(sizeof(struct hnat_desc) == sizeof(struct mtk_tnl_desc));
+#define skb_hnat_tops(skb) (((struct hnat_desc *)((skb)->head))->tops)
+#define skb_hnat_is_decap(skb) (((struct hnat_desc *)((skb)->head))->is_decap)
+#define skb_hnat_is_encap(skb) (!skb_hnat_is_decap(skb))
+#define skb_hnat_cdrt(skb) (((struct hnat_desc *)((skb)->head))->cdrt)
+#define skb_hnat_is_decrypt(skb) (((struct hnat_desc *)((skb)->head))->is_decrypt)
+#define skb_hnat_is_encrypt(skb) (!skb_hnat_is_decrypt(skb))
+#define skb_hnat_is_pppoe(skb) (((struct hnat_desc *)((skb)->head))->is_pppoe)
+#define skb_hnat_set_tops(skb, value) (skb_hnat_tops(skb) = (value))
+#define skb_hnat_set_is_decap(skb, value) (skb_hnat_is_decap(skb) = (value))
+#define skb_hnat_set_cdrt(skb, value) (skb_hnat_cdrt(skb) = (value))
+#define skb_hnat_set_is_decrypt(skb, value) (skb_hnat_is_decrypt(skb) = (value))
+#define skb_hnat_set_is_pppoe(skb, value) (skb_hnat_is_pppoe(skb) = (value))
+#endif
+
+static inline void hnat_tunnel_metadata_init(struct sk_buff *skb)
+{
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	skb_hnat_tops(skb) = 0;
+	skb_hnat_is_decap(skb) = 0;
+	skb_hnat_cdrt(skb) = 0;
+	skb_hnat_is_decrypt(skb) = 0;
+	skb_hnat_is_pppoe(skb) = 0;
+#endif
+}
 
 #define skb_hnat_info(skb) ((struct hnat_desc *)(skb->head))
 #define skb_hnat_magic(skb) (((struct hnat_desc *)(skb->head))->magic)

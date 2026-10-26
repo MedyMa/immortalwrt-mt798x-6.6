@@ -1,0 +1,124 @@
+Subject: [PATCH] net: mediatek: route TOPS decapsulation with synchronized callbacks
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -52,6 +52,52 @@
+ #define MTK_ETHTOOL_XDP_STAT(x) { #x, \
+ 				  offsetof(struct mtk_hw_stats, xdp_stats.x) / \
+ 				  sizeof(u64) }
++
++/* Published only after the TOPS backend is ready.  Never call module text
++ * through a check-then-call raw pointer during backend removal.
++ */
++static DEFINE_MUTEX(mtk_tnl_rx_lock);
++static const struct mtk_tnl_rx_ops __rcu *mtk_tnl_rx_ops;
++
++int mtk_tnl_rx_register(const struct mtk_tnl_rx_ops *ops)
++{
++	int ret = 0;
++
++	if (!ops || !ops->get_dev)
++		return -EINVAL;
++	mutex_lock(&mtk_tnl_rx_lock);
++	if (rcu_access_pointer(mtk_tnl_rx_ops))
++		ret = -EBUSY;
++	else
++		rcu_assign_pointer(mtk_tnl_rx_ops, ops);
++	mutex_unlock(&mtk_tnl_rx_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_tnl_rx_register);
++
++void mtk_tnl_rx_unregister(const struct mtk_tnl_rx_ops *ops)
++{
++	mutex_lock(&mtk_tnl_rx_lock);
++	if (rcu_access_pointer(mtk_tnl_rx_ops) == ops) {
++		RCU_INIT_POINTER(mtk_tnl_rx_ops, NULL);
++		synchronize_net();
++	}
++	mutex_unlock(&mtk_tnl_rx_lock);
++}
++EXPORT_SYMBOL_GPL(mtk_tnl_rx_unregister);
++
++static struct net_device *mtk_tnl_rx_dev_get(u8 reason)
++{
++	const struct mtk_tnl_rx_ops *ops;
++	struct net_device *dev = NULL;
++
++	rcu_read_lock_bh();
++	ops = rcu_dereference_bh(mtk_tnl_rx_ops);
++	if (ops)
++		dev = ops->get_dev(reason);
++	rcu_read_unlock_bh();
++	return dev;
++}
+ 
+ static const struct mtk_reg_map mtk_reg_map = {
+ 	.tx_irq_mask		= 0x1a1c,
+@@ -2462,6 +2508,8 @@
+ 		u32 hash, reason;
+ 		int mac = 0;
+ 		bool sent_ppd = false;
++		struct net_device *tnl_dev = NULL;
++		u8 tops_reason;
+ 
+ 		idx = NEXT_DESP_IDX(ring->calc_idx, ring->dma_size);
+ 		rxd = ring->dma + idx * eth->soc->rx.desc_size;
+@@ -2589,6 +2637,23 @@
+ 			skb_put(skb, pktlen);
+ 		}
+ 
++		/* Preserve the physical RX buffer/XDP handling; select the tunnel only
++		 * once a valid skb exists. Unknown/deleted tunnel IDs must not deliver
++		 * an already decapsulated frame to an unrelated physical interface.
++		 */
++		tops_reason = mtk_is_netsys_v3_or_greater(eth) ? trxd.rxd6 >> 24 : 0;
++		if (tops_reason >= MTK_TOPS_RX_TUNNEL_FIRST &&
++		    tops_reason <= MTK_TOPS_RX_TUNNEL_LAST) {
++			tnl_dev = mtk_tnl_rx_dev_get(tops_reason);
++			if (!tnl_dev || !netif_running(tnl_dev)) {
++				if (tnl_dev)
++					dev_put(tnl_dev);
++				dev_kfree_skb_any(skb);
++				goto skip_rx;
++			}
++			netdev = tnl_dev;
++			sent_ppd = false;
++		}
+ 		skb->dev = netdev;
+ 		bytes += skb->len;
+ 		
+@@ -2634,6 +2699,16 @@
+ 
+ 		skb_hnat_alg(skb) = 0;
+ 		skb_hnat_filled(skb) = 0;
++#if defined(CONFIG_MEDIATEK_NETSYS_V3)
++		/* These bits were reserved in the old ABI. RX buffer reuse must not
++		 * manufacture tunnel/encryption metadata from a previous packet.
++		 */
++		skb_hnat_tops(skb) = 0;
++		skb_hnat_is_decap(skb) = !!tnl_dev;
++		skb_hnat_cdrt(skb) = 0;
++		skb_hnat_is_decrypt(skb) = 0;
++		skb_hnat_is_pppoe(skb) = 0;
++#endif
+ 		skb_hnat_magic_tag(skb) = HNAT_MAGIC_TAG;
+ 		
+ 	
+@@ -2665,7 +2740,15 @@
+ 			skb->mark = 0x78681415;
+ 		}
+ 		skb_record_rx_queue(skb, 0);
+-		napi_gro_receive(napi, skb);
++		if (tnl_dev) {
++			/* Do not leave a virtual netdev in this physical device's GRO
++			 * cache after releasing its lifetime reference.
++			 */
++			netif_receive_skb(skb);
++			dev_put(tnl_dev);
++		} else {
++			napi_gro_receive(napi, skb);
++		}
+ 
+ skip_rx:
+ 		ring->data[idx] = new_data;
