@@ -1,0 +1,32 @@
+Subject: [PATCH] hwifi: bypass firmware RRO on BPI-R4 BE14 dual PCIe
+
+The BPI-R4 MT7990 option 2 RX path loses upload throughput with ordinary
+firmware RRO. Native rro_bypass=1 (ALL_BYPASS=3) restores upload while
+matching payload-sized PPE BIND counters remain active. Select that same
+firmware mode at initialization for this board/layout only. This is a
+measured workaround, not a claimed repair of the firmware reorder engine.
+
+--- a/wlan_hwifi/chips/mt7990/mt7990.c
++++ b/wlan_hwifi/chips/mt7990/mt7990.c
+@@ -31,6 +31,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/firmware.h>
++#include <linux/of.h>
+ #include "mt7990.h"
+ #include "mac_if.h"
+ #include "core.h"
+@@ -583,6 +584,13 @@
+ 		hw_dev->txfreedone_path = chip_desc->rro_disable_txfreedone_path;
+ 	} else {
+ 		hw_dev->rro_bypass_type = chip_desc->rro_bypass_type;
++		/* Standard BPI-R4 with the BE14 dual-PCIe 6/2+5 layout loses
++		 * upload throughput in the firmware RRO path. Use the native
++		 * RX bypass while retaining WED/PPE forwarding and queue setup.
++		 */
++		if (hw_dev->chip_opt == 2 &&
++		    of_machine_is_compatible("bananapi,bpi-r4"))
++			hw_dev->rro_bypass_type = ALL_BYPASS;
+ 		hw_dev->mld_dest_type = chip_desc->mld_dest_type;
+ 		hw_dev->txfreedone_path = chip_desc->txfreedone_path;
+ 		set_bit(HWIFI_FLAG_IN_CHIP_RRO, &hw_dev->flags);
