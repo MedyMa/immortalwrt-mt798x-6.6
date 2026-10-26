@@ -187,9 +187,11 @@ int mtk_pce_dipfilter_entry_del(struct dip_desc *ddesc)
 	if (!dip_entry)
 		goto unlock;
 
-	if (!refcount_dec_and_test(&dip_entry->refcnt))
-		/* dipfilter descriptor is still in use */
+	if (refcount_read(&dip_entry->refcnt) > 1) {
+		/* Shared descriptor: release only this owner's reference. */
+		refcount_dec(&dip_entry->refcnt);
 		goto unlock;
+	}
 
 	mtk_pce_fe_mem_msg_config(&fmsg, FE_MEM_CMD_WRITE, FE_MEM_TYPE_DIPFILTER,
 				  dip_entry->index);
@@ -201,6 +203,11 @@ int mtk_pce_dipfilter_entry_del(struct dip_desc *ddesc)
 		goto unlock;
 	}
 
+	/* Keep the final reference until the hardware write succeeds so that
+	 * an error can be retried without decrementing an already zero count.
+	 * All entry/refcount access is serialized by dip_hw.lock.
+	 */
+	refcount_set(&dip_entry->refcnt, 0);
 	memset(&dip_entry->ddesc, 0, sizeof(struct dip_desc));
 	clear_bit(dip_entry->index, dip_hw.dip_tbl);
 

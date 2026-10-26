@@ -842,6 +842,11 @@ static int mtk_npu_tnl_sync_param_delete(bool skip_pce,
 				 ret);
 			return ret;
 		}
+		/* This tunnel no longer owns a DIP-filter reference, even if the
+		 * following firmware deletion fails. A retry must not release a
+		 * second reference belonging to another tunnel with the same DIP.
+		 */
+		tnl_info->pce_ready = false;
 	}
 
 	memcpy(&tnl_params, &tnl_info->tnl_params, sizeof(struct npu_tnl_params));

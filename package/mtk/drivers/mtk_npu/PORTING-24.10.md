@@ -1,8 +1,10 @@
 # MT7988 TOPS/NPU port to ImmortalWrt 24.10
 
-Development candidate on `mt7988-npu-tops-24.10`, base
-`5efd97189fbf0b81b644f654e7fae0fedb237299`. This source submission has not
-been flashed or hardware verified. Current official firmware/API inputs are pinned below.
+Port developed on `mt7988-npu-tops-24.10`, base
+`5efd97189fbf0b81b644f654e7fae0fedb237299`, published at `93979d14`.
+Firmware readiness and isolated software fallback were checked on BPI-R4 on
+2026-10-26. End-to-end hardware tunnel forwarding remains unverified.
+Current official firmware/API inputs are pinned below.
 The existing source/build branches, MTK/WiFi versions, BE14 software shadow,
 owner accounting, two CPU/WiFi functional patches and 8192 MiB setting remain.
 Only standard BPI-R4 receives the new board include; no Pro/25.12 build.
@@ -245,3 +247,35 @@ Before production activation, verify firmware boot, actual bidirectional
 packets, down/recreate/reload, unsupported-format fallback and byte deltas
 against a single authoritative transfer. Compilation and a software synced
 entry alone cannot prove that the hardware forwarded or accounted traffic.
+
+## Device checks and deletion retry fixes (2026-10-26)
+
+On the published `93979d14` firmware, the NPU MCU is alive, firmware is ready,
+and all three selected tunnel types are registered. No configured, active
+tunnel peer is available for a hardware test. An empty tunnel table therefore
+does not establish an offload failure or success. GRETAP and VXLAN each passed
+three 1400-byte pings in both directions between isolated network namespaces
+on the device. These use veth/software paths outside the init_net backend;
+they created no TOPS table entry. Test namespaces were removed afterward.
+L2TPv2/PPP and physical-port hardware tunnel traffic have not been tested.
+Bridge outer egress remains unsupported; an ordinary br-wan configuration
+must not be advertised as a verified TOPS underlay.
+
+Fault injection into the actual deletion functions exposed two retry bugs:
+
+* PCE decremented the last DIP-filter reference before writing the deletion
+  to hardware. A failed write left a live software entry with a zero count.
+  Retain that final reference until a successful write; shared-reference
+  deletion still only releases one reference under the existing lock.
+* TOPS retained `pce_ready` after releasing its DIP-filter reference. If the
+  subsequent firmware deletion failed, a retry could release a second
+  reference owned by another tunnel sharing that destination. Clear ownership
+  immediately after successful DIP-filter teardown, before firmware deletion.
+
+`tests/test-delete-retry.py` covers repeated PCE write failures, mailbox/pause/
+invalidate failures, shared destinations, successful retries and final cleanup.
+It runs source functions with MMIO/mailbox/lock services modeled, under ASan/
+UBSan. It is not a hardware fault-injection or packet-forwarding test.
+For a reproducible failing baseline, pass
+`--revision 93979d14b32cc4b524c35b4d6288285a714a4d2c`; omit it for the worktree.
+Both forms require `--output <external-directory>`.
