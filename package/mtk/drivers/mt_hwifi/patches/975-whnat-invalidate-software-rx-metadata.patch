@@ -1,0 +1,36 @@
+--- a/mt_wifi/os/linux/mt_data.c
++++ b/mt_wifi/os/linux/mt_data.c
+@@ -504,6 +504,11 @@
+ 				if (RTMP_GET_PACKET_TYPE(pRxPkt)
+ 						== RX_PPE_VALID)
+ 					ra_sw_nat_hook_rx(pRxPkt);
++#ifdef WHNAT_SUPPORT
++				else
++					/* Recycled software RX buffers carry no PPE metadata. */
++					RtmpOsPktNatMagicTagInvalid(pRxPkt);
++#endif
+ 				RtmpOsPktRcvHandle(pRxPkt, napi);
+ 			}
+ 
+--- a/mt_wifi/os/linux/rt_linux.c
++++ b/mt_wifi/os/linux/rt_linux.c
+@@ -2715,7 +2715,8 @@
+ {
+ 	struct sk_buff *pRxPkt = RTPKT_TO_OSPKT(pNetPkt);
+ 
+-	FOE_MAGIC_TAG(pRxPkt) = FOE_MAGIC_WLAN;
++	if (IS_SPACE_AVAILABLE_HEAD(pRxPkt))
++		FOE_MAGIC_TAG(pRxPkt) = FOE_MAGIC_WLAN;
+ }
+ #endif /*CONFIG_FAST_NAT_SUPPORT*/
+ 
+@@ -2724,7 +2725,8 @@
+ {
+ 	struct sk_buff *pRxPkt = RTPKT_TO_OSPKT(pNetPkt);
+ 
+-	FOE_TAG_PROTECT(pRxPkt) = 0;
++	if (IS_SPACE_AVAILABLE_HEAD(pRxPkt))
++		FOE_TAG_PROTECT(pRxPkt) = 0;
+ }
+ #endif
+ /*

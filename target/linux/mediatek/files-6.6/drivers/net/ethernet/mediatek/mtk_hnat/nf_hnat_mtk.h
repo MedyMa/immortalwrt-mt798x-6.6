@@ -135,7 +135,9 @@ struct hnat_desc {
 #define clr_from_extge(skb) (HNAT_SKB_CB2(skb)->magic = 0x0)
 #define set_to_ppe(skb) (HNAT_SKB_CB2(skb)->magic = 0x78681415)
 #define is_from_extge(skb) (HNAT_SKB_CB2(skb)->magic == 0x78786688)
-#define is_magic_tag_valid(skb) (skb_hnat_magic_tag(skb) == HNAT_MAGIC_TAG)
+/* Packet bytes are not private metadata when the headroom is too short. */
+#define is_magic_tag_valid(skb) \
+	(IS_SPACE_AVAILABLE_HEAD(skb) && skb_hnat_magic_tag(skb) == HNAT_MAGIC_TAG)
 #define set_from_mape(skb) (HNAT_SKB_CB2(skb)->magic = 0x78787788)
 #define is_from_mape(skb) (HNAT_SKB_CB2(skb)->magic == 0x78787788)
 #define is_unreserved_port(hdr)						       \

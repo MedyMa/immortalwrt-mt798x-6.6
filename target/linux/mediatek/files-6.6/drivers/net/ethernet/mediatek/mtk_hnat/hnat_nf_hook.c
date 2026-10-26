@@ -1124,7 +1124,8 @@ mtk_hnat_nf_conntrack(void *priv, struct sk_buff *skb,
 	if (!skb)
 		goto drop;
 	
-	if (unlikely(skb_hnat_reason(skb) == HIT_BIND_KEEPALIVE_DUP_OLD_HDR))
+	if (IS_SPACE_AVAILABLE_HEAD(skb) && is_magic_tag_valid(skb) &&
+	    unlikely(skb_hnat_reason(skb) == HIT_BIND_KEEPALIVE_DUP_OLD_HDR))
 		{
 		if (hnat_priv->data->per_flow_accounting && hnat_priv->nf_stat_en)
 			mtk_hnat_nf_update(skb);}
@@ -3065,7 +3066,10 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 
 int mtk_sw_nat_hook_rx(struct sk_buff *skb)
 {
-	if (!IS_SPACE_AVAILABLE_HEAD(skb) || !FROM_WED(skb)) {
+	/* Private metadata must never overwrite packet bytes on a short skb. */
+	if (!IS_SPACE_AVAILABLE_HEAD(skb))
+		return NF_ACCEPT;
+	if (!FROM_WED(skb)) {
 		skb_hnat_magic_tag(skb) = 0;
 		return NF_ACCEPT;
 	}
