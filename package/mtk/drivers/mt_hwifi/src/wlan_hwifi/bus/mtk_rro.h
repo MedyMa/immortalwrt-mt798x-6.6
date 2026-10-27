@@ -231,6 +231,7 @@ struct hw_rro_dbg {
 	u32 msdu_cnt[MAX_MSDU_CNT_ARR_SIZE];
 	u32 sign_ok_cnt;
 	u32 sign_fail_cnt;
+	u32 rxdmad_reason_cnt[IND_REASON_MAX];
 };
 
 struct hw_rro_cfg {

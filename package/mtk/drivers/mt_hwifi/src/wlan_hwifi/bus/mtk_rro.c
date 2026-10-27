@@ -872,6 +872,10 @@ rroinfo_debugfs(struct seq_file *s, void *data)
 	seq_printf(s, "max_msdu_num: %u\n", rro_dbg->max_msdu_num);
 	seq_printf(s, "max_pg_num: %u\n", rro_dbg->max_pg_num);
 
+	for (i = 0; i < IND_REASON_MAX; i++)
+		seq_printf(s, "rxdmad_reason_%02d: %u\n", i,
+			rro_dbg->rxdmad_reason_cnt[i]);
+
 	for (i = 0; i < MAX_MSDU_CNT_ARR_SIZE; i++) {
 		seq_printf(s, "msdu%02d_cnt = 0x%8x", i + 1, rro_dbg->msdu_cnt[i]);
 

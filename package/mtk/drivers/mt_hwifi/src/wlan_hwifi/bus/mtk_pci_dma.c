@@ -1336,6 +1336,22 @@ pci_queues_read(void *hw, struct seq_file *s)
 	return 0;
 }
 
+static inline bool
+pci_dma_ind_reason_hw_path_ok(u32 ind_reason)
+{
+	/* Error/flush indications may still reach the software RX checks.
+	 * They are not confirmation that the saved PPE entry is reusable.
+	 */
+	switch (ind_reason) {
+	case IND_REASON_STEP_ONE:
+	case IND_REASON_WITHIN:
+	case IND_REASON_TIMEOUT_STEP_ONE:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int
 pci_dma_rxdmad_parser(struct pci_trans *trans,
 	struct pci_dma_desc *desc, struct mtk_bus_rx_info *rx_info)
@@ -1354,13 +1370,14 @@ pci_dma_rxdmad_parser(struct pci_trans *trans,
 	rx_info->more = !GET_FIELD(RXDMAD_LS0, dw1);
 	rx_info->ip_frag = GET_FIELD(RXDMAD_F, dw3);
 
-	if (dw3 & RXDMAD_PPE_VLD_MASK) {
-		rx_info->ppe_entry = GET_FIELD(RXDMAD_PPE_ENTRY, dw3);
-		rx_info->csrn = GET_FIELD(RXDMAD_CSRN, dw3);
-
-		if (GET_FIELD(RXDMAD_IND_REASON, dw2) != IND_REASON_CANNOT_DO_REORDER)
-			rx_info->hw_path = true;
-	}
+	/* Keep this descriptor's authority independent of a reused RX context. */
+	rx_info->hw_path = false;
+	rx_info->ppe_entry = 0;
+	rx_info->csrn = 0;
+	rx_info->pn_chk_fail = false;
+	rx_info->repeat_pkt = 0;
+	rx_info->old_pkt = 0;
+	rx_info->drop = RXDMAD_NON_DROP;
 
 	if (dw1 & RXDMAD_VER_MASK) {
 		if (GET_FIELD(RXDMAD_PN_CHK_FAIL, dw1) ||
@@ -1377,6 +1394,22 @@ pci_dma_rxdmad_parser(struct pci_trans *trans,
 				RXDMAD_VER_ZREO_DROP : RXDMAD_NON_DROP;
 	}
 
+	if (dw3 & RXDMAD_PPE_VLD_MASK) {
+		u32 ind_reason = GET_FIELD(RXDMAD_IND_REASON, dw2);
+
+		rx_info->ppe_entry = GET_FIELD(RXDMAD_PPE_ENTRY, dw3);
+		rx_info->csrn = GET_FIELD(RXDMAD_CSRN, dw3);
+		rx_info->hw_path = pci_dma_ind_reason_hw_path_ok(ind_reason) &&
+				   !rx_info->pn_chk_fail && !rx_info->drop;
+
+#ifdef CONFIG_HWIFI_DBG
+		if (trans->rro_cfg && ind_reason < IND_REASON_MAX) {
+			struct hw_rro_cfg *rro_cfg = trans->rro_cfg;
+
+			rro_cfg->rro_dbg.rxdmad_reason_cnt[ind_reason]++;
+		}
+#endif
+	}
 
 	mtk_dbg(MTK_BUS, "%s: rxdmad_version = %d\n", __func__,
 						GET_FIELD(RXDMAD_VER, dw1));
