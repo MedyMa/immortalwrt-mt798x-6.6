@@ -1,0 +1,240 @@
+Subject: [PATCH] net: sfp: bound startup recovery and drain work before releasing resources
+
+Disarm the converter watchdog on admin down and after a stable link,
+retain startup recovery across short link pulses, and restrict reprobe
+to an active present module waiting for signal. Stop every producer
+before draining poll/reprobe/timeout work on probe failure, remove and
+shutdown. Request optional cage power before probing, including an empty
+cage, so later hotplug does not depend on warm-boot recovery.
+
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -257,9 +257,11 @@
+ 	int (*write)(struct sfp *, bool, u8, void *, size_t);
+ 
+ 	struct gpio_desc *gpio[GPIO_MAX];
++	struct gpio_desc *power_gpio;
+ 	int gpio_irq[GPIO_MAX];
+ 
+ 	bool need_poll;
++	bool stopping;
+ 
+ 	/* Access rules:
+ 	 * state_hw_drive: st_mutex held
+@@ -966,7 +968,7 @@
+ 			       mask;
+ 
+ 	if (sfp->state_soft_mask & (SFP_F_LOS | SFP_F_TX_FAULT) &&
+-	    !sfp->need_poll)
++	    !sfp->need_poll && !READ_ONCE(sfp->stopping))
+ 		mod_delayed_work(system_wq, &sfp->poll, poll_jiffies);
+ 	mutex_unlock(&sfp->st_mutex);
+ }
+@@ -2003,7 +2005,7 @@
+ /* SFP state machine */
+ static void sfp_sm_set_timer(struct sfp *sfp, unsigned int timeout)
+ {
+-	if (timeout)
++	if (timeout && !READ_ONCE(sfp->stopping))
+ 		mod_delayed_work(system_power_efficient_wq, &sfp->timeout,
+ 				 timeout);
+ 	else
+@@ -2828,7 +2830,8 @@
+ 		/* Force a poll to re-read the hardware signal state after
+ 		 * sfp_sm_mod_probe() changed state_hw_mask.
+ 		 */
+-		mod_delayed_work(system_wq, &sfp->poll, 1);
++		if (!READ_ONCE(sfp->stopping))
++			mod_delayed_work(system_wq, &sfp->poll, 1);
+ 
+ 		err = sfp_hwmon_insert(sfp);
+ 		if (err)
+@@ -2893,6 +2896,11 @@
+ 	int ret;
+ 
+ 	/* Some events are global */
++	if (sfp->sm_mod_state != SFP_MOD_PRESENT ||
++	    sfp->sm_dev_state != SFP_DEV_UP) {
++		sfp->sm_reprobe_enabled = false;
++		cancel_delayed_work(&sfp->reprobe);
++	}
+ 	if (sfp->sm_state != SFP_S_DOWN &&
+ 	    (sfp->sm_mod_state != SFP_MOD_PRESENT ||
+ 	     sfp->sm_dev_state != SFP_DEV_UP)) {
+@@ -3017,7 +3025,8 @@
+ 		 *
+ 		 * (padavanonly 999-2764 precedes us here: ret==ENODEV||EINVAL)
+ 		 */
+-		if (sfp->sm_reprobe_enabled && sfp->sm_reprobe_tries)
++		if (!sfp->stopping && sfp->sm_reprobe_enabled &&
++		    sfp->sm_reprobe_tries)
+ 			mod_delayed_work(system_wq, &sfp->reprobe, T_LINK_FAIL);
+ 		sfp_sm_link_check_los(sfp);
+ 
+@@ -3045,12 +3054,18 @@
+ 			 * happy with the selected interface, stop the watchdog.
+ 			 */
+ 			cancel_delayed_work(&sfp->reprobe);
++			sfp->sm_reprobe_enabled = false;
+ 		} else if (event == SFP_E_TX_FAULT) {
+ 			sfp_sm_link_down(sfp);
+ 			sfp_sm_fault(sfp, SFP_S_TX_FAULT, true);
+ 		} else if (sfp_los_event_active(sfp, event)) {
+ 			sfp_sm_link_down(sfp);
+ 			sfp_sm_next(sfp, SFP_S_WAIT_LOS, 0);
++			/* A short link pulse must not disarm startup recovery. */
++			if (!sfp->stopping && sfp->sm_reprobe_enabled &&
++			    sfp->sm_reprobe_tries)
++				mod_delayed_work(system_wq, &sfp->reprobe,
++						 T_LINK_FAIL);
+ 		}
+ 		break;
+ 
+@@ -3229,7 +3244,8 @@
+ 	struct sfp *sfp = container_of(work, struct sfp, timeout.work);
+ 
+ 	rtnl_lock();
+-	sfp_sm_event(sfp, SFP_E_TIMEOUT);
++	if (!sfp->stopping)
++		sfp_sm_event(sfp, SFP_E_TIMEOUT);
+ 	rtnl_unlock();
+ }
+ 
+@@ -3238,6 +3254,10 @@
+ 	unsigned int state, i, changed;
+ 
+ 	rtnl_lock();
++	if (sfp->stopping) {
++		rtnl_unlock();
++		return;
++	}
+ 	mutex_lock(&sfp->st_mutex);
+ 	state = sfp_get_state(sfp);
+ 	changed = state ^ sfp->state;
+@@ -3285,8 +3305,9 @@
+ 
+ 	// st_mutex doesn't need to be held here for state_soft_mask,
+ 	// it's unimportant if we race while reading this.
+-	if (sfp->state_soft_mask & (SFP_F_LOS | SFP_F_TX_FAULT) ||
+-	    sfp->need_poll)
++	if (!READ_ONCE(sfp->stopping) &&
++	    (sfp->state_soft_mask & (SFP_F_LOS | SFP_F_TX_FAULT) ||
++	     sfp->need_poll))
+ 		mod_delayed_work(system_wq, &sfp->poll, poll_jiffies);
+ }
+ 
+@@ -3297,9 +3318,13 @@
+ 	rtnl_lock();
+ 	mutex_lock(&sfp->sm_mutex);
+ 
+-	if (!sfp->sm_reprobe_enabled || !sfp->sm_reprobe_tries ||
++	if (sfp->stopping || !sfp->sm_reprobe_enabled ||
++	    !sfp->sm_reprobe_tries ||
++	    sfp->sm_mod_state != SFP_MOD_PRESENT ||
++	    sfp->sm_dev_state != SFP_DEV_UP ||
+ 	    !(sfp->state & SFP_F_PRESENT) ||
+-	    sfp->sm_state == SFP_S_LINK_UP)
++	    sfp->sm_state != SFP_S_WAIT_LOS ||
++	    sfp->state & (SFP_F_TX_DISABLE | SFP_F_TX_FAULT))
+ 		goto unlock;
+ 
+ 	--sfp->sm_reprobe_tries;
+@@ -3342,15 +3367,32 @@
+ 	return sfp;
+ }
+ 
+-static void sfp_cleanup(void *data)
++/* Stop producers before draining work, without waiting while RTNL or the
++ * state-machine mutex is held. Register this after the GPIO resources so
++ * probe failure also drains every worker before devres releases those pins.
++ */
++static void sfp_stop_works(void *data)
+ {
+ 	struct sfp *sfp = data;
+ 
+-	sfp_hwmon_exit(sfp);
++	rtnl_lock();
++	mutex_lock(&sfp->sm_mutex);
++	WRITE_ONCE(sfp->stopping, true);
++	sfp->sm_reprobe_enabled = false;
++	mutex_unlock(&sfp->sm_mutex);
++	rtnl_unlock();
+ 
+ 	cancel_delayed_work_sync(&sfp->poll);
+ 	cancel_delayed_work_sync(&sfp->reprobe);
+ 	cancel_delayed_work_sync(&sfp->timeout);
++}
++
++static void sfp_cleanup(void *data)
++{
++	struct sfp *sfp = data;
++
++	sfp_stop_works(sfp);
++	sfp_hwmon_exit(sfp);
+ 	if (sfp->i2c_mii) {
+ 		mdiobus_unregister(sfp->i2c_mii);
+ 		mdiobus_free(sfp->i2c_mii);
+@@ -3457,7 +3499,7 @@
+ 
+ static int sfp_warm_boot_recover(struct sfp *sfp)
+ {
+-	struct gpio_desc *power;
++	struct gpio_desc *power = sfp->power_gpio;
+ 	int recover_ret, retry, ret;
+ 
+ 	if (!(sfp->state & SFP_F_PRESENT))
+@@ -3466,16 +3508,6 @@
+ 	ret = sfp_warm_boot_wait_for_eeprom(sfp);
+ 	if (!ret)
+ 		return 0;
+-
+-	power = devm_gpiod_get_optional(sfp->dev, "power", GPIOD_OUT_HIGH);
+-	if (IS_ERR(power)) {
+-		ret = PTR_ERR(power);
+-		if (ret == -EPROBE_DEFER)
+-			return ret;
+-		dev_warn(sfp->dev,
+-			 "warm boot: power GPIO unavailable: %d\n", ret);
+-		power = NULL;
+-	}
+ 
+ 	dev_warn(sfp->dev,
+ 		 "warm boot: EEPROM unavailable after passive readiness; attempting recovery\n");
+@@ -3567,6 +3599,18 @@
+ 			if (IS_ERR(sfp->gpio[i]))
+ 				return PTR_ERR(sfp->gpio[i]);
+ 		}
++
++	/* Power the cage even when it is empty at probe; a later hotplug must
++	 * not depend on the warm-boot recovery path requesting this GPIO.
++	 */
++	sfp->power_gpio = devm_gpiod_get_optional(sfp->dev, "power",
++						 GPIOD_OUT_HIGH);
++	if (IS_ERR(sfp->power_gpio))
++		return PTR_ERR(sfp->power_gpio);
++
++	err = devm_add_action_or_reset(sfp->dev, sfp_stop_works, sfp);
++	if (err)
++		return err;
+ 
+ 	sfp->state_hw_mask = SFP_F_PRESENT;
+ 	sfp->state_hw_drive = SFP_F_TX_DISABLE;
+@@ -3671,6 +3715,7 @@
+ 	struct sfp *sfp = platform_get_drvdata(pdev);
+ 
+ 	sfp_debugfs_exit(sfp);
++	sfp_stop_works(sfp);
+ 	sfp_unregister_socket(sfp->sfp_bus);
+ 
+ 	rtnl_lock();
+@@ -3692,9 +3737,7 @@
+ 		devm_free_irq(sfp->dev, sfp->gpio_irq[i], sfp);
+ 	}
+ 
+-	cancel_delayed_work_sync(&sfp->poll);
+-	cancel_delayed_work_sync(&sfp->reprobe);
+-	cancel_delayed_work_sync(&sfp->timeout);
++	sfp_stop_works(sfp);
+ }
+ 
+ static struct platform_driver sfp_driver = {

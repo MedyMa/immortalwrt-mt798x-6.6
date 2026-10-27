@@ -1,0 +1,17 @@
+Subject: [PATCH] net: mdio: i2c: keep short RollBall transfers as transport errors
+
+A short unlock transfer is not proof that a module lacks a RollBall
+bridge. Return EIO, retaining the existing explicit NACK and completed
+probe fallback policy for supported media converters.
+
+--- a/drivers/net/mdio/mdio-i2c.c
++++ b/drivers/net/mdio/mdio-i2c.c
+@@ -423,7 +423,7 @@
+ 		return ret;
+ 	}
+ 	if (ret != 1)
+-		return -ENODEV;
++		return -EIO;
+ 
+ 	return i2c_mii_probe_rollball(i2c);
+ }

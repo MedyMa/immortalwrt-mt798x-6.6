@@ -1,0 +1,147 @@
+Subject: [PATCH] net: phy: aquantia: preserve control state on errors and separate SFP MIB nodes
+
+Check protocol setup transactions and propagate failures instead of
+truncating MDIO errors into syscfg words. Restore the saved global
+control word on every programming exit. Still run regular AN setup
+for interfaces without a protocol override. Check non-SFP POR reset
+errors; preserve module-controlled SFP provisioning. Serialize MIB
+root creation and use the full MDIO device name to distinguish two
+SFP buses with the same PHY address.
+
+--- a/drivers/net/phy/aquantia/aquantia_main.c
++++ b/drivers/net/phy/aquantia/aquantia_main.c
+@@ -281,34 +281,56 @@
+ static int aqr_config_aneg_set_prot(struct phy_device *phydev)
+ {
+ 	int if_type = phydev->interface;
+-	int i;
+-
++	int i, ret, restore_ret, saved_sc, val;
++
++	if (if_type < 0 || if_type >= ARRAY_SIZE(aquantia_syscfg))
++		return -EINVAL;
+ 	if (!aquantia_syscfg[if_type].cnt)
+-		return 0;
++		return aqr_config_aneg(phydev);
+ 
+ 	/* set PHY in low power mode so we can configure protocols */
+-	phy_write_mmd(phydev, MDIO_MMD_VEND1, AQUANTIA_VND1_GLOBAL_SC,
+-		      AQUANTIA_VND1_GLOBAL_SC_LP);
++	saved_sc = phy_read_mmd(phydev, MDIO_MMD_VEND1,
++				AQUANTIA_VND1_GLOBAL_SC);
++	if (saved_sc < 0)
++		return saved_sc;
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, AQUANTIA_VND1_GLOBAL_SC,
++			    saved_sc | AQUANTIA_VND1_GLOBAL_SC_LP);
++	if (ret)
++		goto restore;
+ 	mdelay(10);
+ 
+ 	/* set the default rate to enable the SI link */
+-	phy_write_mmd(phydev, MDIO_MMD_VEND1, AQUANTIA_VND1_GSTART_RATE,
+-		      aquantia_syscfg[if_type].start_rate);
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, AQUANTIA_VND1_GSTART_RATE,
++			    aquantia_syscfg[if_type].start_rate);
++	if (ret)
++		goto restore;
+ 
+ 	for (i = 0; i <= aquantia_syscfg[if_type].cnt; i++) {
+-		u16 reg = phy_read_mmd(phydev, MDIO_MMD_VEND1,
+-				       AQUANTIA_VND1_GSYSCFG_BASE + i);
+-		if (!reg)
++		val = phy_read_mmd(phydev, MDIO_MMD_VEND1,
++				   AQUANTIA_VND1_GSYSCFG_BASE + i);
++		if (val < 0) {
++			ret = val;
++			goto restore;
++		}
++		if (!val)
+ 			continue;
+ 
+-		phy_write_mmd(phydev, MDIO_MMD_VEND1,
+-			      AQUANTIA_VND1_GSYSCFG_BASE + i,
+-			      aquantia_syscfg[if_type].syscfg);
+-	}
+-
+-	/* wake PHY back up */
+-	phy_write_mmd(phydev, MDIO_MMD_VEND1, AQUANTIA_VND1_GLOBAL_SC, 0);
++		ret = phy_write_mmd(phydev, MDIO_MMD_VEND1,
++				    AQUANTIA_VND1_GSYSCFG_BASE + i,
++				    aquantia_syscfg[if_type].syscfg);
++		if (ret)
++			goto restore;
++	}
++
++restore:
++	/* Restore the caller's control bits even when programming failed. */
++	restore_ret = phy_write_mmd(phydev, MDIO_MMD_VEND1,
++				    AQUANTIA_VND1_GLOBAL_SC, saved_sc);
++	if (!ret)
++		ret = restore_ret;
+ 	mdelay(10);
++	if (ret)
++		return ret;
+ 
+ 	return aqr_config_aneg(phydev);
+ }
+@@ -860,8 +882,11 @@
+ 		return ret;
+ 
+ 	/* Preserve provisioning managed by the SFP module controller. */
+-	if (!phydev->is_on_sfp_module)
+-		aqr107_phy_reset(phydev);
++	if (!phydev->is_on_sfp_module) {
++		ret = aqr107_phy_reset(phydev);
++		if (ret)
++			return ret;
++	}
+ 
+ 	ret = aqr_mib_probe(phydev);
+ 	if (ret)
+--- a/drivers/net/phy/aquantia/aquantia_mib.c
++++ b/drivers/net/phy/aquantia/aquantia_mib.c
+@@ -7,8 +7,11 @@
+ #include <linux/debugfs.h>
+ #include <linux/kthread.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ 
+ #include "aquantia.h"
++
++static DEFINE_MUTEX(aqr_mib_debugfs_lock);
+ 
+ #define MDIO_PCS_LS_TX_GOOD_COUNTER		0xc820
+ #define MDIO_PCS_LS_TX_BAD_COUNTER		0xc822
+@@ -156,7 +159,6 @@
+ 	struct aqr107_priv *priv = phydev->priv;
+ 	struct task_struct *thread;
+ 	struct dentry *root;
+-	char dirname[6];
+ 	int ret;
+ 
+ 	mutex_init(&priv->mib_lock);
+@@ -174,17 +176,21 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	snprintf(dirname, sizeof(dirname), "phy%d", phydev->mdio.addr);
++	/* Different SFP MDIO buses commonly use the same PHY address. */
++	mutex_lock(&aqr_mib_debugfs_lock);
+ 	root = debugfs_lookup("aquantia", NULL);
+ 	if (!IS_ERR_OR_NULL(root)) {
+-		priv->mib_dentry = debugfs_create_file(dirname, 0444, root,
++		priv->mib_dentry = debugfs_create_file(dev_name(&phydev->mdio.dev),
++						     0444, root,
+ 						     phydev, &fops_mib);
+ 		dput(root);
+ 	} else {
+ 		root = debugfs_create_dir("aquantia", NULL);
+-		priv->mib_dentry = debugfs_create_file(dirname, 0444, root,
++		priv->mib_dentry = debugfs_create_file(dev_name(&phydev->mdio.dev),
++							     0444, root,
+ 							     phydev, &fops_mib);
+ 	}
++	mutex_unlock(&aqr_mib_debugfs_lock);
+ 	/* debugfs is optional, including CONFIG_DEBUG_FS=n. */
+ 	wake_up_process(thread);
+ 	return 0;

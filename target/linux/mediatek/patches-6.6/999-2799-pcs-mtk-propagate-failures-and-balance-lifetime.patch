@@ -1,0 +1,778 @@
+Subject: [PATCH] net: pcs: mtk: propagate failures and balance clock, PHY and reset ownership
+
+Retain the selected modes and native register sequences, but track
+requested, enabled and successfully configured states separately. Keep
+carrier down on failed configuration or invalid status; retry no more
+than once a second while enabled. Handle clock/PHY/reset/regmap errors
+and shared reset accounting, and avoid devm double free and phandle
+reference leaks. Honor both individual polarity flags together.
+
+--- a/drivers/net/pcs/pcs-mtk-lynxi.c
++++ b/drivers/net/pcs/pcs-mtk-lynxi.c
+@@ -103,6 +103,9 @@
+ 	u32			flags;
+ 	unsigned long		link_poll_expire;
+ 	unsigned int		neg_mode;
++	bool			configured;
++	bool			enabled;
++	bool			want_enabled;
+ 	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
+ 	struct reset_control	*rstc;
+ 	struct clk		*sgmii_sel;
+@@ -120,6 +123,8 @@
+ 				const unsigned long *advertising,
+ 				bool permit_pause_to_mac);
+ 
++static int mtk_pcs_lynxi_enable(struct phylink_pcs *pcs);
++
+ static struct mtk_pcs_lynxi *pcs_to_mtk_pcs_lynxi(struct phylink_pcs *pcs)
+ {
+ 	return container_of(pcs, struct mtk_pcs_lynxi, pcs);
+@@ -146,18 +151,29 @@
+ 	struct mtk_pcs_lynxi *mpcs = pcs_to_mtk_pcs_lynxi(pcs);
+ 	unsigned int bm, bmsr, adv, rgc3, sgm_mode;
+ 
+-	/* Read the BMSR and LPA */
+-	regmap_read(mpcs->regmap, SGMSYS_PCS_CONTROL_1, &bm);
++	state->link = false;
++	state->an_complete = false;
++	state->speed = SPEED_UNKNOWN;
++	state->duplex = DUPLEX_UNKNOWN;
++	if (!mpcs->want_enabled)
++		return;
++	if (!mpcs->enabled || !mpcs->configured)
++		goto retry;
++
++	if (regmap_read(mpcs->regmap, SGMSYS_PCS_CONTROL_1, &bm))
++		goto read_error;
+ 	bmsr = FIELD_GET(SGMII_BMSR, bm);
+ 
+ 	if (bm & BMCR_ANENABLE) {
+-		regmap_read(mpcs->regmap, SGMSYS_PCS_ADVERTISE, &adv);
++		if (regmap_read(mpcs->regmap, SGMSYS_PCS_ADVERTISE, &adv))
++			goto read_error;
+ 		phylink_mii_c22_pcs_decode_state(state, bmsr, FIELD_GET(SGMII_LPA, adv));
+ 	} else {
+ 		state->link = !!(bmsr & BMSR_LSTATUS);
+ 		state->an_complete = !!(bmsr & BMSR_ANEGCOMPLETE);
+ 
+-		regmap_read(mpcs->regmap, SGMSYS_SGMII_MODE, &sgm_mode);
++		if (regmap_read(mpcs->regmap, SGMSYS_SGMII_MODE, &sgm_mode))
++			goto read_error;
+ 
+ 		switch (sgm_mode & SGMII_SPEED_MASK) {
+ 		case SGMII_SPEED_10:
+@@ -167,42 +183,55 @@
+ 			state->speed = SPEED_100;
+ 			break;
+ 		case SGMII_SPEED_1000:
+-			regmap_read(mpcs->regmap, mpcs->ana_rgc3, &rgc3);
++			if (regmap_read(mpcs->regmap, mpcs->ana_rgc3, &rgc3))
++				goto read_error;
+ 			rgc3 &= SGMII_PHY_SPEED_MASK;
+ 			state->speed = (rgc3 == SGMII_PHY_SPEED_3_125G) ? SPEED_2500 : SPEED_1000;
+ 			break;
+ 		default:
+-			/* Speed field read back a reserved value during mode
+-			 * transition (e.g. XGDM->GDM on warm reboot).  Keep
+-			 * link down so phylink re-polls until speed resolves.
++			/* A reserved speed needs the same bounded recovery as
++			 * a down link, not an early return before that recovery.
+ 			 */
+-			state->link = false;
+-			return;
++			goto read_error;
+ 		}
+-
+-		if (sgm_mode & SGMII_DUPLEX_HALF)
+-			state->duplex = DUPLEX_HALF;
+-		else
+-			state->duplex = DUPLEX_FULL;
+-	}
+-
+-	/* Continuously repeat re-configuration sequence until link comes up */
+-	if (!state->link && time_after(jiffies, mpcs->link_poll_expire)) {
++		state->duplex = sgm_mode & SGMII_DUPLEX_HALF ? DUPLEX_HALF : DUPLEX_FULL;
++	}
++	goto retry;
++
++read_error:
++	state->link = false;
++	state->an_complete = false;
++	state->speed = SPEED_UNKNOWN;
++	state->duplex = DUPLEX_UNKNOWN;
++	mpcs->configured = false;
++retry:
++	if (!state->link && time_after_eq(jiffies, mpcs->link_poll_expire)) {
+ 		mpcs->link_poll_expire = jiffies + HZ;
+ 		mtk_pcs_lynxi_config(pcs, mpcs->neg_mode,
+ 				     state->interface, mpcs->advertising, false);
+ 	}
+ }
+ 
+-static void mtk_sgmii_reset(struct mtk_pcs_lynxi *mpcs)
+-{
++static int mtk_sgmii_reset(struct mtk_pcs_lynxi *mpcs)
++{
++	int ret;
++
+ 	if (!mpcs->rstc)
+-		return;
+-
+-	reset_control_assert(mpcs->rstc);
++		return 0;
++	ret = reset_control_assert(mpcs->rstc);
++	if (ret) {
++		/* Shared-reset accounting consumes the deassert reference even
++		 * when the controller's assert operation fails.
++		 */
++		reset_control_deassert(mpcs->rstc);
++		return ret;
++	}
+ 	udelay(100);
+-	reset_control_deassert(mpcs->rstc);
++	ret = reset_control_deassert(mpcs->rstc);
++	if (ret)
++		return ret;
+ 	mdelay(1);
++	return 0;
+ }
+ 
+ static int mtk_pcs_lynxi_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+@@ -211,117 +240,103 @@
+ 				bool permit_pause_to_mac)
+ {
+ 	struct mtk_pcs_lynxi *mpcs = pcs_to_mtk_pcs_lynxi(pcs);
+-	bool mode_changed = false, changed;
++	bool mode_changed, changed;
+ 	unsigned int rgc3, sgm_mode, bmcr = 0, trxbuf_thr = 0x3112;
+ 	unsigned int pnswap_tx, pnswap_rx;
+-	int advertise, link_timer;
+-
+-	advertise = phylink_mii_c22_pcs_encode_advertisement(interface,
+-							     advertising);
++	int advertise, link_timer = 0, ret;
++
++	advertise = phylink_mii_c22_pcs_encode_advertisement(interface, advertising);
+ 	if (advertise < 0)
+ 		return advertise;
+ 
+-	/* Clearing IF_MODE_BIT0 switches the PCS to BASE-X mode, and
+-	 * we assume that fixes it's speed at bitrate = line rate (in
+-	 * other words, 1000Mbps or 2500Mbps).
+-	 */
+-	if (interface == PHY_INTERFACE_MODE_SGMII)
+-		sgm_mode = SGMII_IF_MODE_SGMII;
+-	else
+-		sgm_mode = 0;
+-
++	sgm_mode = interface == PHY_INTERFACE_MODE_SGMII ? SGMII_IF_MODE_SGMII : 0;
+ 	if (neg_mode & PHYLINK_PCS_NEG_INBAND)
+ 		sgm_mode |= SGMII_REMOTE_FAULT_DIS;
+-
+-	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED) {
+-		if (interface != PHY_INTERFACE_MODE_2500BASEX) {
+-			sgm_mode |= SGMII_SPEED_DUPLEX_AN;
+-			bmcr = BMCR_ANENABLE;
+-		}
+-	}
+-
+-	/* Configure SGMII PCS clock source */
++	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED &&
++	    interface != PHY_INTERFACE_MODE_2500BASEX) {
++		sgm_mode |= SGMII_SPEED_DUPLEX_AN;
++		bmcr = BMCR_ANENABLE;
++	}
+ 	if (mpcs->flags & MTK_SGMII_FLAG_PHYA_TRX_CK) {
+ 		bmcr |= SGMII_REF_CK_SEL;
+ 		trxbuf_thr = 0x2111;
+ 	}
+ 
+-	if (mpcs->interface != interface || mpcs->neg_mode != neg_mode) {
++	mode_changed = !mpcs->configured || mpcs->interface != interface ||
++		       mpcs->neg_mode != neg_mode;
++	if (mode_changed) {
+ 		link_timer = phylink_get_link_timer_ns(interface);
+ 		if (link_timer < 0)
+ 			return link_timer;
+-
+-		/* PHYA power down */
+-		regmap_set_bits(mpcs->regmap, SGMSYS_QPHY_PWR_STATE_CTRL,
+-				SGMII_PHYA_PWD);
+-
+-		/* Reset SGMII PCS state */
+-		if (mpcs->xfi_tphy)
+-			phy_reset(mpcs->xfi_tphy);
+-
+-		mtk_sgmii_reset(mpcs);
+-		regmap_set_bits(mpcs->regmap, SGMSYS_RESERVED_0,
+-				SGMII_SW_RESET);
+-
+-		/* Configure the interface polarity */
+-		pnswap_tx = (mpcs->flags & MTK_SGMII_FLAG_PN_SWAP_TX) ?
+-			    SGMII_PN_SWAP_TX : 0;
+-		pnswap_rx = (mpcs->flags & MTK_SGMII_FLAG_PN_SWAP_RX) ?
+-			    SGMII_PN_SWAP_RX : 0;
+-		regmap_update_bits(mpcs->regmap, SGMSYS_QPHY_WRAP_CTRL,
+-				   SGMII_PN_SWAP_MASK,
+-				   pnswap_tx | pnswap_rx);
+-
+-		if (interface == PHY_INTERFACE_MODE_2500BASEX)
+-			rgc3 = SGMII_PHY_SPEED_3_125G;
+-		else
+-			rgc3 = SGMII_PHY_SPEED_1_25G;
+-
+-		/* Configure the underlying interface speed */
+-		regmap_update_bits(mpcs->regmap, mpcs->ana_rgc3,
+-				   SGMII_PHY_SPEED_MASK, rgc3);
+-
+-		/* Setup the link timer */
+-		regmap_write(mpcs->regmap, SGMSYS_PCS_LINK_TIMER,
+-			     SGMII_LINK_TIMER_VAL(link_timer));
+-
+-		mpcs->interface = interface;
+-		mpcs->neg_mode = neg_mode;
+-		linkmode_copy(mpcs->advertising, advertising);
+-		mode_changed = true;
+-	}
+-
+-	/* Update the advertisement, noting whether it has changed */
+-	regmap_update_bits_check(mpcs->regmap, SGMSYS_PCS_ADVERTISE,
+-				 SGMII_ADVERTISE, advertise, &changed);
+-
+-	/* Update the sgmsys mode register */
+-	regmap_update_bits(mpcs->regmap, SGMSYS_SGMII_MODE,
+-			   SGMII_TRXBUF_THR_MASK |
+-			   SGMII_REMOTE_FAULT_DIS | SGMII_DUPLEX_HALF |
+-			   SGMII_SPEED_DUPLEX_AN | SGMII_IF_MODE_SGMII,
+-			   SGMII_TRXBUF_THR(trxbuf_thr) | sgm_mode);
+-
+-	/* Update the BMCR */
+-	regmap_update_bits(mpcs->regmap, SGMSYS_PCS_CONTROL_1,
+-			   SGMII_REF_CK_SEL | BMCR_ANENABLE, bmcr);
+-
+-	/* Release PHYA power down state
+-	 * Only removing bit SGMII_PHYA_PWD isn't enough.
+-	 * There are cases when the SGMII_PHYA_PWD register contains 0x9 which
+-	 * prevents SGMII from working. The SGMII still shows link but no traffic
+-	 * can flow. Writing 0x0 to the PHYA_PWD register fix the issue. 0x0 was
+-	 * taken from a good working state of the SGMII interface.
+-	 * Unknown how much the QPHY needs but it is racy without a sleep.
+-	 * Tested on mt7622 & mt7986.
+-	 */
++	}
++	/* Cache the requested mode for recovery, not a claim of success. */
++	mpcs->interface = interface;
++	mpcs->neg_mode = neg_mode;
++	linkmode_copy(mpcs->advertising, advertising);
++	mpcs->configured = false;
++	mpcs->link_poll_expire = jiffies + HZ;
++	ret = mtk_pcs_lynxi_enable(pcs);
++	if (ret)
++		return ret;
++
++	if (mode_changed) {
++		ret = regmap_set_bits(mpcs->regmap, SGMSYS_QPHY_PWR_STATE_CTRL, SGMII_PHYA_PWD);
++		if (ret)
++			return ret;
++		if (mpcs->xfi_tphy) {
++			ret = phy_reset(mpcs->xfi_tphy);
++			if (ret)
++				return ret;
++		}
++		ret = mtk_sgmii_reset(mpcs);
++		if (ret)
++			return ret;
++		ret = regmap_set_bits(mpcs->regmap, SGMSYS_RESERVED_0, SGMII_SW_RESET);
++		if (ret)
++			return ret;
++
++		pnswap_tx = mpcs->flags & MTK_SGMII_FLAG_PN_SWAP_TX ? SGMII_PN_SWAP_TX : 0;
++		pnswap_rx = mpcs->flags & MTK_SGMII_FLAG_PN_SWAP_RX ? SGMII_PN_SWAP_RX : 0;
++		ret = regmap_update_bits(mpcs->regmap, SGMSYS_QPHY_WRAP_CTRL,
++					 SGMII_PN_SWAP_MASK, pnswap_tx | pnswap_rx);
++		if (ret)
++			return ret;
++		rgc3 = interface == PHY_INTERFACE_MODE_2500BASEX ?
++			SGMII_PHY_SPEED_3_125G : SGMII_PHY_SPEED_1_25G;
++		ret = regmap_update_bits(mpcs->regmap, mpcs->ana_rgc3, SGMII_PHY_SPEED_MASK, rgc3);
++		if (ret)
++			return ret;
++		ret = regmap_write(mpcs->regmap, SGMSYS_PCS_LINK_TIMER, SGMII_LINK_TIMER_VAL(link_timer));
++		if (ret)
++			return ret;
++	}
++
++	ret = regmap_update_bits_check(mpcs->regmap, SGMSYS_PCS_ADVERTISE,
++				       SGMII_ADVERTISE, advertise, &changed);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(mpcs->regmap, SGMSYS_SGMII_MODE,
++		SGMII_TRXBUF_THR_MASK | SGMII_REMOTE_FAULT_DIS | SGMII_DUPLEX_HALF |
++		SGMII_SPEED_DUPLEX_AN | SGMII_IF_MODE_SGMII,
++		SGMII_TRXBUF_THR(trxbuf_thr) | sgm_mode);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(mpcs->regmap, SGMSYS_PCS_CONTROL_1,
++				 SGMII_REF_CK_SEL | BMCR_ANENABLE, bmcr);
++	if (ret)
++		return ret;
++
++	/* Retain the vendor PHYA release sequence and its settling delay. */
+ 	usleep_range(50, 100);
+-	regmap_write(mpcs->regmap, SGMSYS_QPHY_PWR_STATE_CTRL, 0);
+-
+-	/* Setup PMA/PMD */
+-	if (mode_changed)
+-		phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET, interface);
+-
++	ret = regmap_write(mpcs->regmap, SGMSYS_QPHY_PWR_STATE_CTRL, 0);
++	if (ret)
++		return ret;
++	if (mode_changed && mpcs->xfi_tphy) {
++		ret = phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET, interface);
++		if (ret)
++			return ret;
++	}
++	mpcs->configured = true;
+ 	return changed || mode_changed;
+ }
+ 
+@@ -329,7 +344,8 @@
+ {
+ 	struct mtk_pcs_lynxi *mpcs = pcs_to_mtk_pcs_lynxi(pcs);
+ 
+-	regmap_set_bits(mpcs->regmap, SGMSYS_PCS_CONTROL_1, BMCR_ANRESTART);
++	if (regmap_set_bits(mpcs->regmap, SGMSYS_PCS_CONTROL_1, BMCR_ANRESTART))
++		mpcs->configured = false;
+ }
+ 
+ static void mtk_pcs_lynxi_link_up(struct phylink_pcs *pcs,
+@@ -352,24 +368,43 @@
+ 		if (duplex != DUPLEX_FULL)
+ 			sgm_mode |= SGMII_DUPLEX_HALF;
+ 
+-		regmap_update_bits(mpcs->regmap, SGMSYS_SGMII_MODE,
+-				   SGMII_DUPLEX_HALF | SGMII_SPEED_MASK,
+-				   sgm_mode);
++		if (regmap_update_bits(mpcs->regmap, SGMSYS_SGMII_MODE,
++				       SGMII_DUPLEX_HALF | SGMII_SPEED_MASK,
++				       sgm_mode))
++			mpcs->configured = false;
+ 	}
+ }
+ 
+ static int mtk_pcs_lynxi_enable(struct phylink_pcs *pcs)
+ {
+ 	struct mtk_pcs_lynxi *mpcs = pcs_to_mtk_pcs_lynxi(pcs);
+-
++	int ret;
++
++	mpcs->want_enabled = true;
++	if (mpcs->enabled)
++		return 0;
++	mpcs->configured = false;
+ 	if (mpcs->sgmii_tx && mpcs->sgmii_rx) {
+-		clk_prepare_enable(mpcs->sgmii_rx);
+-		clk_prepare_enable(mpcs->sgmii_tx);
+-	}
+-
+-	if (mpcs->xfi_tphy)
+-		phy_power_on(mpcs->xfi_tphy);
+-
++		ret = clk_prepare_enable(mpcs->sgmii_rx);
++		if (ret)
++			return ret;
++		ret = clk_prepare_enable(mpcs->sgmii_tx);
++		if (ret) {
++			clk_disable_unprepare(mpcs->sgmii_rx);
++			return ret;
++		}
++	}
++	if (mpcs->xfi_tphy) {
++		ret = phy_power_on(mpcs->xfi_tphy);
++		if (ret) {
++			if (mpcs->sgmii_tx && mpcs->sgmii_rx) {
++				clk_disable_unprepare(mpcs->sgmii_tx);
++				clk_disable_unprepare(mpcs->sgmii_rx);
++			}
++			return ret;
++		}
++	}
++	mpcs->enabled = true;
+ 	return 0;
+ }
+ 
+@@ -377,6 +412,11 @@
+ {
+ 	struct mtk_pcs_lynxi *mpcs = pcs_to_mtk_pcs_lynxi(pcs);
+ 
++	mpcs->want_enabled = false;
++	mpcs->configured = false;
++	if (!mpcs->enabled)
++		return;
++	mpcs->enabled = false;
+ 	regmap_set_bits(mpcs->regmap, SGMSYS_QPHY_PWR_STATE_CTRL, SGMII_PHYA_PWD);
+ 
+ 	if (mpcs->sgmii_tx && mpcs->sgmii_rx) {
+@@ -467,6 +507,12 @@
+ }
+ EXPORT_SYMBOL(mtk_pcs_lynxi_destroy);
+ 
++static void mtk_pcs_lynxi_reset_release(void *data)
++{
++	reset_control_assert(data);
++	reset_control_put(data);
++}
++
+ static int mtk_pcs_lynxi_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -475,6 +521,7 @@
+ 	struct phylink_pcs *pcs;
+ 	struct regmap *regmap;
+ 	u32 flags = 0;
++	int ret;
+ 
+ 	mpcs = devm_kzalloc(dev, sizeof(*mpcs), GFP_KERNEL);
+ 	if (!mpcs)
+@@ -487,22 +534,35 @@
+ 
+ 	if (of_property_read_bool(np->parent, "mediatek,pnswap"))
+ 		flags |= MTK_SGMII_FLAG_PN_SWAP_TX | MTK_SGMII_FLAG_PN_SWAP_RX;
+-	else if (of_property_read_bool(np->parent, "mediatek,pnswap-tx"))
+-		flags |= MTK_SGMII_FLAG_PN_SWAP_TX;
+-	else if (of_property_read_bool(np->parent, "mediatek,pnswap-rx"))
+-		flags |= MTK_SGMII_FLAG_PN_SWAP_RX;
++	else {
++		if (of_property_read_bool(np->parent, "mediatek,pnswap-tx"))
++			flags |= MTK_SGMII_FLAG_PN_SWAP_TX;
++		if (of_property_read_bool(np->parent, "mediatek,pnswap-rx"))
++			flags |= MTK_SGMII_FLAG_PN_SWAP_RX;
++	}
+ 
+ 	if (of_property_read_bool(np->parent, "mediatek,phya_trx_ck"))
+ 		flags |= MTK_SGMII_FLAG_PHYA_TRX_CK;
+ 
+-	if (of_parse_phandle(np->parent, "resets", 0)) {
++	if (of_find_property(np->parent, "resets", NULL)) {
+ 		mpcs->rstc = of_reset_control_get_shared(np->parent, NULL);
+ 		if (IS_ERR(mpcs->rstc))
+ 			return PTR_ERR(mpcs->rstc);
+ 	} else
+ 		mpcs->rstc = NULL;
+ 
+-	reset_control_deassert(mpcs->rstc);
++	ret = reset_control_deassert(mpcs->rstc);
++	if (ret) {
++		reset_control_assert(mpcs->rstc);
++		reset_control_put(mpcs->rstc);
++		return ret;
++	}
++	if (mpcs->rstc) {
++		ret = devm_add_action_or_reset(dev, mtk_pcs_lynxi_reset_release,
++					       mpcs->rstc);
++		if (ret)
++			return ret;
++	}
+ 	mpcs->sgmii_sel = devm_clk_get_enabled(dev, "sgmii_sel");
+ 	if (IS_ERR(mpcs->sgmii_sel))
+ 		return PTR_ERR(mpcs->sgmii_sel);
+@@ -515,7 +575,7 @@
+ 	if (IS_ERR(mpcs->sgmii_tx))
+ 		return PTR_ERR(mpcs->sgmii_tx);
+ 
+-	if (of_parse_phandle(dev->of_node, "phys", 0)) {
++	if (of_find_property(dev->of_node, "phys", NULL)) {
+ 		mpcs->xfi_tphy = devm_of_phy_get(mpcs->dev, dev->of_node, NULL);
+ 		if (IS_ERR(mpcs->xfi_tphy))
+ 			return PTR_ERR(mpcs->xfi_tphy);
+@@ -547,7 +607,6 @@
+ 	list_for_each_entry_safe(cur, tmp, &mtk_pcs_lynxi_instances, node)
+ 		if (cur->dev == dev) {
+ 			list_del(&cur->node);
+-			kfree(cur);
+ 			break;
+ 		}
+ 	mutex_unlock(&instance_mutex);
+@@ -584,7 +643,10 @@
+ 	}
+ 
+ 	mpcs = platform_get_drvdata(pdev);
+-	device_link_add(dev, mpcs->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
++	if (!device_link_add(dev, mpcs->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
++		put_device(&pdev->dev);
++		return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	return &mpcs->pcs;
+ }
+--- a/drivers/net/pcs/pcs-mtk-usxgmii.c
++++ b/drivers/net/pcs/pcs-mtk-usxgmii.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/io.h>
++#include <linux/jiffies.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/mdio.h>
+ #include <linux/mutex.h>
+@@ -84,11 +85,17 @@
+ 	phy_interface_t			interface;
+ 	unsigned int			polarity;
+ 	unsigned int			neg_mode;
++	bool				configured;
++	bool				enabled;
++	bool				want_enabled;
++	unsigned long			link_poll_expire;
+ 	struct list_head		node;
+ };
+ 
+ static LIST_HEAD(mtk_usxgmii_pcs_instances);
+ static DEFINE_MUTEX(instance_mutex);
++
++static int mtk_usxgmii_pcs_enable(struct phylink_pcs *pcs);
+ 
+ static u32 mtk_r32(struct mtk_usxgmii_pcs *mpcs, unsigned int reg)
+ {
+@@ -110,13 +117,25 @@
+ 	return container_of(pcs, struct mtk_usxgmii_pcs, pcs);
+ }
+ 
+-static void mtk_usxgmii_reset(struct mtk_usxgmii_pcs *mpcs)
+-{
+-	reset_control_assert(mpcs->reset);
++static int mtk_usxgmii_reset(struct mtk_usxgmii_pcs *mpcs)
++{
++	int ret;
++
++	ret = reset_control_assert(mpcs->reset);
++	if (ret) {
++		/* Shared-reset accounting consumes the deassert reference even
++		 * when the controller's assert operation fails.
++		 */
++		reset_control_deassert(mpcs->reset);
++		return ret;
++	}
+ 	udelay(100);
+-	reset_control_deassert(mpcs->reset);
++	ret = reset_control_deassert(mpcs->reset);
++	if (ret)
++		return ret;
+ 
+ 	mdelay(10);
++	return 0;
+ }
+ 
+ static int mtk_usxgmii_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+@@ -158,13 +177,24 @@
+ 
+ 	adapt_mode |= FIELD_PREP(USXGMII_RATE_ADAPT_MODE, USXGMII_RATE_ADAPT_MODE_X1);
+ 
+-	if (mpcs->interface != interface) {
++	if (!mpcs->configured || mpcs->interface != interface ||
++	    mpcs->neg_mode != neg_mode) {
+ 		mpcs->interface = interface;
+ 		mode_changed = true;
+ 	}
+-
+-	phy_reset(mpcs->xfi_tphy);
+-	mtk_usxgmii_reset(mpcs);
++	mpcs->neg_mode = neg_mode;
++	mpcs->configured = false;
++	mpcs->link_poll_expire = jiffies + HZ;
++
++	ret = mtk_usxgmii_pcs_enable(pcs);
++	if (ret)
++		return ret;
++	ret = phy_reset(mpcs->xfi_tphy);
++	if (ret)
++		return ret;
++	ret = mtk_usxgmii_reset(mpcs);
++	if (ret)
++		return ret;
+ 
+ 	/* Configure the interface polarity */
+ 	mtk_m32(mpcs, RG_PHY_TOP_CTRL0,
+@@ -216,6 +246,7 @@
+ 	ret = phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET, interface);
+ 	if (ret)
+ 		return ret;
++	mpcs->configured = true;
+ 
+ 	return mode_changed;
+ }
+@@ -292,6 +323,16 @@
+ {
+ 	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
+ 
++	if (!mpcs->want_enabled) {
++		state->link = false;
++		state->an_complete = false;
++		state->speed = SPEED_UNKNOWN;
++		state->duplex = DUPLEX_UNKNOWN;
++		return;
++	}
++	if (!mpcs->enabled || !mpcs->configured)
++		goto retry;
++
+ 	/* Refresh USXGMII link status by toggling RG_PCS_AN_STATUS_UPDATE */
+ 	mtk_m32(mpcs, RG_PCS_RX_STATUS0, RG_PCS_RX_STATUS_UPDATE,
+ 		RG_PCS_RX_STATUS_UPDATE);
+@@ -303,17 +344,29 @@
+ 	state->link = FIELD_GET(RG_PCS_RX_LINK_STATUS,
+ 				mtk_r32(mpcs, RG_PCS_RX_STATUS0));
+ 
++	if (state->link) {
++		if (FIELD_GET(USXGMII_AN_ENABLE, mtk_r32(mpcs, RG_PCS_AN_CTRL0)))
++			mtk_usxgmii_pcs_get_an_state(mpcs, state);
++		else
++			mtk_usxgmii_pcs_get_fixed_speed(mpcs, state);
++		if (state->speed == SPEED_UNKNOWN)
++			state->link = false;
++	}
++
++retry:
+ 	/* Continuously repeat re-configuration sequence until link comes up */
+-	if (!state->link) {
+-		mtk_usxgmii_pcs_config(pcs, mpcs->neg_mode,
+-				       state->interface, NULL, false);
+-		return;
+-	}
+-
+-	if (FIELD_GET(USXGMII_AN_ENABLE, mtk_r32(mpcs, RG_PCS_AN_CTRL0)))
+-		mtk_usxgmii_pcs_get_an_state(mpcs, state);
+-	else
+-		mtk_usxgmii_pcs_get_fixed_speed(mpcs, state);
++	if (!mpcs->configured || !state->link) {
++		state->link = false;
++		state->an_complete = false;
++		state->speed = SPEED_UNKNOWN;
++		state->duplex = DUPLEX_UNKNOWN;
++		if (time_after_eq(jiffies, mpcs->link_poll_expire)) {
++			mpcs->link_poll_expire = jiffies + HZ;
++			mtk_usxgmii_pcs_config(pcs, mpcs->neg_mode,
++					       state->interface, NULL, false);
++		}
++		return;
++	}
+ }
+ 
+ static void mtk_usxgmii_pcs_restart_an(struct phylink_pcs *pcs)
+@@ -340,9 +393,16 @@
+ static int mtk_usxgmii_pcs_enable(struct phylink_pcs *pcs)
+ {
+ 	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
+-
+-	phy_power_on(mpcs->xfi_tphy);
+-
++	int ret;
++
++	mpcs->want_enabled = true;
++	if (mpcs->enabled)
++		return 0;
++	mpcs->configured = false;
++	ret = phy_power_on(mpcs->xfi_tphy);
++	if (ret)
++		return ret;
++	mpcs->enabled = true;
+ 	return 0;
+ }
+ 
+@@ -352,7 +412,11 @@
+ 
+ 	mpcs->interface = PHY_INTERFACE_MODE_NA;
+ 	mpcs->neg_mode = -1;
+-
++	mpcs->want_enabled = false;
++	mpcs->configured = false;
++	if (!mpcs->enabled)
++		return;
++	mpcs->enabled = false;
+ 	phy_power_off(mpcs->xfi_tphy);
+ }
+ 
+@@ -365,11 +429,17 @@
+ 	.pcs_disable = mtk_usxgmii_pcs_disable,
+ };
+ 
++static void mtk_usxgmii_reset_assert(void *data)
++{
++	reset_control_assert(data);
++}
++
+ static int mtk_usxgmii_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct device_node *np = dev->of_node;
+ 	struct mtk_usxgmii_pcs *mpcs;
++	int ret;
+ 
+ 	mpcs = devm_kzalloc(dev, sizeof(*mpcs), GFP_KERNEL);
+ 	if (!mpcs)
+@@ -381,10 +451,12 @@
+ 
+ 	if (of_property_read_bool(np->parent, "mediatek,pnswap"))
+ 		mpcs->polarity = USXGMII_PN_SWAP_TX | USXGMII_PN_SWAP_RX;
+-	else if (of_property_read_bool(np, "mediatek,pnswap-tx"))
+-		mpcs->polarity = USXGMII_PN_SWAP_TX;
+-	else if (of_property_read_bool(np, "mediatek,pnswap-rx"))
+-		mpcs->polarity = USXGMII_PN_SWAP_RX;
++	else {
++		if (of_property_read_bool(np, "mediatek,pnswap-tx"))
++			mpcs->polarity |= USXGMII_PN_SWAP_TX;
++		if (of_property_read_bool(np, "mediatek,pnswap-rx"))
++			mpcs->polarity |= USXGMII_PN_SWAP_RX;
++	}
+ 
+ 	mpcs->dev = dev;
+ 	mpcs->pcs.ops = &mtk_usxgmii_pcs_ops;
+@@ -405,7 +477,14 @@
+ 	if (IS_ERR(mpcs->reset))
+ 		return PTR_ERR(mpcs->reset);
+ 
+-	reset_control_deassert(mpcs->reset);
++	ret = reset_control_deassert(mpcs->reset);
++	if (ret) {
++		reset_control_assert(mpcs->reset);
++		return ret;
++	}
++	ret = devm_add_action_or_reset(dev, mtk_usxgmii_reset_assert, mpcs->reset);
++	if (ret)
++		return ret;
+ 
+ 	platform_set_drvdata(pdev, mpcs);
+ 
+@@ -460,7 +539,10 @@
+ 	}
+ 
+ 	mpcs = platform_get_drvdata(pdev);
+-	device_link_add(dev, mpcs->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
++	if (!device_link_add(dev, mpcs->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
++		put_device(&pdev->dev);
++		return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	return &mpcs->pcs;
+ }
+--- a/drivers/phy/mediatek/phy-mtk-xfi-tphy.c
++++ b/drivers/phy/mediatek/phy-mtk-xfi-tphy.c
+@@ -290,10 +290,15 @@
+ static int mtk_xfi_tphy_reset(struct phy *phy)
+ {
+ 	struct mtk_xfi_tphy *xfi_tphy = phy_get_drvdata(phy);
+-
+-	reset_control_assert(xfi_tphy->reset);
++	int ret;
++
++	ret = reset_control_assert(xfi_tphy->reset);
++	if (ret)
++		return ret;
+ 	usleep_range(100, 500);
+-	reset_control_deassert(xfi_tphy->reset);
++	ret = reset_control_deassert(xfi_tphy->reset);
++	if (ret)
++		return ret;
+ 	usleep_range(1, 10);
+ 
+ 	return 0;
