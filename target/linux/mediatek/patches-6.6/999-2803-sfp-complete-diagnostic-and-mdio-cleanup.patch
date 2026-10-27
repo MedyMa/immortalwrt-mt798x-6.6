@@ -1,0 +1,114 @@
+Subject: [PATCH] net: sfp: complete diagnostic and MDIO resource cleanup
+
+Match the upstream MDIO destroy ownership and release each dynamically
+allocated bus after unregistering it. Unregister hwmon on probe unwind as
+well as module removal, release failed registrations, and initialize the
+retry budget before publishing work. Reject partial diagnostic reads and
+stop hwmon producers during teardown.
+
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -866,6 +866,7 @@
+ static void sfp_i2c_mdiobus_destroy(struct sfp *sfp)
+ {
+ 	mdiobus_unregister(sfp->i2c_mii);
++	mdiobus_free(sfp->i2c_mii);
+ 	sfp->i2c_mii = NULL;
+ }
+ 
+@@ -1723,6 +1724,9 @@
+ 	struct sfp *sfp = container_of(work, struct sfp, hwmon_probe.work);
+ 	int err;
+ 
++	if (READ_ONCE(sfp->stopping))
++		return;
++
+ 	/* hwmon interface needs to access 16bit registers in atomic way to
+ 	 * guarantee coherency of the diagnostic monitoring data. If it is not
+ 	 * possible to guarantee coherency because EEPROM is broken in such way
+@@ -1738,8 +1742,11 @@
+ 	}
+ 
+ 	err = sfp_read(sfp, true, 0, &sfp->diag, sizeof(sfp->diag));
+-	if (err < 0) {
+-		if (sfp->hwmon_tries--) {
++	if (err != sizeof(sfp->diag)) {
++		if (err >= 0)
++			err = -EIO;
++		if (sfp->hwmon_tries && !READ_ONCE(sfp->stopping)) {
++			sfp->hwmon_tries--;
+ 			mod_delayed_work(system_wq, &sfp->hwmon_probe,
+ 					 T_PROBE_RETRY_SLOW);
+ 		} else {
+@@ -1752,6 +1759,7 @@
+ 	sfp->hwmon_name = hwmon_sanitize_name(dev_name(sfp->dev));
+ 	if (IS_ERR(sfp->hwmon_name)) {
+ 		dev_err(sfp->dev, "out of memory for hwmon name\n");
++		sfp->hwmon_name = NULL;
+ 		return;
+ 	}
+ 
+@@ -1759,29 +1767,34 @@
+ 							 sfp->hwmon_name, sfp,
+ 							 &sfp_hwmon_chip_info,
+ 							 NULL);
+-	if (IS_ERR(sfp->hwmon_dev))
++	if (IS_ERR(sfp->hwmon_dev)) {
+ 		dev_err(sfp->dev, "failed to register hwmon device: %ld\n",
+ 			PTR_ERR(sfp->hwmon_dev));
+-}
+-
+-static int sfp_hwmon_insert(struct sfp *sfp)
+-{
+-	if (sfp->have_a2 && sfp->id.ext.diagmon & SFP_DIAGMON_DDM) {
+-		mod_delayed_work(system_wq, &sfp->hwmon_probe, 1);
+-		sfp->hwmon_tries = R_PROBE_RETRY_SLOW;
+-	}
+-
+-	return 0;
+-}
+-
+-static void sfp_hwmon_remove(struct sfp *sfp)
+-{
+-	cancel_delayed_work_sync(&sfp->hwmon_probe);
+-	if (!IS_ERR_OR_NULL(sfp->hwmon_dev)) {
+-		hwmon_device_unregister(sfp->hwmon_dev);
+ 		sfp->hwmon_dev = NULL;
+ 		kfree(sfp->hwmon_name);
+-	}
++		sfp->hwmon_name = NULL;
++	}
++}
++
++static int sfp_hwmon_insert(struct sfp *sfp)
++{
++	if (!READ_ONCE(sfp->stopping) && sfp->have_a2 &&
++	    sfp->id.ext.diagmon & SFP_DIAGMON_DDM) {
++		sfp->hwmon_tries = R_PROBE_RETRY_SLOW;
++		mod_delayed_work(system_wq, &sfp->hwmon_probe, 1);
++	}
++
++	return 0;
++}
++
++static void sfp_hwmon_remove(struct sfp *sfp)
++{
++	cancel_delayed_work_sync(&sfp->hwmon_probe);
++	if (!IS_ERR_OR_NULL(sfp->hwmon_dev))
++		hwmon_device_unregister(sfp->hwmon_dev);
++	sfp->hwmon_dev = NULL;
++	kfree(sfp->hwmon_name);
++	sfp->hwmon_name = NULL;
+ }
+ 
+ static int sfp_hwmon_init(struct sfp *sfp)
+@@ -1793,7 +1806,8 @@
+ 
+ static void sfp_hwmon_exit(struct sfp *sfp)
+ {
+-	cancel_delayed_work_sync(&sfp->hwmon_probe);
++	/* Probe can fail after the EEPROM worker registered hwmon. */
++	sfp_hwmon_remove(sfp);
+ }
+ #else
+ static int sfp_hwmon_insert(struct sfp *sfp)

@@ -1,0 +1,121 @@
+Subject: [PATCH] net: pcs: mtk: complete XFI retraining and guard inactive callbacks
+
+Use the ImmortalWrt 6.18 Lynxi recovery principle: an XFI link which stays
+down must re-run analog calibration, with the existing one-second limit.
+Forced PHY-driven links get calibration at link-up without resetting an
+established in-band link. Preserve legacy switch reset polarity unless
+the caller requests an override. Do not access inactive PCS hardware from
+AN restart or stale link-up callbacks.
+
+--- a/drivers/net/pcs/pcs-mtk-lynxi.c
++++ b/drivers/net/pcs/pcs-mtk-lynxi.c
+@@ -106,6 +106,7 @@
+ 	bool			configured;
+ 	bool			enabled;
+ 	bool			want_enabled;
++	bool			configure_polarity;
+ 	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
+ 	struct reset_control	*rstc;
+ 	struct clk		*sgmii_sel;
+@@ -207,6 +208,11 @@
+ retry:
+ 	if (!state->link && time_after_eq(jiffies, mpcs->link_poll_expire)) {
+ 		mpcs->link_poll_expire = jiffies + HZ;
++		/* A down XFI link needs another analog calibration, not only
++		 * an advertisement rewrite of the already configured mode.
++		 */
++		if (mpcs->xfi_tphy)
++			mpcs->configured = false;
+ 		mtk_pcs_lynxi_config(pcs, mpcs->neg_mode,
+ 				     state->interface, mpcs->advertising, false);
+ 	}
+@@ -295,12 +301,14 @@
+ 		if (ret)
+ 			return ret;
+ 
+-		pnswap_tx = mpcs->flags & MTK_SGMII_FLAG_PN_SWAP_TX ? SGMII_PN_SWAP_TX : 0;
+-		pnswap_rx = mpcs->flags & MTK_SGMII_FLAG_PN_SWAP_RX ? SGMII_PN_SWAP_RX : 0;
+-		ret = regmap_update_bits(mpcs->regmap, SGMSYS_QPHY_WRAP_CTRL,
+-					 SGMII_PN_SWAP_MASK, pnswap_tx | pnswap_rx);
+-		if (ret)
+-			return ret;
++		if (mpcs->configure_polarity) {
++			pnswap_tx = mpcs->flags & MTK_SGMII_FLAG_PN_SWAP_TX ? SGMII_PN_SWAP_TX : 0;
++			pnswap_rx = mpcs->flags & MTK_SGMII_FLAG_PN_SWAP_RX ? SGMII_PN_SWAP_RX : 0;
++			ret = regmap_update_bits(mpcs->regmap, SGMSYS_QPHY_WRAP_CTRL,
++						 SGMII_PN_SWAP_MASK, pnswap_tx | pnswap_rx);
++			if (ret)
++				return ret;
++		}
+ 		rgc3 = interface == PHY_INTERFACE_MODE_2500BASEX ?
+ 			SGMII_PHY_SPEED_3_125G : SGMII_PHY_SPEED_1_25G;
+ 		ret = regmap_update_bits(mpcs->regmap, mpcs->ana_rgc3, SGMII_PHY_SPEED_MASK, rgc3);
+@@ -344,6 +352,9 @@
+ {
+ 	struct mtk_pcs_lynxi *mpcs = pcs_to_mtk_pcs_lynxi(pcs);
+ 
++	if (!mpcs->want_enabled || !mpcs->enabled || !mpcs->configured)
++		return;
++
+ 	if (regmap_set_bits(mpcs->regmap, SGMSYS_PCS_CONTROL_1, BMCR_ANRESTART))
+ 		mpcs->configured = false;
+ }
+@@ -355,6 +366,22 @@
+ {
+ 	struct mtk_pcs_lynxi *mpcs = pcs_to_mtk_pcs_lynxi(pcs);
+ 	unsigned int sgm_mode;
++
++	if (!mpcs->want_enabled)
++		return;
++
++	/* With a PHY-driven, forced link there may be no PCS state polls.
++	 * Retry XFI calibration when that PHY reports link up, preserving
++	 * the negotiated in-band link in the other modes.
++	 */
++	if (mpcs->xfi_tphy && neg_mode != PHYLINK_PCS_NEG_INBAND_ENABLED) {
++		mpcs->configured = false;
++		if (mtk_pcs_lynxi_config(pcs, neg_mode, interface,
++					 mpcs->advertising, false) < 0)
++			return;
++	}
++	if (!mpcs->enabled || !mpcs->configured)
++		return;
+ 
+ 	if (neg_mode != PHYLINK_PCS_NEG_INBAND_ENABLED) {
+ 		/* Force the speed and duplex setting */
+@@ -481,6 +508,11 @@
+ 	mpcs->ana_rgc3 = ana_rgc3;
+ 	mpcs->regmap = regmap;
+ 	mpcs->flags = flags;
++	/* Legacy switch PCSes retain their reset polarity unless requested.
++	 * Platform PCSes describe both lane polarities in firmware.
++	 */
++	mpcs->configure_polarity = prealloc ||
++		(flags & (MTK_SGMII_FLAG_PN_SWAP_TX | MTK_SGMII_FLAG_PN_SWAP_RX));
+ 	mpcs->pcs.ops = &mtk_pcs_lynxi_ops;
+ 	mpcs->pcs.neg_mode = true;
+ 	mpcs->pcs.poll = true;
+--- a/drivers/net/pcs/pcs-mtk-usxgmii.c
++++ b/drivers/net/pcs/pcs-mtk-usxgmii.c
+@@ -373,6 +373,9 @@
+ {
+ 	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
+ 
++	if (!mpcs->want_enabled || !mpcs->enabled || !mpcs->configured)
++		return;
++
+ 	mtk_m32(mpcs, RG_PCS_AN_CTRL0, USXGMII_AN_RESTART, USXGMII_AN_RESTART);
+ }
+ 
+@@ -380,6 +383,11 @@
+ 				    phy_interface_t interface,
+ 				    int speed, int duplex)
+ {
++	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
++
++	if (!mpcs->want_enabled)
++		return;
++
+ 	/* Preserve the USXGMII link already established through in-band AN. */
+ 	if (interface == PHY_INTERFACE_MODE_USXGMII)
+ 		return;
