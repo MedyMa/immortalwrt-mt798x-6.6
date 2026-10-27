@@ -1,0 +1,70 @@
+Subject: [PATCH] net: phy: realtek: scope module workarounds to supported SFP interfaces
+
+The older FS copper SFP workaround forced every RTL822x instance to
+2500BASE-X, removed board MDIO broadcast protection, and dropped the
+RTL8221B-VB C45 reset globally. Restore host-interface detection and board
+broadcast/reset behavior. Retain fixed-rate module provisioning only on
+SFPs whose host can use 2500BASE-X, including the existing pause-based rate
+matching, without advertising 2500BASE-X to an SGMII-only host.
+
+Reference: ImmortalWrt 13376a7112809b19d3413a1689a4244c45165003,
+720-07 MDIO broadcast patch and Linux 6.18.55 host-interface selection.
+
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -1083,9 +1083,30 @@
+ 
+ static int rtl822xb_config_init(struct phy_device *phydev)
+ {
+-	bool has_2500 = true, has_sgmii = false;
++	bool has_2500, has_sgmii;
+ 	int ret, val;
+ 	u16 mode;
++
++	has_2500 = test_bit(PHY_INTERFACE_MODE_2500BASEX,
++			    phydev->host_interfaces) ||
++		   phydev->interface == PHY_INTERFACE_MODE_2500BASEX;
++	has_sgmii = test_bit(PHY_INTERFACE_MODE_SGMII,
++			     phydev->host_interfaces) ||
++		    phydev->interface == PHY_INTERFACE_MODE_SGMII;
++
++	/* Keep fixed-rate provisioning for embedded SFP PHYs only when the
++	 * host can use it. Do not force this module workaround on board PHYs
++	 * or advertise a host interface which the MAC cannot support.
++	 */
++	if (phydev->is_on_sfp_module && has_2500)
++		has_sgmii = false;
++
++	/* An SFP controller may itself use MDIO broadcast address zero. */
++	if (!phydev->is_on_sfp_module) {
++		ret = phy_clear_bits_mmd(phydev, MDIO_MMD_VEND2, 0xa430, BIT(13));
++		if (ret < 0)
++			return ret;
++	}
+ 
+ 	/* fill in possible interfaces */
+ 	__assign_bit(PHY_INTERFACE_MODE_2500BASEX, phydev->possible_interfaces,
+@@ -1175,6 +1196,14 @@
+ 	}
+ 
+ 	return ret;
++}
++
++static int rtl8221b_vb_c45_soft_reset(struct phy_device *phydev)
++{
++	/* Preserve the module controller's PHY provisioning, while retaining
++	 * the original reset path for a PHY mounted directly on the board.
++	 */
++	return phydev->is_on_sfp_module ? 0 : genphy_soft_reset(phydev);
+ }
+ 
+ static int rtl822xb_get_rate_matching(struct phy_device *phydev,
+@@ -1864,7 +1893,7 @@
+ 		.name           = "RTL8221B-VB-CG 2.5Gbps PHY (C45)",
+ 		.config_intr	= rtl8221b_config_intr,
+ 		.handle_interrupt = rtl8221b_handle_interrupt,
+-		/*.soft_reset     = genphy_soft_reset,*/
++		.soft_reset     = rtl8221b_vb_c45_soft_reset,
+ 		.probe		= rtl822x_probe,
+ 		.config_init    = rtl822xb_config_init_war,
+ 		.get_rate_matching = rtl822xb_get_rate_matching,

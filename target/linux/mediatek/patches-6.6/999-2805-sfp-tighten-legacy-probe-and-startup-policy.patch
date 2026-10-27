@@ -1,0 +1,395 @@
+Subject: [PATCH] net: sfp: tighten legacy probe and startup recovery policy
+
+Remove the unverified generic zero-identifier acceptance; retain named
+module exceptions and the bounded blank/checksum retry policy. Keep
+RollBall command deadlines in native PHY discovery and give NACKs a
+bounded startup budget before falling back to module EEPROM capabilities.
+Do not infer a chipset from zero-filled I2C block reads. Distinguish a
+module command deadline from an I2C transport timeout so that only the
+former retains the native absent-register value during PHY discovery.
+
+Check a complete nonblank base before declaring startup readiness, retain
+byte-I/O fallback, and keep TX_DISABLE asserted during startup recovery.
+Allow recovery to continue up the mux hierarchy when unsupported. Follow
+ImmortalWrt 6.18 prefix matching and potron startup handling for the
+already-listed OEM XGSPONST2001. Report short Cotsworks fixup writes as
+errors and do not announce empty C45 IDs as detected PHYs.
+
+References: ImmortalWrt 13376a7112809b19d3413a1689a4244c45165003,
+756-01/756-02 SFP patches; Linux 6.18.55 RollBall PHY discovery.
+
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -335,13 +335,6 @@
+ 	    id->base.phys_ext_id == SFP_PHYS_EXT_ID_SFP)
+ 		return true;
+ 
+-	/* RTL8672/RTL9601C based GPON ONT sticks (e.g. locked Chinese ISP
+-	 * modules) return all-zero EEPROM even after byte-by-byte I/O.
+-	 * Accept (phys_id, phys_ext_id) == (0x00, 0x00) as standard SFP.
+-	 */
+-	if (!id->base.phys_id && !id->base.phys_ext_id)
+-		return true;
+-
+ 	/* SFP GPON module Ubiquiti U-Fiber Instant has in its EEPROM stored
+ 	 * phys id SFF instead of SFP. Therefore mark this module explicitly
+ 	 * as supported based on vendor name and pn match.
+@@ -542,6 +535,10 @@
+ #define SFP_QUIRK_M(_v, _p, _m) SFP_QUIRK(_v, _p, _m, NULL)
+ #define SFP_QUIRK_F(_v, _p, _f) SFP_QUIRK(_v, _p, NULL, _f)
+ 
++/* Vendor matching remains exact; only explicitly listed parts use a prefix. */
++#define SFP_QUIRK_F_PREFIX(_v, _p, _f) \
++	{ .vendor = _v, .part = _p, .fixup = _f, .part_prefix_match = true }
++
+ static const struct sfp_quirk sfp_quirks[] = {
+ 	// Alcatel Lucent G-010S-P can operate at 2500base-X, but incorrectly
+ 	// report 2500MBd NRZ in their EEPROM
+@@ -579,7 +576,7 @@
+ 	/* HSGQ NU-STICK1.0 XGS-PON module (SFP+) */
+ 	SFP_QUIRK_F("HSGQ", "NU-STICK1.0", sfp_fixup_halny_gsfp),
+ 	/* OEM XGSPONST2001 XGS-PON module (SFP+) */
+-	SFP_QUIRK_F("OEM", "XGSPONST2001", sfp_fixup_halny_gsfp),
++	SFP_QUIRK_F_PREFIX("OEM", "XGSPONST2001", sfp_fixup_potron),
+ 	SFP_QUIRK_F("OEM", "XGSPONST2000", sfp_fixup_halny_gsfp),
+ 
+ 	SFP_QUIRK_F("HALNy", "HL-GSFP", sfp_fixup_halny_gsfp),
+@@ -660,13 +657,16 @@
+ 	return size;
+ }
+ 
+-static bool sfp_match(const char *qs, const char *str, size_t len)
+-{
++static bool sfp_match(const char *qs, const char *str, size_t len, bool prefix)
++{
++	size_t qs_len;
++
+ 	if (!qs)
+ 		return true;
+-	if (strlen(qs) != len)
++	qs_len = strlen(qs);
++	if (prefix ? qs_len > len : qs_len != len)
+ 		return false;
+-	return !strncmp(qs, str, len);
++	return !strncmp(qs, str, qs_len);
+ }
+ 
+ static const struct sfp_quirk *sfp_lookup_quirk(struct sfp *sfp, const struct sfp_eeprom_id *id)
+@@ -679,8 +679,9 @@
+ 	ps = sfp_strlen(id->base.vendor_pn, ARRAY_SIZE(id->base.vendor_pn));
+ 
+ 	for (i = 0, q = sfp_quirks; i < ARRAY_SIZE(sfp_quirks); i++, q++)
+-		if (sfp_match(q->vendor, id->base.vendor_name, vs) &&
+-		    sfp_match(q->part, id->base.vendor_pn, ps)) {
++		if (sfp_match(q->vendor, id->base.vendor_name, vs, false) &&
++		    sfp_match(q->part, id->base.vendor_pn, ps,
++			      q->part_prefix_match)) {
+ 			dev_info(sfp->dev,
+ 			         "module %.*s %.*s rev %.*s has been found in the quirk list\n",
+ 				 (int)sizeof(id->base.vendor_name), id->base.vendor_name,
+@@ -839,8 +840,13 @@
+ 	if (IS_ERR(i2c_mii)) {
+ 		if (sfp->mdio_protocol == MDIO_I2C_ROLLBALL &&
+ 		    PTR_ERR(i2c_mii) == -ENODEV) {
++			/* A starting bridge can NACK too. Use the startup budget
++			 * before falling back to the module's EEPROM capabilities.
++			 */
++			if (sfp->sm_phy_retries > 1)
++				return -EAGAIN;
+ 			dev_info(sfp->dev,
+-				 "no RollBall bridge detected, using module as a media converter\n");
++				 "RollBall unavailable after startup retries, using module EEPROM capabilities\n");
+ 			sfp->mdio_protocol = MDIO_I2C_NONE;
+ 			sfp->no_rollball_bridge = true;
+ 			return 0;
+@@ -2076,7 +2082,7 @@
+ 	if (phy->is_c45) {
+ 		for (i = 0; i < ARRAY_SIZE(phy->c45_ids.device_ids); i++) {
+ 			id = phy->c45_ids.device_ids[i];
+-			if (id == 0xffffffff)
++			if (!id || id == 0xffffffff)
+ 				continue;
+ 
+ 			dev_info(sfp->dev,
+@@ -2470,7 +2476,7 @@
+ 			dev_err(sfp->dev,
+ 				"Failed to rewrite module EEPROM: %pe\n",
+ 				ERR_PTR(err));
+-			return err;
++			return err < 0 ? err : -EIO;
+ 		}
+ 
+ 		/* Cotsworks modules have been found to require a delay between write operations. */
+@@ -2483,7 +2489,7 @@
+ 			dev_err(sfp->dev,
+ 				"Failed to update base structure checksum in fiber module EEPROM: %pe\n",
+ 				ERR_PTR(err));
+-			return err;
++			return err < 0 ? err : -EIO;
+ 		}
+ 	}
+ 	return 0;
+@@ -2553,10 +2559,8 @@
+ 		if (sfp_id_is_unready(&id.base))
+ 			goto unready;
+ 
+-		/* If the byte-at-a-time re-read yields a valid vendor
+-		 * name, the module is a standard SFP whose multi-byte read
+-		 * failed for platform (I2C) reasons rather than because it
+-		 * is an RTL8672/RTL9601C GPON stick.  Tone down the warning.
++		/* The read pattern does not identify a chipset or prove which
++		 * side of the I2C connection caused the block-read failure.
+ 		 */
+ 		if (sfp_id_has_valid_vendor_name(id.base.vendor_name,
+ 						 sizeof(id.base.vendor_name)))
+@@ -2564,7 +2568,7 @@
+ 				 "I2C multi-byte read unreliable, falling back to byte-at-a-time\n");
+ 		else
+ 			dev_info(sfp->dev,
+-				 "Detected broken RTL8672/RTL9601C emulated EEPROM\n");
++				 "I2C multi-byte read unreliable, vendor identity unavailable\n");
+ 		dev_info(sfp->dev,
+ 			 "Switching to reading EEPROM to one byte at a time\n");
+ 	}
+@@ -2663,6 +2667,15 @@
+ 
+ 	/* Check whether we support this module */
+ 	if (!sfp->type->module_supported(&id)) {
++		/* Unset identifiers may be transient during startup, but are
++		 * never sufficient evidence to accept an otherwise unknown
++		 * module. Keep the normal bounded probe retries available.
++		 */
++		if (!id.base.phys_id && !id.base.phys_ext_id) {
++			if (report)
++				dev_err(sfp->dev, "EEPROM module identifiers remain unset\n");
++			return -EAGAIN;
++		}
+ 		dev_err(sfp->dev,
+ 			"module is not supported - phys id 0x%02x 0x%02x\n",
+ 			sfp->id.base.phys_id, sfp->id.base.phys_ext_id);
+@@ -2951,6 +2964,7 @@
+ 
+ 		/* Initialise the fault clearance retries */
+ 		sfp->sm_fault_retries = N_FAULT_INIT;
++		sfp->sm_phy_retries = R_PHY_RETRY;
+ 
+ 		/* We need to check the TX_FAULT state, which is not defined
+ 		 * while TX_DISABLE is asserted. The earliest we want to do
+@@ -2997,6 +3011,11 @@
+ 			/* Create mdiobus and start trying for PHY */
+ 			ret = sfp_sm_add_mdio_bus(sfp);
+ 			if (ret < 0) {
++				if (ret == -EAGAIN && sfp->sm_phy_retries &&
++				    --sfp->sm_phy_retries) {
++					sfp_sm_next(sfp, SFP_S_INIT, sfp->phy_t_retry);
++					break;
++				}
+ 				sfp_sm_next(sfp, SFP_S_FAIL, 0);
+ 				break;
+ 			}
+@@ -3024,6 +3043,15 @@
+ 				break;
+ 			} else {
+ 				dev_info(sfp->dev, "no PHY detected\n");
++				/* Keep slow RollBall bridges in native PHY discovery
++				 * until this budget expires. Only then arm converter
++				 * recovery; a 200ms command deadline proves no absence.
++				 */
++				if (ret == -ENODEV &&
++				    sfp->mdio_protocol == MDIO_I2C_ROLLBALL) {
++					sfp->no_rollball_bridge = true;
++					sfp->sm_reprobe_enabled = true;
++				}
+ 			}
+ 		} else if (ret) {
+ 			sfp_sm_next(sfp, SFP_S_FAIL, 0);
+@@ -3445,21 +3473,31 @@
+ #define SFP_WARM_BOOT_READY_MS	300
+ #define SFP_WARM_BOOT_READY_RETRIES	10
+ #define SFP_WARM_BOOT_RETRIES	5
+-#define SFP_WARM_BOOT_PULSE_MS	100
+ #define SFP_WARM_BOOT_SETTLE_MS	500
+ #define SFP_WARM_BOOT_POWER_OFF_MS	500
+ #define SFP_WARM_BOOT_POWER_ON_MS	1500
+ 
+ static int sfp_warm_boot_read_eeprom(struct sfp *sfp)
+ {
+-	u8 phys_id;
++	struct sfp_eeprom_base id;
+ 	int ret;
+ 
+-	ret = sfp_read(sfp, false, 0, &phys_id, sizeof(phys_id));
+-	if (ret == sizeof(phys_id))
+-		return 0;
+-
+-	return ret < 0 ? ret : -EIO;
++	ret = sfp_read(sfp, false, 0, &id, sizeof(id));
++	if (ret != sizeof(id))
++		return ret < 0 ? ret : -EIO;
++
++	/* A one-byte ACK can hide an entirely blank identity. Use the same
++	 * block-read fallback as module probing without interpreting the ID
++	 * or bypassing any module-specific checksum exception here.
++	 */
++	if (sfp_id_needs_byte_io(sfp, &id, sizeof(id))) {
++		sfp->i2c_block_size = 1;
++		ret = sfp_read(sfp, false, 0, &id, sizeof(id));
++		if (ret != sizeof(id))
++			return ret < 0 ? ret : -EIO;
++	}
++
++	return sfp_id_is_unready(&id) ? -EAGAIN : 0;
+ }
+ 
+ static int sfp_warm_boot_wait_for_eeprom(struct sfp *sfp)
+@@ -3490,12 +3528,12 @@
+ 
+ 	while (adap) {
+ 		ret = i2c_recover_bus(adap);
+-		if (ret != -EBUSY)
++		if (ret != -EBUSY && ret != -EOPNOTSUPP)
+ 			break;
+ 		adap = i2c_parent_is_i2c_adapter(adap);
+ 	}
+ 
+-	if (ret == -EBUSY) {
++	if (ret == -EBUSY || ret == -EOPNOTSUPP) {
+ 		dev_dbg(sfp->dev, "warm boot: no I2C bus recovery support\n");
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -3537,15 +3575,11 @@
+ 	}
+ 
+ 	for (retry = 0; retry < SFP_WARM_BOOT_RETRIES; retry++) {
+-		if (sfp->gpio[GPIO_TX_DISABLE]) {
+-			/* Hold TX_DISABLE asserted, then release: several GPON
+-			 * modules reset their management firmware on the deassert
+-			 * edge after a sustained disable, re-initialising the
+-			 * EEPROM interface. */
+-			gpiod_set_value_cansleep(sfp->gpio[GPIO_TX_DISABLE], 1);
+-			msleep(SFP_WARM_BOOT_PULSE_MS);
+-			gpiod_set_value_cansleep(sfp->gpio[GPIO_TX_DISABLE], 0);
+-		}
++		/* TX_DISABLE is a transmitter inhibit, not a generic module
++		 * reset. Keep it asserted until the normal state machine
++		 * enables an administratively UP interface.
++		 */
++		sfp_module_tx_disable(sfp);
+ 
+ 		if (sfp->i2c) {
+ 			i2c_lock_bus(sfp->i2c, I2C_LOCK_SEGMENT);
+@@ -3560,8 +3594,6 @@
+ 				"warm boot: I2C recovery failed: %d\n",
+ 				recover_ret);
+ 
+-		/* Keep the cached output state and physical pin safely disabled. */
+-		sfp_module_tx_disable(sfp);
+ 		msleep(SFP_WARM_BOOT_SETTLE_MS);
+ 
+ 		ret = sfp_warm_boot_read_eeprom(sfp);
+--- a/drivers/net/phy/sfp.h
++++ b/drivers/net/phy/sfp.h
+@@ -12,6 +12,7 @@
+ 	void (*modes)(const struct sfp_eeprom_id *id, unsigned long *modes,
+ 		      unsigned long *interfaces);
+ 	void (*fixup)(struct sfp *sfp);
++	bool part_prefix_match;
+ };
+ 
+ struct sfp_socket_ops {
+--- a/drivers/net/mdio/mdio-i2c.c
++++ b/drivers/net/mdio/mdio-i2c.c
+@@ -226,12 +226,15 @@
+ }
+ 
+ static int i2c_rollball_mii_poll(struct mii_bus *bus, int bus_addr, u8 *buf,
+-				 size_t len)
++				 size_t len, bool *command_timeout)
+ {
+ 	struct i2c_adapter *i2c = bus->priv;
+ 	struct i2c_msg msgs[2];
+ 	u8 cmd_addr, tmp, *res;
+ 	int i, ret;
++
++	if (command_timeout)
++		*command_timeout = false;
+ 
+ 	cmd_addr = ROLLBALL_CMD_ADDR;
+ 
+@@ -265,6 +268,9 @@
+ 
+ 	dev_dbg(&bus->dev, "poll timed out\n");
+ 
++	if (command_timeout)
++		*command_timeout = true;
++
+ 	return -ETIMEDOUT;
+ }
+ 
+@@ -294,6 +300,7 @@
+ static int i2c_mii_read_rollball(struct mii_bus *bus, int phy_id, int devad,
+ 				 int reg)
+ {
++	bool command_timeout;
+ 	u8 buf[4], res[6];
+ 	int bus_addr, ret;
+ 	u16 val;
+@@ -312,8 +319,12 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = i2c_rollball_mii_poll(bus, bus_addr, res, sizeof(res));
+-	if (ret == -ETIMEDOUT)
++	ret = i2c_rollball_mii_poll(bus, bus_addr, res, sizeof(res),
++				    &command_timeout);
++	/* Only a module command deadline means an absent MDIO register.
++	 * Preserve an I2C transport timeout as an error for PHY discovery.
++	 */
++	if (ret == -ETIMEDOUT && command_timeout)
+ 		return 0xffff;
+ 	else if (ret < 0)
+ 		return ret;
+@@ -345,7 +356,7 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = i2c_rollball_mii_poll(bus, bus_addr, NULL, 0);
++	ret = i2c_rollball_mii_poll(bus, bus_addr, NULL, 0, NULL);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -393,7 +404,10 @@
+ 			return 0;
+ 	}
+ 
+-	return -ENODEV;
++	/* A command deadline can occur while the module controller starts.
++	 * Keep the bus and let native PHY discovery use its full retry budget.
++	 */
++	return 0;
+ }
+ 
+ static int i2c_mii_init_rollball(struct i2c_adapter *i2c)
+@@ -415,9 +429,7 @@
+ 
+ 	ret = i2c_transfer(i2c, &msg, 1);
+ 	if (ret < 0) {
+-		/* A module without the RollBall bridge firmware answers
+-		 * the 0x51 command interface with NACK; treat it as a
+-		 * confirmed media converter instead of failing. */
++		/* Let SFP apply its bounded startup retry budget to NACKs. */
+ 		if (ret == -ENXIO)
+ 			return -ENODEV;
+ 		return ret;
+--- a/Documentation/devicetree/bindings/net/sff,sfp.yaml
++++ b/Documentation/devicetree/bindings/net/sff,sfp.yaml
+@@ -66,7 +66,8 @@
+       Enable disruptive startup recovery only for SFP cages affected by modules
+       whose EEPROM can remain unavailable after a warm reboot. When a module is
+       present, the driver waits for passive EEPROM readiness before attempting
+-      an optional power cycle, a TX_DISABLE pulse, or I2C bus recovery.
++      an optional power cycle or I2C bus recovery. The transmitter remains
++      disabled until the normal SFP state machine enables the interface.
+ 
+   "rate-select0-gpios":
+     maxItems: 1
