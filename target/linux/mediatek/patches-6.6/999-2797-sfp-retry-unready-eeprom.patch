@@ -1,0 +1,101 @@
+From: MedyMa <aneylovemzy@gmail.com>
+Subject: [PATCH] net: phy: sfp: retry blank and transiently corrupt EEPROM reads
+
+A blank EEPROM base passes its zero checksum. The legacy zero-ID
+compatibility rule can then publish empty capabilities, causing a copper
+module to be rejected by phylink as an optical module with no interfaces.
+
+Reject blank/erased data before publishing an identity and retry through
+the existing finite SFP probe budget. Keep all named quirks and nonblank
+zero-ID compatibility. Treat a bad base checksum as a retryable read,
+while preserving explicit vendor checksum exceptions. A permanently
+unreadable module still fails, without inventing speeds or PHY types.
+
+Do not log the RTL8672 heuristic for a still-blank byte-wise reread.
+Initialize the whole ID and dump only bytes already read on base failure.
+
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -2410,6 +2410,16 @@
+ 	return true;
+ }
+ 
++/* An ACK and a matching checksum do not prove that EEPROM is ready:
++ * an all-zero base has a valid zero checksum but no module capabilities.
++ * Neither blank nor erased data may be published as a module identity.
++ */
++static bool sfp_id_is_unready(const struct sfp_eeprom_base *id)
++{
++	return !memchr_inv(id, 0, sizeof(*id)) ||
++	       !memchr_inv(id, 0xff, sizeof(*id));
++}
++
+ static bool sfp_id_has_valid_vendor_name(const char *name, size_t len)
+ {
+ 	bool seen = false;
+@@ -2478,7 +2488,7 @@
+ static int sfp_sm_mod_probe(struct sfp *sfp, bool report)
+ {
+ 	/* SFP module inserted - read I2C data */
+-	struct sfp_eeprom_id id;
++	struct sfp_eeprom_id id = {};
+ 	bool cotsworks_sfbg;
+ 	unsigned int mask;
+ 	bool cotsworks, jesslink, sklink;;
+@@ -2523,6 +2533,9 @@
+ 				ERR_PTR(ret));
+ 			return -EAGAIN;
+ 		}
++
++		if (sfp_id_is_unready(&id.base))
++			goto unready;
+ 
+ 		/* If the byte-at-a-time re-read yields a valid vendor
+ 		 * name, the module is a standard SFP whose multi-byte read
+@@ -2540,6 +2553,9 @@
+ 			 "Switching to reading EEPROM to one byte at a time\n");
+ 	}
+ 
++	if (sfp_id_is_unready(&id.base))
++		goto unready;
++
+ 	/* Cotsworks do not seem to update the checksums when they
+ 	 * do the final programming with the final module part number,
+ 	 * serial number and date code.
+@@ -2577,12 +2593,17 @@
+ 				 "EEPROM base structure checksum failure (0x%02x != 0x%02x)\n",
+ 				 check, id.base.cc_base);
+ 		} else {
+-			dev_err(sfp->dev,
+-				"EEPROM base structure checksum failure: 0x%02x != 0x%02x\n",
+-				check, id.base.cc_base);
+-			print_hex_dump(KERN_ERR, "sfp EE: ", DUMP_PREFIX_OFFSET,
+-				       16, 1, &id, sizeof(id), true);
+-			return -EINVAL;
++			/* Reads during module initialization can be transiently
++			 * corrupt. Use the existing bounded probe retry budget.
++			 */
++			if (report) {
++				dev_err(sfp->dev,
++					"EEPROM base structure checksum failure: 0x%02x != 0x%02x\n",
++					check, id.base.cc_base);
++				print_hex_dump(KERN_ERR, "sfp EE: ", DUMP_PREFIX_OFFSET,
++					       16, 1, &id.base, sizeof(id.base), true);
++			}
++			return -EAGAIN;
+ 		}
+ 	}
+ 
+@@ -2692,6 +2713,12 @@
+ 	mutex_unlock(&sfp->st_mutex);
+ 
+ 	return 0;
++
++unready:
++	if (report)
++		dev_err(sfp->dev,
++			"EEPROM base is blank or erased; module identity unavailable\n");
++	return -EAGAIN;
+ }
+ 
+ static void sfp_sm_mod_remove(struct sfp *sfp)
