@@ -1,0 +1,47 @@
+From 8f053f4c93a2849d9df4e5960845548aa9405152 Mon Sep 17 00:00:00 2001
+From: "chak-kei.lam" <chak-kei.lam@mediatek.com>
+Date: Thu, 2 Apr 2026 14:05:39 +0800
+Subject: [PATCH] net: netdevice: add ndo_flow_offload_stats64_add for offload
+ stats correction
+
+Introduce a new net_device_ops callback, ndo_flow_offload_stats64_add(),
+to allow virtual upper devices (e.g., VLAN, PPP) to correct their software
+statistics when traffic is hardware-offloaded.
+
+When a flow is offloaded to hardware, packets bypass the CPU entirely,
+causing the software counters of virtual devices sitting above the
+offloading device to become inaccurate. This new NDO provides a
+mechanism to compensate by adding hardware-reported byte and packet
+counts (via struct rtnl_link_stats64) into the device's per-CPU
+software statistics.
+
+The callback returns 0 on success, or a negative errno on failure.
+
+Ported from ImmortalWrt 25.12 (999-net-04) for the 6.6 mt7988 line.
+Refresh against the actual 6.6 patch stage; do not use whitespace/fuzz overrides.
+---
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1349,6 +1349,12 @@
+  *	For virtual devices like bridges, vlan, and pppoe, fill in the
+  *	underlying network device that can be used for offloading connections.
+  *	Return an error if offloading is not supported.
++ *
++ * int (*ndo_flow_offload_stats64_add)(struct net_device *dev,
++ *                                     const struct rtnl_link_stats64 *stats64);
++ *      Add hardware-offloaded traffic to a virtual device's software counters.
++ *      The caller must serialize per-CPU updates with bottom halves disabled.
++ *      Return 0 on success or a negative errno on failure.
+  *
+  * int (*ndo_change_carrier)(struct net_device *dev, bool new_carrier);
+  *	Called to change device carrier. Soft-devices (like dummy, team, etc)
+@@ -1637,6 +1643,8 @@
+ 						      struct nlmsghdr *nlh,
+ 						      u16 flags);
+ 	int			(*ndo_flow_offload_check)(struct flow_offload_hw_path *path);
++	int			(*ndo_flow_offload_stats64_add)(struct net_device *dev,
++					       const struct rtnl_link_stats64 *stats64);
+ 	int			(*ndo_change_carrier)(struct net_device *dev,
+ 						      bool new_carrier);
+ 	int			(*ndo_get_phys_port_id)(struct net_device *dev,

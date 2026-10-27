@@ -3768,6 +3768,45 @@ static bool hnat_invalid_index_fallback(struct sk_buff *skb)
 	return true;
 }
 
+/* The existing firmware encapsulates the outer tunnel; PPE handles the inner
+ * TCP/UDP translation. Validate a complete non-GSO IPv4 transport header before
+ * either prefill or confirmation. This is not an outer-IPv6 capability claim.
+ */
+static bool hnat_tunnel_ipv4_payload_valid(const struct sk_buff *skb, int offset,
+					  const struct iphdr *ip)
+{
+	struct tcphdr tcp_copy;
+	struct udphdr udp_copy;
+	const struct tcphdr *tcp;
+	const struct udphdr *udp;
+	u32 l4_len;
+
+	if (!ip || offset < 0 || (unsigned int)offset > skb->len ||
+	    ip->version != 4 || ip->ihl != 5 || ip_is_fragment(ip) || skb_is_gso(skb) ||
+	    ntohs(ip->tot_len) < sizeof(*ip) ||
+	    ntohs(ip->tot_len) > skb->len - (unsigned int)offset)
+		return false;
+	l4_len = ntohs(ip->tot_len) - sizeof(*ip);
+	if (ip->protocol == IPPROTO_TCP) {
+		if (l4_len < sizeof(tcp_copy))
+			return false;
+		tcp = skb_header_pointer(skb, offset + sizeof(*ip),
+					 sizeof(tcp_copy), &tcp_copy);
+		return tcp && tcp->doff >= 5 && tcp->doff * 4 <= l4_len;
+	}
+	if (ip->protocol == IPPROTO_UDP) {
+		if (l4_len < sizeof(udp_copy))
+			return false;
+		udp = skb_header_pointer(skb, offset + sizeof(*ip),
+					 sizeof(udp_copy), &udp_copy);
+		/* IPv4 permits a zero UDP checksum. Length still has to describe
+		 * the complete datagram; no truncated/padded header is inferred.
+		 */
+		return udp && ntohs(udp->len) == l4_len;
+	}
+	return false;
+}
+
 /* Confirm the inner packet using an explicit kernel inner-header marker.
  * Unknown encapsulations/offsets remain on the software forwarding path.
  */
@@ -3787,13 +3826,11 @@ static bool hnat_tunnel_inner_match(const struct sk_buff *skb,
 	if (offset < 0 || offset > skb->len || skb->len - offset < sizeof(ip_copy))
 		return false;
 	ip = skb_header_pointer(skb, offset, sizeof(ip_copy), &ip_copy);
-	if (!ip || ip->version != 4 || ip->ihl < 5 || ip_is_fragment(ip) ||
-	    ip->protocol != IPPROTO_TCP || ntohs(ip->tot_len) < ip->ihl * 4 + sizeof(struct tcphdr) ||
-	    ntohs(ip->tot_len) > skb->len - offset)
+	if (!hnat_tunnel_ipv4_payload_valid(skb, offset, ip))
 		return false;
 	ports = skb_header_pointer(skb, offset + ip->ihl * 4,
 				   sizeof(ports_copy), &ports_copy);
-	return ports && !entry->bfib1.udp &&
+	return ports && (ip->protocol == IPPROTO_UDP) == !!entry->bfib1.udp &&
 	       ntohl(ip->saddr) == entry->ipv4_hnapt.new_sip &&
 	       ntohl(ip->daddr) == entry->ipv4_hnapt.new_dip &&
 	       ntohs(ports->src) == entry->ipv4_hnapt.new_sport &&
@@ -4114,6 +4151,11 @@ static unsigned int mtk_hnat_nf_post_routing(
 
 	if (out->netdev_ops->ndo_flow_offload_check) {
 		path_err = out->netdev_ops->ndo_flow_offload_check(&hw_path);
+		/* A failed/partial resolution cannot supply a device or hardware
+		 * action for publication. Leave this packet on its software path.
+		 */
+		if (path_err || !hw_path.dev || !hw_path.virt_dev)
+			return 0;
 		out = (IS_GMAC1_MODE) ? hw_path.virt_dev : hw_path.dev;
 	}
 
@@ -4123,9 +4165,9 @@ static unsigned int mtk_hnat_nf_post_routing(
 		const struct iphdr *ip = skb_header_pointer(skb, skb_network_offset(skb),
 							 sizeof(copy), &copy);
 
-		if (skb->protocol != htons(ETH_P_IP) || !ip || ip->version != 4 ||
-		    ip->ihl != 5 || ip->protocol != IPPROTO_TCP || ip_is_fragment(ip) ||
-		    skb_is_gso(skb) || dev_net(out) != &init_net ||
+		if (skb->protocol != htons(ETH_P_IP) ||
+		    !hnat_tunnel_ipv4_payload_valid(skb, skb_network_offset(skb), ip) ||
+		    dev_net(out) != &init_net ||
 		    (hw_path.tnl_type != FLOW_OFFLOAD_TNL_GRETAP &&
 		     hw_path.tnl_type != FLOW_OFFLOAD_TNL_VXLAN &&
 		     hw_path.tnl_type != FLOW_OFFLOAD_TNL_L2TP_V2)) {

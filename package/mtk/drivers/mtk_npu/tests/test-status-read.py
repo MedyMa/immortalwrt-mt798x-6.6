@@ -17,10 +17,16 @@ printf '%s\\n%s\\n%s\\n' "$ret" "$READ_COVERAGE" "$READ_VALUE"
 ''')
 with tempfile.TemporaryDirectory(prefix='tops-status-') as tmp:
     t=Path(tmp);(t/'complete').write_text('abcd');(t/'empty').touch();(t/'long').write_text('x'*1024)
+    (t/'newline-exact').write_text('abc\n')
+    (t/'newline-over').write_text('abcd\n')
+    (t/'newlines-only').write_text('\n'*5)
     os.mkfifo(t/'blocked');(t/'no-tools').mkdir()
     cases=[('complete',t/'complete',4,'complete','abcd',False),
            ('empty',t/'empty',4,'complete','',False),
            ('truncated',t/'long',4,'truncated','',False),
+           ('newline-exact',t/'newline-exact',4,'complete','abc',False),
+           ('newline-over',t/'newline-over',4,'truncated','',False),
+           ('newlines-only',t/'newlines-only',4,'truncated','',False),
            ('missing',t/'absent',4,'missing','',False),
            ('no-timeout',t/'complete',4,'no_timeout_tool','',True),
            ('blocked',t/'blocked',4,'read_exit_124','',False)]

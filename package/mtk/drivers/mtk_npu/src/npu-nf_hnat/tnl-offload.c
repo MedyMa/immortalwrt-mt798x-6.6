@@ -796,6 +796,7 @@ void mtk_npu_nf_hnat_tnl_offload_deinit(void)
 
 void mtk_npu_nf_hnat_statistic_show(struct seq_file *s)
 {
+	seq_puts(s, "unit=host_eligibility_and_setup_events; not_hardware_bytes_or_forwarding_proof\n");
 	seq_printf(s, "decap offloadable|success: %llu|fail: %llu|\n",
 		   hnat_ts.decap_offloadable.success, hnat_ts.decap_offloadable.fail);
 	seq_printf(s, "decap offload    |success: %llu|fail: %llu|\n",

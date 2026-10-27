@@ -24,7 +24,7 @@ start=header.index('#if defined(CONFIG_MEDIATEK_NETSYS_V2) || defined(CONFIG_MED
 for f,n in [('network/ip_params.h','npu_ip_params'),('network/ipv6_params.h','npu_ipv6_params'),('transport/udp_params.h','npu_udp_params'),('tunnel/l2tp/l2tp_params.h','npu_l2tp_params'),('tunnel/pptp/pptp_params.h','npu_pptp_params'),('tunnel/vxlan/vxlan_params.h','npu_vxlan_params')]:types+=block((N/'protocol/inc/npu/protocol'/f).read_text(),n,'struct')
 params=(N/'inc/npu/npu_params.h').read_text();types+=params[params.index('enum npu_mac_type {'):params.index('int\nmtk_npu_encap_param_setup')]
 types+='\n'.join(l for l in params.splitlines() if l.startswith(('#define TNL_DECAP_ENABLE','#define TNL_ENCAP_ENABLE')))+'\n'
-types+=block(tnl,'tnl_status','enum')+block(tnl,'npu_tnl_info','struct')+block(tnl,'npu_tnl_input','struct')
+types+=block(tnl,'tnl_status','enum')+block(tnl,'npu_tnl_sync_stage','enum')+block(tnl,'npu_tnl_info','struct')+block(tnl,'npu_tnl_input','struct')
 typedef_start=tnl.index('typedef int (*tnl_info_setup_func_t)');types+=tnl[typedef_start:tnl.index(';',typedef_start)+1]+'\n'
 types+='\n'.join(l for l in tnl.splitlines() if l.startswith('#define TNL_STA_'))+'\n'
 dependency=r'''

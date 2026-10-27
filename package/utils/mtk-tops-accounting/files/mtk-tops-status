@@ -1,6 +1,7 @@
 #!/bin/sh
 # Bounded, passive software status. No debugfs mount, device setting, MIB
 # drain, service installation, counter reset, conntrack scan or FOE dump.
+export LC_ALL=C
 . /usr/share/libubox/jshn.sh
 
 bounded_read() {
@@ -12,18 +13,53 @@ bounded_read() {
 		READ_COVERAGE=no_timeout_tool
 		return 1
 	}
-	value=$(timeout 2 head -c "$(( $2 + 1 ))" "$1" 2>/dev/null)
+	# Count trailing newlines too. Command substitution would otherwise strip
+	# them before the size check and misreport a truncated snapshot as complete.
+	value=$(timeout 2 head -c "$(( $2 + 1 ))" "$1" 2>/dev/null
+		rc=$?; printf .; exit "$rc")
 	rc=$?
 	[ "$rc" -eq 0 ] || {
 		READ_COVERAGE="read_exit_$rc"
 		return 1
 	}
+	value=${value%.}
 	[ "${#value}" -le "$2" ] || {
 		READ_COVERAGE=truncated
 		return 1
 	}
-	READ_VALUE=$value
+	READ_VALUE=$(printf '%s' "$value")
 	READ_COVERAGE=complete
+}
+
+valid_uint() {
+	case "$1" in ''|*[!0-9]*|0[0-9]*) return 1 ;; esac
+	# Every integer bound used below fits signed 32 bits. Length-check before
+	# test's integer conversion so an oversized field cannot overflow it.
+	[ "${#1}" -le 10 ] && [ "$1" -le "$2" ] 2>/dev/null
+}
+
+valid_ipv4() {
+	local octet IFS=.
+	case "$1" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+	set -- $1
+	[ "$#" -eq 4 ] || return 1
+	for octet in "$@"; do
+		[ "${#octet}" -le 3 ] && valid_uint "$octet" 255 || return 1
+	done
+}
+
+valid_generation() {
+	case "$1" in ''|*[!0-9]*|0[0-9]*) return 1 ;; esac
+	[ "${#1}" -lt 20 ] && return 0
+	[ "${#1}" -eq 20 ] && ! [ "$1" \> 18446744073709551615 ]
+}
+
+valid_sync_error() {
+	case "$1" in
+		-0) return 1 ;;
+		-*) valid_uint "${1#-}" 4095 ;;
+		*) valid_uint "$1" 4095 ;;
+	esac
 }
 
 npu_present=0
@@ -35,10 +71,24 @@ for node in /sys/bus/platform/drivers/mediatek,npu/*/npu/mcu/state; do
 	[ -r "$node" ] || continue
 	npu_present=1
 	if bounded_read "$node" 1024; then
-		if json_load "$READ_VALUE"; then
+		# jshn.sh's json_load() evaluates parser output; some versions return
+		# success for empty output even when the parser failed. Check it first.
+		if jshn -r "$READ_VALUE" >/dev/null 2>&1 && json_load "$READ_VALUE" 2>/dev/null; then
+			json_get_var npu_schema schema
+			json_get_type ready_type firmware_ready
+			json_get_type alive_type mcu_alive
+			json_get_type count_type registered_tunnel_types
 			json_get_var npu_ready firmware_ready
 			json_get_var npu_alive mcu_alive
 			json_get_var npu_types registered_tunnel_types
+			if [ "$npu_schema" != 1 ] || [ "$ready_type" != boolean ] ||
+			   [ "$alive_type" != boolean ] || [ "$count_type" != int ] ||
+			   ! valid_uint "$npu_types" 32; then
+				READ_COVERAGE=invalid_schema
+				npu_ready=0
+				npu_alive=0
+				npu_types=0
+			fi
 		else
 			READ_COVERAGE=invalid_json
 		fi
@@ -69,9 +119,18 @@ if bounded_read /proc/npu/tunnels 8192; then
 	tunnel_text=$READ_VALUE
 fi
 tunnel_coverage=$READ_COVERAGE
+if [ "$tunnel_coverage" = complete ]; then
+	IFS= read -r tunnel_schema <<EOF
+$tunnel_text
+EOF
+	if [ "$tunnel_schema" != '# schema=1 max_tunnels=32 snapshot=per_entry unit=metadata' ]; then
+		tunnel_coverage=unsupported_schema
+		tunnel_text=
+	fi
+fi
 
 json_init
-json_add_int schema 2
+json_add_int schema 3
 json_add_object npu
 json_add_boolean status_node_present "$npu_present"
 json_add_boolean firmware_ready "$npu_ready"
@@ -81,18 +140,61 @@ json_add_string coverage "$npu_coverage"
 json_add_boolean packet_offload_verified 0
 json_close_object
 json_add_object tunnels
-json_add_string coverage "$tunnel_coverage"
 json_add_string snapshot per_entry_software
 json_add_string unit metadata
 json_add_int capacity 32
 json_add_array entries
+tunnel_count=0
+synced_count=0
+invalid_count=0
+seen_indices=' '
+health_index=
 while read -r ti tg tif tt tp ts tsp td tdp te tde tsy extra; do
+	case "$ti:$tg" in
+		'#:sync')
+			# Optional metadata comment, immediately preceding its data row.
+			# Join only the same index/generation from that per-entry snapshot.
+			[ -z "$health_index" ] || invalid_count=$((invalid_count + 1))
+			health_index=
+			if [ -z "$te$tde$tsy$extra" ] && valid_uint "$tif" 31 &&
+			   valid_generation "$tt" && valid_generation "$tp" &&
+			   valid_generation "$ts" && valid_uint "$tsp" 6 &&
+			   valid_sync_error "$td" && valid_generation "$tdp"; then
+				health_index=$tif
+				health_generation=$tt
+				health_attempts=$tp
+				health_failures=$ts
+				health_stage=$tsp
+				health_error=$td
+				health_synced_generation=$tdp
+			else
+				invalid_count=$((invalid_count + 1))
+			fi
+			continue
+			;;
+	esac
 	case "$ti" in ''|\#*) continue ;; esac
-	[ -z "$extra" ] || continue
-	case "$ti$tg$tif$tt$tp$tsp$tdp$te$tde$tsy" in *[!0-9]*|'') continue ;; esac
-	case "$ts$td" in *[!0-9.]*|'') continue ;; esac
-	case "$tt" in 1) tname=gretap ;; 3) tname=l2tpv2 ;; 5) tname=vxlan ;; *) continue ;; esac
-	[ "$ti" -lt 32 ] 2>/dev/null || continue
+	valid=1
+	[ -z "$extra" ] && valid_uint "$ti" 31 && valid_uint "$tif" 2147483647 &&
+		valid_uint "$tsp" 65535 && valid_uint "$tdp" 65535 &&
+		valid_ipv4 "$ts" && valid_ipv4 "$td" || valid=0
+	valid_generation "$tg" || valid=0
+	case "$te:$tde:$tsy" in [01]:[01]:[01]) ;; *) valid=0 ;; esac
+	case "$tt:$tp" in
+		1:47) tname=gretap; [ "$tsp:$tdp" = 0:0 ] || valid=0 ;;
+		3:17) tname=l2tpv2 ;;
+		5:17) tname=vxlan ;;
+		*) valid=0 ;;
+	esac
+	case "$seen_indices" in *" $ti "*) valid=0 ;; esac
+	if [ "$valid" != 1 ]; then
+		invalid_count=$((invalid_count + 1))
+		health_index=
+		continue
+	fi
+	seen_indices="$seen_indices$ti "
+	tunnel_count=$((tunnel_count + 1))
+	synced_count=$((synced_count + tsy))
 	json_add_object
 	json_add_int index "$ti"
 	json_add_string generation "$tg"
@@ -106,11 +208,32 @@ while read -r ti tg tif tt tp ts tsp td tdp te tde tsy extra; do
 	json_add_boolean encapsulation "$te"
 	json_add_boolean decapsulation "$tde"
 	json_add_boolean synchronized "$tsy"
+	if [ -n "$health_index" ]; then
+		if [ "$health_index:$health_generation" = "$ti:$tg" ]; then
+			json_add_object sync_health
+			json_add_string unit parameter_sync_attempts
+			json_add_string attempts "$health_attempts"
+			json_add_string failures "$health_failures"
+			json_add_int stage "$health_stage"
+			json_add_int last_error "$health_error"
+			json_add_string synced_generation "$health_synced_generation"
+			json_close_object
+		else
+			invalid_count=$((invalid_count + 1))
+		fi
+		health_index=
+	fi
 	json_close_object
 done <<EOF
 $tunnel_text
 EOF
+[ -z "$health_index" ] || invalid_count=$((invalid_count + 1))
 json_close_array
+[ "$invalid_count" -eq 0 ] || tunnel_coverage=invalid_entries
+json_add_string coverage "$tunnel_coverage"
+json_add_int count "$tunnel_count"
+json_add_int synchronized_count "$synced_count"
+json_add_int invalid_entries "$invalid_count"
 json_close_object
 json_add_object accounting
 json_add_boolean conntrack_accounting_enabled "$ct_acct"

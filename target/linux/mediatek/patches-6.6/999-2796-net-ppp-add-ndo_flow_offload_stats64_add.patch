@@ -1,0 +1,53 @@
+From 9842c8e5847b2f51b486dcd2ed939af04dc6946a Mon Sep 17 00:00:00 2001
+From: "chak-kei.lam" <chak-kei.lam@mediatek.com>
+Date: Thu, 2 Apr 2026 14:13:03 +0800
+Subject: [PATCH] ppp: add ndo_flow_offload_stats64_add for offload stats
+ correction
+
+Adapt the callback to Linux 6.6's PPP accounting model. This tree stores
+RX/TX counters in ppp->stats64 under the receive/transmit locks; it neither
+allocates nor returns dev->tstats. Updating a per-CPU tstats pointer would
+therefore fail or remain invisible to ppp_get_stats64().
+
+Keep the definition and registration under the existing NF_FLOW_TABLE guard.
+The callback is infrastructure only; its presence does not establish correct
+HNAT per-interface attribution.
+
+---
+
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -1565,4 +1565,27 @@
+ }
+ 
++#if IS_ENABLED(CONFIG_NF_FLOW_TABLE)
++static int ppp_flow_offload_stats64_add(struct net_device *dev,
++				      const struct rtnl_link_stats64 *stats64)
++{
++	struct ppp *ppp = netdev_priv(dev);
++
++	/* 6.6 uses ppp->stats64, not dev->tstats. Match the ordinary path's
++	 * locks and the fields returned by ppp_get_stats64().
++	 */
++	ppp_recv_lock(ppp);
++	ppp->stats64.rx_packets += stats64->rx_packets;
++	ppp->stats64.rx_bytes += stats64->rx_bytes;
++	ppp_recv_unlock(ppp);
++
++	ppp_xmit_lock(ppp);
++	ppp->stats64.tx_packets += stats64->tx_packets;
++	ppp->stats64.tx_bytes += stats64->tx_bytes;
++	ppp_xmit_unlock(ppp);
++
++	return 0;
++}
++#endif
++
+ static int ppp_dev_init(struct net_device *dev)
+ {
+@@ -1660,4 +1683,5 @@
+ #if IS_ENABLED(CONFIG_NF_FLOW_TABLE)
+ 	.ndo_flow_offload_check = ppp_flow_offload_check,
++	.ndo_flow_offload_stats64_add = ppp_flow_offload_stats64_add,
+ #endif
+ 	.ndo_fill_forward_path = ppp_fill_forward_path,

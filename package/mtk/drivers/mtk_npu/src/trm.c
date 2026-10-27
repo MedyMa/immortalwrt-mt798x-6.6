@@ -9,6 +9,7 @@
 #include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/math64.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -219,26 +220,37 @@ static int __mtk_trm_dump(struct trm_hw_config *trm_hw_cfg,
 	return 0;
 }
 
+struct trm_cpu_utilization_result {
+	u32 percent;
+	int error;
+};
+
 static void trm_cpu_utilization_ret_handler(void *priv,
 					    struct mailbox_msg *msg)
 {
-	u32 *cpu_utilization = priv;
+	struct trm_cpu_utilization_result *result = priv;
 
 	/*
 	 * msg1: ticks of idle task
 	 * msg2: ticks of this statistic period
 	 */
-	if (msg->msg2 != 0)
-		*cpu_utilization = (msg->msg2 - msg->msg1) * 100U / msg->msg2;
+	if (!msg->msg2 || msg->msg1 > msg->msg2) {
+		result->error = -ERANGE;
+		return;
+	}
+	result->percent = div_u64((u64)(msg->msg2 - msg->msg1) * 100,
+				 msg->msg2);
+	result->error = 0;
 }
 
 int mtk_trm_cpu_utilization(enum core_id core, u32 *cpu_utilization)
 {
 	struct mailbox_dev *send_mdev;
 	struct mailbox_msg msg;
+	struct trm_cpu_utilization_result result = { .error = -ENODATA };
 	int ret;
 
-	if (core > CORE_MGMT || !cpu_utilization)
+	if ((unsigned int)core > CORE_MGMT || !cpu_utilization)
 		return -EINVAL;
 
 	if (!mtk_npu_mcu_alive()) {
@@ -258,13 +270,16 @@ int mtk_trm_cpu_utilization(enum core_id core, u32 *cpu_utilization)
 
 	ret = mbox_send_msg(send_mdev,
 			    &msg,
-			    cpu_utilization,
+			    &result,
 			    trm_cpu_utilization_ret_handler);
 	if (ret) {
 		NPU_ERR("send CPU_UTILIZATION cmd failed(%d)\n", ret);
 		return ret;
 	}
 
+	if (result.error)
+		return result.error;
+	*cpu_utilization = result.percent;
 	return 0;
 }
 

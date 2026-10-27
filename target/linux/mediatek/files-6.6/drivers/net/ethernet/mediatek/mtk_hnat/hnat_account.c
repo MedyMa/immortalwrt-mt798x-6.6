@@ -10,6 +10,7 @@
 #include <linux/workqueue.h>
 #include <linux/ktime.h>
 #include <linux/jiffies.h>
+#include <linux/bitmap.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
 #include <net/netfilter/nf_conntrack.h>
@@ -73,6 +74,8 @@ struct hnat_account_ppe {
 	struct mtk_hnat *h;
 	spinlock_t lock; /* entry_lock -> this lock; never acquire entry_lock here */
 	struct hnat_slot *slots;
+	unsigned long *poll_active; /* bound, owned epochs only; protected by lock */
+	u32 poll_cursor;
 	u32 cursor;
 	bool paused;
 	bool quarantined;
@@ -90,7 +93,7 @@ struct hnat_account_ctx {
 	atomic64_t poll_lock_skips[MAX_PPE_NUM];
 	struct delayed_work gc;
 	struct delayed_work poll;
-	u32 poll_ppe, poll_slot;
+	u32 poll_ppe;
 	bool stopping;
 };
 
@@ -157,6 +160,8 @@ static bool flush_ct_locked(struct hnat_account_ppe *p, struct hnat_slot *s)
 static void retire_locked(struct hnat_account_ppe *p, struct hnat_slot *s)
 {
 	struct hnat_accounting d = hnat_ledger_take(&s->pending);
+
+	__clear_bit(s - p->slots, p->poll_active);
 	/* These bytes have already passed identity validation. Retire them to
 	 * their pinned old CT, but never synthesize shared diff / a rule path.
 	 */
@@ -241,6 +246,12 @@ static int drain_locked(struct mtk_hnat *h, u32 ppe, u32 slot,
 	if (s->owner && !s->owner->prefill) {
 		s->pending_ct.bytes += delta->bytes;
 		s->pending_ct.packets += delta->packets;
+		/* Every read clears the hardware MIB, including keepalive/debug and
+		 * retirement readers. Publish its verified CT delta here exactly once;
+		 * the independent rule ledger remains pending for a real carrier skb.
+		 */
+		if (!flush_ct_locked(p, s))
+			p->no_acct++;
 	}
 	if (!s->owner || s->owner->prefill) {
 		p->discarded_bytes += delta->bytes;
@@ -329,7 +340,7 @@ static bool account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			 struct sk_buff *skb, const struct foe_entry *entry,
 			 bool prefill, bool confirm, u64 expected_generation,
 			 bool *accepted, struct nf_conn *saved_ct,
-			 enum ip_conntrack_info saved_info)
+			 enum ip_conntrack_info saved_info, bool require_owner)
 {
 	struct hnat_account_ppe *p;
 	struct hnat_slot *s;
@@ -378,6 +389,15 @@ static bool account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		p->mismatch++;
 		spin_unlock_bh(&p->lock);
 		return true; /* handled: stale software epoch must not publish */
+	}
+	if (confirm && require_owner && (!ct || !s->owner)) {
+		/* A TOPS encap flow must retain its verified INNER CT owner. An
+		 * allocation failure is a software fallback, not an unaccounted
+		 * hardware tunnel. Preserve the ordinary owner's optional policy.
+		 */
+		p->untracked++;
+		spin_unlock_bh(&p->lock);
+		return true;
 	}
 	if (confirm && ct && (nf_ct_is_template(ct) || nf_ct_is_dying(ct) ||
 	    READ_ONCE(((struct hnat_account_net *)net_generic(nf_ct_net(ct), account_net_id))->exiting))) {
@@ -471,8 +491,11 @@ static bool account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		memcpy(&foe->bfib1, &entry->bfib1, sizeof(entry->bfib1));
 		dma_wmb();
 	}
-	if (s->owner)
+	if (s->owner) {
 		s->owner->identity = *foe;
+		if (!s->owner->prefill)
+			__set_bit(slot, p->poll_active);
+	}
 	if (accepted)
 		*accepted = true;
 	spin_unlock_bh(&p->lock);
@@ -484,7 +507,7 @@ bool hnat_account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 			 bool prefill, bool confirm, u64 generation, bool *accepted)
 {
 	return account_commit(h, ppe, slot, skb, entry, prefill, confirm,
-			      generation, accepted, NULL, 0);
+			      generation, accepted, NULL, 0, false);
 }
 
 bool hnat_account_tunnel_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
@@ -496,7 +519,7 @@ bool hnat_account_tunnel_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 	 * skb's conntrack association or account its bytes a second time.
 	 */
 	return account_commit(h, ppe, slot, NULL, entry, false, true,
-			      generation, accepted, ct, ctinfo);
+			      generation, accepted, ct, ctinfo, true);
 }
 
 bool hnat_account_publish_delta(struct mtk_hnat *h, u32 ppe, u32 slot,
@@ -798,7 +821,11 @@ static void account_poll(struct work_struct *work)
 	struct hnat_account_ctx *ctx = container_of(to_delayed_work(work),
 						struct hnat_account_ctx, poll);
 	struct mtk_hnat *h = ctx->h;
-	u32 ppe_count, slot_count, n, budget;
+	u32 ppe_count, slot_count, n, budget, exhausted_count = 0;
+	u32 start_cursor[MAX_PPE_NUM] = { 0 };
+	bool started_ppe[MAX_PPE_NUM] = { false };
+	bool wrapped[MAX_PPE_NUM] = { false };
+	bool exhausted[MAX_PPE_NUM] = { false };
 	u64 started = ktime_get_ns();
 
 	if (READ_ONCE(ctx->stopping) || !account_poll_interval_ms)
@@ -809,12 +836,12 @@ static void account_poll(struct work_struct *work)
 	if (!ppe_count || !slot_count || !READ_ONCE(h->nf_stat_en))
 		goto requeue;
 	budget = min_t(u64, account_poll_budget, (u64)ppe_count * slot_count);
-	for (n = 0; n < budget; n++) {
+	for (n = 0; n < budget && exhausted_count < ppe_count;) {
 		struct hnat_account_ppe *p;
 		struct hnat_slot *s;
 		struct hnat_accounting d;
 		u32 ppe = ctx->poll_ppe % ppe_count;
-		u32 slot = ctx->poll_slot % slot_count;
+		u32 slot;
 		int err = 0;
 
 		/* A service-time budget, not a guarantee about scheduler/lock waits.
@@ -823,18 +850,20 @@ static void account_poll(struct work_struct *work)
 		if (READ_ONCE(ctx->stopping) ||
 		    ktime_get_ns() - started >= HNAT_ACCOUNT_POLL_TIME_NS)
 			break;
-		ctx->poll_ppe = ppe + 1;
-		if (ctx->poll_ppe == ppe_count) {
-			ctx->poll_ppe = 0;
-			ctx->poll_slot = (slot + 1) % slot_count;
-		}
-		if (!account_valid(h, ppe, slot))
+		ctx->poll_ppe = (ppe + 1) % ppe_count;
+		if (exhausted[ppe])
 			continue;
+		if (!account_valid(h, ppe, 0)) {
+			exhausted[ppe] = true;
+			exhausted_count++;
+			continue;
+		}
 		p = &ctx->ppe[ppe];
-		s = &p->slots[slot];
 		/* Background sampling must not wait for a forwarding-path reader. */
 		if (!spin_trylock_bh(&p->lock)) {
 			atomic64_inc(&ctx->poll_lock_skips[ppe]);
+			exhausted[ppe] = true;
+			exhausted_count++;
 			continue;
 		}
 		/* Check again after acquisition; never start a late SER transaction. */
@@ -843,6 +872,30 @@ static void account_poll(struct work_struct *work)
 			spin_unlock_bh(&p->lock);
 			break;
 		}
+		if (!started_ppe[ppe]) {
+			start_cursor[ppe] = min(p->poll_cursor, slot_count);
+			started_ppe[ppe] = true;
+		}
+		slot = find_next_bit(p->poll_active, slot_count,
+				     min(p->poll_cursor, slot_count));
+		if (slot == slot_count && !wrapped[ppe]) {
+			wrapped[ppe] = true;
+			slot = find_first_bit(p->poll_active, slot_count);
+		}
+		/* At most one circular pass per PPE in this invocation, even when
+		 * the first owner is retired concurrently. Sparse tables therefore
+		 * do not wait for a scan through all 8192 slots or reread one owner.
+		 */
+		if (p->paused || slot == slot_count ||
+		    (wrapped[ppe] && slot >= start_cursor[ppe])) {
+			exhausted[ppe] = true;
+			exhausted_count++;
+			spin_unlock_bh(&p->lock);
+			continue;
+		}
+		p->poll_cursor = slot + 1;
+		s = &p->slots[slot];
+		n++;
 		p->poll_scanned++;
 		if (!p->paused && s->owner && !s->owner->prefill) {
 			if (!owner_live(h, ppe, slot)) {
@@ -853,9 +906,6 @@ static void account_poll(struct work_struct *work)
 				err = drain_locked(h, ppe, slot, &d);
 				if (!err) {
 					p->poll_reads++;
-					if (owner_live(h, ppe, slot) &&
-					    !flush_ct_locked(p, s))
-						p->no_acct++;
 				} else {
 					p->poll_errors++;
 				}
@@ -933,6 +983,11 @@ int hnat_account_init(struct mtk_hnat *h)
 			err = -ENOMEM;
 			goto fail;
 		}
+		ctx->ppe[ppe].poll_active = bitmap_zalloc(h->foe_etry_num, GFP_KERNEL);
+		if (!ctx->ppe[ppe].poll_active) {
+			err = -ENOMEM;
+			goto fail;
+		}
 	}
 	INIT_DELAYED_WORK(&ctx->gc, account_gc);
 	INIT_DELAYED_WORK(&ctx->poll, account_poll);
@@ -951,8 +1006,10 @@ int hnat_account_init(struct mtk_hnat *h)
 				      msecs_to_jiffies(account_poll_interval_ms));
 	return 0;
 fail:
-	for (ppe = 0; ppe < ctx->ppe_num; ppe++)
+	for (ppe = 0; ppe < ctx->ppe_num; ppe++) {
+		bitmap_free(ctx->ppe[ppe].poll_active);
 		kvfree(ctx->ppe[ppe].slots);
+	}
 	kfree(ctx);
 	return err;
 }
@@ -983,8 +1040,10 @@ void hnat_account_cleanup(struct mtk_hnat *h)
 	}
 	rcu_barrier(); /* callbacks contain module text; unload must wait */
 	h->account = NULL;
-	for (ppe = 0; ppe < ctx->ppe_num; ppe++)
+	for (ppe = 0; ppe < ctx->ppe_num; ppe++) {
+		bitmap_free(ctx->ppe[ppe].poll_active);
 		kvfree(ctx->ppe[ppe].slots);
+	}
 	kfree(ctx);
 #ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
 	nf_hnat_packet_accounting_disable();
@@ -1007,8 +1066,10 @@ int hnat_account_show(struct seq_file *m, void *unused)
 		min_t(u32, h->account->ppe_num, min_t(u32, MAX_PPE_NUM, CFG_PPE_NUM))); ppe++) {
 		struct hnat_account_ppe *p = &h->account->ppe[ppe];
 		struct hnat_account_ppe snap;
+		u32 active;
 		spin_lock_bh(&p->lock);
 		snap = *p;
+		active = bitmap_weight(p->poll_active, h->account->slot_count);
 		spin_unlock_bh(&p->lock);
 		seq_printf(m, "ppe=%u paused=%u quarantine=%u reads=%llu read_error=%llu unknown_loss_events=%llu untracked=%llu mismatch=%llu retired=%llu no_acct=%llu discarded_bytes=%llu discarded_packets=%llu retire_rule_unpublished_bytes=%llu retire_rule_unpublished_packets=%llu\n",
 			   ppe, snap.paused, snap.quarantined, snap.reads,
@@ -1020,6 +1081,8 @@ int hnat_account_show(struct seq_file *m, void *unused)
 			   ppe, snap.poll_scanned, snap.poll_reads, snap.poll_errors,
 			   (unsigned long long)atomic64_read(&h->account->poll_lock_skips[ppe]),
 			   snap.ct_written_bytes, snap.ct_written_packets);
+		seq_printf(m, "ppe=%u poll_active_owned_slots=%u poll_selection=owned_bitmap\n",
+			   ppe, active);
 	}
 	return 0;
 }

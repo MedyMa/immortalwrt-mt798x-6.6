@@ -1,0 +1,40 @@
+#!/bin/sh
+# Read the vendor's five-core TRM idle-tick utilization report. Firmware
+# readiness and tunnel-table occupancy are not utilization percentages.
+export LC_ALL=C
+
+unavailable() {
+	printf '{"schema":1,"available":false,"unit":"mean_core_busy_percent","coverage":"%s"}\n' "$1"
+	exit 0
+}
+
+command -v timeout >/dev/null 2>&1 || unavailable no_timeout_tool
+[ -r /proc/npu/telemetry-capabilities ] || unavailable driver_unsupported
+capability=$(timeout 2 head -c 129 /proc/npu/telemetry-capabilities 2>/dev/null)
+[ "$?" -eq 0 ] && [ "$capability" = 'schema=1 mailbox_bounded=1 utilization_cores=5' ] ||
+	unavailable driver_unsupported
+[ -r /proc/npu/cpu-utilization ] || unavailable missing
+sample=$(timeout 2 head -c 513 /proc/npu/cpu-utilization 2>/dev/null; rc=$?; printf '.'; exit "$rc")
+[ "$?" -eq 0 ] || unavailable read_failed
+sample=${sample%.}
+[ "${#sample}" -le 512 ] || unavailable oversized
+
+percent_milli=$(printf '%s' "$sample" | awk '
+	NR == 1 { if ($0 != "CPU Utilization:") bad = 1; next }
+	{
+		if (NF != 2 || $1 !~ /^Core[0123M]$/ || seen[$1]++ ||
+		    $2 !~ /^[0-9]+%$/ || length($2) > 4) { bad = 1; next }
+		value = substr($2, 1, length($2) - 1)
+		if ((length(value) > 1 && substr(value, 1, 1) == "0") || value + 0 > 100) {
+			bad = 1; next
+		}
+		sum += value; count++
+	}
+	END {
+		if (bad || NR != 6 || count != 5 || !seen["Core0"] ||
+		    !seen["Core1"] || !seen["Core2"] || !seen["Core3"] || !seen["CoreM"])
+			exit 1
+		printf "%.0f", sum * 1000 / 5
+	}') || unavailable invalid
+
+printf '{"schema":1,"available":true,"unit":"mean_core_busy_percent","percent_milli":%s,"core_count":5,"coverage":"complete"}\n' "$percent_milli"

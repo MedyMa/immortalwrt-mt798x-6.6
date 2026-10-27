@@ -31,10 +31,28 @@ enum { MTK_HNAT_V3=5 };
 typedef struct { bool held; } spinlock_t;
 static void spin_lock_bh(spinlock_t *s) { assert(!s->held);s->held=true; }
 static void spin_unlock_bh(spinlock_t *s) { assert(s->held);s->held=false; }
+static bool spin_trylock_bh(spinlock_t *s) { if(s->held)return false;spin_lock_bh(s);return true; }
 #define lockdep_assert_held(s) assert((s)->held)
 typedef struct { u64 value; } atomic64_t;
 static void atomic64_add(u64 n,atomic64_t *s) { s->value+=n; }
-struct delayed_work { int unused; };
+static void atomic64_inc(atomic64_t *s) { ++s->value; }
+struct work_struct { int unused; };
+struct delayed_work { struct work_struct work; };
+#define to_delayed_work(w) container_of(w,struct delayed_work,work)
+static unsigned int account_poll_interval_ms=100,account_poll_budget=64;
+#define HNAT_ACCOUNT_POLL_TIME_NS 2000000ULL
+static u64 test_clock,test_clock_step;
+static u64 ktime_get_ns(void) { test_clock+=test_clock_step;return test_clock; }
+static unsigned int test_requeues;
+static unsigned long msecs_to_jiffies(unsigned int n) { return n; }
+static void schedule_delayed_work(struct delayed_work *w,unsigned long delay) { (void)w;assert(delay==100);++test_requeues; }
+#define min(a,b) ((a)<(b)?(a):(b))
+#define min_t(t,a,b) ((t)(a)<(t)(b)?(t)(a):(t)(b))
+static void __set_bit(unsigned long n,unsigned long *bits) { bits[n/(8*sizeof(*bits))]|=1UL<<(n%(8*sizeof(*bits))); }
+static void __clear_bit(unsigned long n,unsigned long *bits) { bits[n/(8*sizeof(*bits))]&=~(1UL<<(n%(8*sizeof(*bits)))); }
+static bool test_bit(unsigned long n,const unsigned long *bits) { return (bits[n/(8*sizeof(*bits))]>>(n%(8*sizeof(*bits))))&1UL; }
+static unsigned long find_next_bit(const unsigned long *bits,unsigned long size,unsigned long offset) { for(unsigned long n=offset;n<size;n++)if(test_bit(n,bits))return n;return size; }
+#define find_first_bit(bits,size) find_next_bit(bits,size,0)
 struct rcu_head { struct rcu_head *next; void (*fn)(struct rcu_head *); };
 struct nf_conntrack_zone { u16 id,dir,flags; };
 struct hnat_account_net { bool exiting; };

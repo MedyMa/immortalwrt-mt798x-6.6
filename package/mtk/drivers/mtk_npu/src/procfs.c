@@ -17,6 +17,27 @@
 struct proc_dir_entry *npu_proc_root;
 EXPORT_SYMBOL(npu_proc_root);
 
+/* Software capability marker. Legacy utilization reads can otherwise enter
+ * an unbounded mailbox wait; userspace must opt in only with this driver.
+ */
+static int telemetry_capabilities_show(struct seq_file *s, void *unused)
+{
+	seq_puts(s, "schema=1 mailbox_bounded=1 utilization_cores=5\n");
+	return 0;
+}
+
+static int telemetry_capabilities_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, telemetry_capabilities_show, NULL);
+}
+
+static const struct proc_ops telemetry_capabilities_ops = {
+	.proc_open = telemetry_capabilities_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
 static int tnl_show(struct seq_file *s, void *private)
 {
 	struct npu_tnl_info *tnl_info;
@@ -62,7 +83,9 @@ static int tunnels_show(struct seq_file *s, void *unused)
 	struct npu_tnl_info *info;
 	struct npu_tnl_params params;
 	unsigned long flags;
-	u64 generation;
+	u64 generation, sync_attempts, sync_failures, synced_generation;
+	int sync_error;
+	u8 sync_stage;
 	u32 i, status, ifindex;
 	bool synced;
 
@@ -81,6 +104,11 @@ static int tunnels_show(struct seq_file *s, void *unused)
 		}
 		params = info->cache;
 		generation = info->generation;
+		sync_attempts = info->sync_attempts;
+		sync_failures = info->sync_failures;
+		synced_generation = info->synced_generation;
+		sync_error = info->last_sync_error;
+		sync_stage = info->sync_stage;
 		ifindex = info->dev->ifindex;
 		synced = (status & TNL_STA_UPDATED) &&
 			 !(status & (TNL_STA_UPDATING | TNL_STA_QUEUED)) &&
@@ -88,6 +116,12 @@ static int tunnels_show(struct seq_file *s, void *unused)
 		spin_unlock_irqrestore(&info->lock, flags);
 		if (params.params.network.type != NPU_NETWORK_IP)
 			continue;
+		/* Optional comment records preserve the schema-1 data-row format.
+		 * Counters describe host setup/ACKs, never forwarded bytes/packets.
+		 */
+		seq_printf(s, "# sync %u %llu %llu %llu %u %d %llu\n",
+			i, generation, sync_attempts, sync_failures,
+			sync_stage, sync_error, synced_generation);
 		seq_printf(s, "%u %llu %u %u %u %pI4 %u %pI4 %u %u %u %u\n",
 			i, generation, ifindex, params.params.tunnel.type,
 			params.params.network.ip.proto, &params.params.network.ip.sip,
@@ -149,6 +183,12 @@ int mtk_npu_procfs_init(struct platform_device *pdev)
 		remove_proc_entry("tnl", npu_proc_root);
 		goto err_out;
 	}
+	if (!proc_create("telemetry-capabilities", 0400, npu_proc_root,
+			 &telemetry_capabilities_ops)) {
+		remove_proc_entry("tunnels", npu_proc_root);
+		remove_proc_entry("tnl", npu_proc_root);
+		goto err_out;
+	}
 	return 0;
 
 err_out:
@@ -159,6 +199,7 @@ err_out:
 
 void mtk_npu_procfs_deinit(struct platform_device *pdev)
 {
+	remove_proc_entry("telemetry-capabilities", npu_proc_root);
 	remove_proc_entry("tunnels", npu_proc_root);
 	remove_proc_entry("tnl", npu_proc_root);
 	remove_proc_entry("npu", NULL);

@@ -585,6 +585,12 @@ mtk_npu_tnl_info_alloc_no_lock(struct npu_tnl_type *tnl_type)
 	tnl_info_sta_init_no_tnl_lock(tnl_info);
 
 	tnl_info->tnl_type = tnl_type;
+	tnl_info->sync_attempts = 0;
+	tnl_info->sync_failures = 0;
+	tnl_info->sync_target_generation = 0;
+	tnl_info->synced_generation = 0;
+	tnl_info->last_sync_error = 0;
+	tnl_info->sync_stage = NPU_TNL_SYNC_IDLE;
 
 	INIT_HLIST_NODE(&tnl_info->hlist);
 
@@ -873,6 +879,44 @@ static int mtk_npu_tnl_sync_param_delete(bool skip_pce,
 	return ret;
 }
 
+static void tnl_sync_stage_set(struct npu_tnl_info *info, u8 stage)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&info->lock, flags);
+	info->sync_stage = stage;
+	spin_unlock_irqrestore(&info->lock, flags);
+}
+
+static void tnl_sync_attempt_begin(struct npu_tnl_info *info)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&info->lock, flags);
+	info->sync_attempts++;
+	info->last_sync_error = 0;
+	info->sync_stage = NPU_TNL_SYNC_IDLE;
+	spin_unlock_irqrestore(&info->lock, flags);
+}
+
+static void tnl_sync_attempt_finish(struct npu_tnl_info *info, int error)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&info->lock, flags);
+	info->last_sync_error = error;
+	if (error) {
+		info->sync_failures++;
+	} else {
+		info->sync_stage = NPU_TNL_SYNC_READY;
+		/* A newer cache can arrive during the mailbox operation. Record
+		 * the generation copied by this worker, not the current cache.
+		 */
+		info->synced_generation = info->sync_target_generation;
+	}
+	spin_unlock_irqrestore(&info->lock, flags);
+}
+
 static int __mtk_npu_tnl_sync_param_update(struct npu_tnl_info *tnl_info,
 					   bool is_new_tnl)
 {
@@ -884,6 +928,7 @@ static int __mtk_npu_tnl_sync_param_update(struct npu_tnl_info *tnl_info,
 	};
 	int ret;
 
+	tnl_sync_stage_set(tnl_info, NPU_TNL_SYNC_PAUSE);
 	ret = mtk_npu_net_dev_pause();
 	if (ret) {
 		NPU_NOTICE("Pause NPU network device failed: %d\n", ret);
@@ -892,6 +937,7 @@ static int __mtk_npu_tnl_sync_param_update(struct npu_tnl_info *tnl_info,
 
 	tnl_params_fw_write(tnl_info);
 
+	tnl_sync_stage_set(tnl_info, NPU_TNL_SYNC_MGMT);
 	ret = mtk_npu_net_send_cmd_mgmt(&cmd);
 	if (ret) {
 		NPU_NOTICE("Update tunnel parameters to core mgmt failed: %d\n",
@@ -900,6 +946,7 @@ static int __mtk_npu_tnl_sync_param_update(struct npu_tnl_info *tnl_info,
 	}
 
 	cmd.arg[0] = NPU_TNL_PARAMS_NET_CMD_INVALIDATE;
+	tnl_sync_stage_set(tnl_info, NPU_TNL_SYNC_OFFLOAD_SEND);
 	ret = mtk_npu_net_send_cmd_offload_no_wait(&cmd);
 	if (ret)
 		NPU_NOTICE("Update tunnel parameters to core offload failed: %d\n",
@@ -916,11 +963,13 @@ static int mtk_npu_tnl_sync_param_update(struct npu_tnl_info *tnl_info,
 {
 	int ret;
 
+	tnl_sync_attempt_begin(tnl_info);
 	if (setup_pce) {
+		tnl_sync_stage_set(tnl_info, NPU_TNL_SYNC_CLASSIFIER);
 		ret = mtk_npu_tnl_info_cls_setup(tnl_info);
 		if (ret) {
 			NPU_ERR("tnl cls setup failed: %d\n", ret);
-			return ret;
+			goto out;
 		}
 	}
 
@@ -937,23 +986,26 @@ static int mtk_npu_tnl_sync_param_update(struct npu_tnl_info *tnl_info,
 	}
 
 	if (setup_pce) {
+		tnl_sync_stage_set(tnl_info, NPU_TNL_SYNC_DIPFILTER);
 		ret = mtk_npu_tnl_info_dipfilter_setup(tnl_info);
 		if (ret) {
 			NPU_ERR("tnl dipfilter setup failed: %d\n", ret);
 			/* TODO: should undo parameter sync */
-			return ret;
+			goto out;
 		}
 	}
 
 	if (setup_pce)
 		tnl_info->pce_ready = true;
 	/* Readiness is published after both firmware and PCE succeeded. */
+	tnl_sync_attempt_finish(tnl_info, 0);
 	tnl_info_sta_updated(tnl_info);
 	return ret;
 
 cls_tear_down:
 	mtk_npu_tnl_info_cls_tear_down(tnl_info);
-
+out:
+	tnl_sync_attempt_finish(tnl_info, ret);
 	return ret;
 }
 
@@ -1017,6 +1069,7 @@ static void mtk_npu_tnl_sync_queue_proc(void)
 		tnl_status = tnl_info->status;
 		memcpy(&tnl_info->tnl_params, &tnl_info->cache,
 		       sizeof(struct npu_tnl_params));
+		tnl_info->sync_target_generation = tnl_info->generation;
 
 		list_del_init(&tnl_info->sync_node);
 
