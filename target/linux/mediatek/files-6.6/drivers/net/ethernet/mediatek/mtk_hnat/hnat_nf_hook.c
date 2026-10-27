@@ -4167,9 +4167,9 @@ static unsigned int mtk_hnat_nf_post_routing(
 		if (fn && !(hw_path.flags & BIT(DEV_PATH_TNL)) && fn(skb, arp_dev, &hw_path))
 			break;
 
-		spin_lock(&hnat_priv->entry_lock);
+		spin_lock_bh(&hnat_priv->entry_lock);
 		skb_to_hnat_info(skb, out, entry, &hw_path);
-		spin_unlock(&hnat_priv->entry_lock);
+		spin_unlock_bh(&hnat_priv->entry_lock);
 		break;
 	case HIT_BIND_KEEPALIVE_DUP_OLD_HDR:
 		/* update hnat count to nf_conntrack by keepalive */
