@@ -1,0 +1,1040 @@
+Subject: [PATCH] odhcp6c: sync public upstream runtime safety fixes
+
+Upstream: https://github.com/openwrt/odhcp6c/commit/10a52220aec9d45803518d8cc4d63e552484ed61
+
+Bring the pinned source runtime code to this upstream snapshot while
+retaining the existing package configuration and installation interface.
+The update includes the parser and memory-safety fixes backported by the
+24.10 branch, adapted upstream to the newer source layout used here.
+
+--- a/src/config.c
++++ b/src/config.c
+@@ -220,8 +220,17 @@
+ 	odhcp6c_clear_state(STATE_OPTS);
+ }
+ 
+-bool config_add_send_options(char* option) {
+-	return (config_parse_opt(option) == 0);
++bool config_add_send_options(const char *option) {
++	char *dup = strdup(option);
++	bool ok;
++
++	if (!dup)
++		return false;
++
++	ok = (config_parse_opt(dup) == 0);
++	free(dup);
++
++	return ok;
+ }
+ 
+ bool config_set_rtx_delay_max(enum config_dhcp_msg msg, unsigned int value)
+@@ -335,7 +344,7 @@
+ 	return script_unhexlify(*dst, len, src);
+ }
+ 
+-static int config_parse_opt_string(const char *src, uint8_t **dst, const bool array)
++static int config_parse_opt_string(char *src, uint8_t **dst, const bool array)
+ {
+ 	int o_len = 0;
+ 	char *sep = strpbrk(src, ARRAY_SEP);
+@@ -368,7 +377,7 @@
+ 	return o_len;
+ }
+ 
+-static int config_parse_opt_dns_string(const char *src, uint8_t **dst, const bool array)
++static int config_parse_opt_dns_string(char *src, uint8_t **dst, const bool array)
+ {
+ 	int o_len = 0;
+ 	char *sep = strpbrk(src, ARRAY_SEP);
+@@ -405,7 +414,7 @@
+ 	return o_len;
+ }
+ 
+-static int config_parse_opt_ip6(const char *src, uint8_t **dst, const bool array)
++static int config_parse_opt_ip6(char *src, uint8_t **dst, const bool array)
+ {
+ 	int o_len = 0;
+ 	char *sep = strpbrk(src, ARRAY_SEP);
+@@ -439,7 +448,7 @@
+ 	return o_len;
+ }
+ 
+-static int config_parse_opt_user_class(const char *src, uint8_t **dst, const bool array)
++static int config_parse_opt_user_class(char *src, uint8_t **dst, const bool array)
+ {
+ 	int o_len = 0;
+ 	char *sep = strpbrk(src, ARRAY_SEP);
+@@ -510,7 +519,7 @@
+ 	return 0;
+ }
+ 
+-int config_parse_opt_data(const char *data, uint8_t **dst, const unsigned int type,
++int config_parse_opt_data(char *data, uint8_t **dst, const unsigned int type,
+ 		const bool array)
+ {
+ 	int ret = 0;
+@@ -544,7 +553,7 @@
+ 	return ret;
+ }
+ 
+-int config_parse_opt(const char *opt)
++int config_parse_opt(char *opt)
+ {
+ 	uint32_t optn;
+ 	char *data;
+--- a/src/config.h
++++ b/src/config.h
+@@ -117,7 +117,7 @@
+ void config_clear_requested_options(void) ;
+ bool config_add_requested_options(unsigned int option);
+ void config_clear_send_options(void);
+-bool config_add_send_options(char *option);
++bool config_add_send_options(const char *option);
+ bool config_set_rtx_delay_max(enum config_dhcp_msg msg, unsigned int value);
+ bool config_set_rtx_timeout_init(enum config_dhcp_msg msg, unsigned int value);
+ bool config_set_rtx_timeout_max(enum config_dhcp_msg msg, unsigned int value);
+@@ -130,8 +130,8 @@
+ void config_set_client_opt_cfg(struct odhcp6c_opt_cfg *opt_cfg);
+ 
+ int config_add_opt(const uint16_t code, const uint8_t *data, const uint16_t len);
+-int config_parse_opt_data(const char *data, uint8_t **dst, const unsigned int type, const bool array);
+-int config_parse_opt(const char *opt);
++int config_parse_opt_data(char *data, uint8_t **dst, const unsigned int type, const bool array);
++int config_parse_opt(char *opt);
+ 
+ void config_apply_dhcp_rtx(struct dhcpv6_retx* dhcpv6_retx);
+ 
+--- a/src/dhcpv6.c
++++ b/src/dhcpv6.c
+@@ -15,6 +15,7 @@
+ 
+ #include <arpa/inet.h>
+ #include <ctype.h>
++#include <endian.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <inttypes.h>
+@@ -251,6 +252,8 @@
+ // Authentication options
+ static enum odhcp6c_auth_protocol auth_protocol = AUTH_PROT_RKAP;
+ static uint8_t reconf_key[16];
++static uint64_t reconf_replay;
++static bool reconf_replay_seen;
+ 
+ // client options
+ static unsigned int client_options = 0;
+@@ -553,10 +556,10 @@
+ 	md5_hash(ifname, strlen(ifname), &md5);
+ 	md5_end(hash, &md5);
+ 
+-	iaid = hash[0] << 24;
+-	iaid |= hash[1] << 16;
+-	iaid |= hash[2] << 8;
+-	iaid |= hash[3];
++	iaid = (uint32_t)hash[0] << 24;
++	iaid |= (uint32_t)hash[1] << 16;
++	iaid |= (uint32_t)hash[2] << 8;
++	iaid |= (uint32_t)hash[3];
+ 
+ 	return iaid;
+ }
+@@ -598,7 +601,8 @@
+ 	odhcp6c_get_state(STATE_OUR_FQDN, &fqdn_len);
+ 	if(fqdn_len == 0) {
+ 		char fqdn_buf[256];
+-		gethostname(fqdn_buf, sizeof(fqdn_buf));
++		gethostname(fqdn_buf, sizeof(fqdn_buf) - 1);
++		fqdn_buf[sizeof(fqdn_buf) - 1] = '\0';
+ 		struct {
+ 			uint16_t type;
+ 			uint16_t len;
+@@ -822,13 +826,15 @@
+ 				if (pd_entries[j].iaid != iaid)
+ 					continue;
+ 
+-				uint8_t ex_len = 0;
+-				if (pd_entries[j].exclusion_length > 0)
+-					ex_len = ((pd_entries[j].exclusion_length - pd_entries[j].length - 1) / 8) + 6;
+-
++				uint8_t excl_subnet_id_nbits, excl_subnet_id_nbytes, excl_opt_len = 0;
++				if (pd_entries[j].exclusion_length > 0) {
++					excl_subnet_id_nbits = pd_entries[j].exclusion_length - pd_entries[j].length;
++					excl_subnet_id_nbytes = ((excl_subnet_id_nbits - 1) / 8)  + 1;
++					excl_opt_len = excl_subnet_id_nbytes + DHCPV6_OPT_HDR_SIZE + 1;
++				}
+ 				struct dhcpv6_ia_prefix p = {
+ 					.type = htons(DHCPV6_OPT_IA_PREFIX),
+-					.len = htons(sizeof(p) - DHCPV6_OPT_HDR_SIZE_U + ex_len),
++					.len = htons(sizeof(p) - DHCPV6_OPT_HDR_SIZE_U + excl_opt_len),
+ 					.prefix = pd_entries[j].length,
+ 					.addr = pd_entries[j].target
+ 				};
+@@ -841,21 +847,22 @@
+ 				memcpy(ia_pd + ia_pd_len, &p, sizeof(p));
+ 				ia_pd_len += sizeof(p);
+ 
+-				if (ex_len) {
++				if (excl_opt_len) {
+ 					ia_pd[ia_pd_len++] = 0;
+ 					ia_pd[ia_pd_len++] = DHCPV6_OPT_PD_EXCLUDE;
+ 					ia_pd[ia_pd_len++] = 0;
+-					ia_pd[ia_pd_len++] = ex_len - DHCPV6_OPT_HDR_SIZE;
++					ia_pd[ia_pd_len++] = excl_opt_len - DHCPV6_OPT_HDR_SIZE;
+ 					ia_pd[ia_pd_len++] = pd_entries[j].exclusion_length;
+ 
+-					uint32_t excl = ntohl(pd_entries[j].router.s6_addr32[1]);
+-					excl >>= (64 - pd_entries[j].exclusion_length);
+-					excl <<= 8 - ((pd_entries[j].exclusion_length - pd_entries[j].length) % 8);
+-
+-					for (size_t k = ex_len - 5; k > 0; --k, excl >>= 8)
+-						ia_pd[ia_pd_len + k] = excl & 0xff;
+-
+-					ia_pd_len += ex_len - 5;
++					uint32_t excluded_bits = ntohl(pd_entries[j].router.s6_addr32[1]);
++					excluded_bits >>= (64 - pd_entries[j].exclusion_length); /* Right align subnet ID bits */
++					excluded_bits <<= (32 - excl_subnet_id_nbits); /* Left align subnet ID bits */
++
++					/* Copy subnet ID bits into the option MSB first */
++					for (size_t k = 0; k < excl_subnet_id_nbytes; ++k) {
++						ia_pd[ia_pd_len++] = excluded_bits >> 24;
++						excluded_bits <<= 8;
++					}
+ 				}
+ 
+ 				hdr->len = htons(ntohs(hdr->len) + ntohs(p.len) + 4U);
+@@ -1118,7 +1125,7 @@
+ 			if (server_id_len)
+ 				serverid_ok = (olen + DHCPV6_OPT_HDR_SIZE_U == server_id_len) && !memcmp(
+ 						&odata[-DHCPV6_OPT_HDR_SIZE], server_id, server_id_len);
+-			else
++			else if (req_msg_type != DHCPV6_MSG_UNKNOWN)
+ 				serverid_ok = true;
+ 			break;
+ 
+@@ -1132,7 +1139,17 @@
+ 			auth_present = true;
+ 			if (auth_protocol == AUTH_PROT_RKAP) {
+ 				struct dhcpv6_auth_reconfigure *rkap = (void*)r->data;
+-				if (r->protocol != AUTH_PROT_RKAP || r->algorithm != AUTH_ALG_HMACMD5 || r->len != 28 || rkap->reconf_type != RKAP_TYPE_HMACMD5)
++				if (olen != 28 || r->protocol != AUTH_PROT_RKAP || r->algorithm != AUTH_ALG_HMACMD5 || rkap->reconf_type != RKAP_TYPE_HMACMD5)
++					continue;
++
++				/* RFC 8415 §20.4.3: the replay-detection field must be
++				 * monotonically increasing per (client, server-id) pair.
++				 * Drop any Reconfigure whose replay value does not exceed
++				 * the highest one we have already accepted. */
++				uint64_t replay;
++				memcpy(&replay, &r->replay, sizeof(replay));
++				replay = be64toh(replay);
++				if (reconf_replay_seen && replay <= reconf_replay)
+ 					continue;
+ 
+ 				md5_ctx_t md5;
+@@ -1163,11 +1180,15 @@
+ 				md5_end(hash, &md5);
+ 
+ 				rcauth_ok = !memcmp(hash, serverhash, sizeof(hash));
++				if (rcauth_ok) {
++					reconf_replay = replay;
++					reconf_replay_seen = true;
++				}
+ 			} else if (auth_protocol == AUTH_PROT_TOKEN) {
+-				if (r->protocol != AUTH_PROT_TOKEN || r->algorithm != AUTH_ALG_TOKEN || r->len < 12)
++				if (olen < 12 || r->protocol != AUTH_PROT_TOKEN || r->algorithm != AUTH_ALG_TOKEN)
+ 					continue;
+ 
+-				uint16_t token_len = r->len - 11;
++				uint16_t token_len = olen - 11;
+ 				if (config_dhcp->auth_token == NULL || strlen(config_dhcp->auth_token) != token_len)
+ 					continue;
+ 
+@@ -1221,29 +1242,38 @@
+ 	uint16_t otype, olen;
+ 	uint8_t *odata;
+ 	enum dhcpv6_msg msg = DHCPV6_MSG_UNKNOWN;
++	bool reconf_msg_seen = false;
+ 
+ 	dhcpv6_for_each_option(opt, end, otype, olen, odata) {
+-		if (otype == DHCPV6_OPT_RECONF_MESSAGE && olen == 1) {
+-			switch (odata[0]) {
+-			case DHCPV6_MSG_REBIND:
+-				if (t2 != UINT32_MAX)
+-					t2 = 0;
+-				_o_fallthrough;
+-			case DHCPV6_MSG_RENEW:
+-				if (t1 != UINT32_MAX)
+-					t1 = 0;
+-				_o_fallthrough;
+-			case DHCPV6_MSG_INFO_REQ:
+-				msg = odata[0];
+-				notice("Need to respond with %s in reply to %s",
+-				       dhcpv6_msg_to_str(msg), dhcpv6_msg_to_str(DHCPV6_MSG_RECONF));
+-				break;
+-
+-			default:
+-				break;
+-			}
+-		}
+-	}
++		if (otype != DHCPV6_OPT_RECONF_MESSAGE)
++			continue;
++
++		/* RFC 8415 §21.19: the Reconfigure Message option MUST appear
++		 * exactly once. Drop the message if it appears more than once
++		 * or carries an unexpected length. */
++		if (reconf_msg_seen || olen != 1)
++			return -1;
++
++		reconf_msg_seen = true;
++
++		switch (odata[0]) {
++		case DHCPV6_MSG_REBIND:
++		case DHCPV6_MSG_RENEW:
++		case DHCPV6_MSG_INFO_REQ:
++			msg = odata[0];
++			notice("Need to respond with %s in reply to %s",
++			       dhcpv6_msg_to_str(msg), dhcpv6_msg_to_str(DHCPV6_MSG_RECONF));
++			break;
++
++		default:
++			return -1;
++		}
++	}
++
++	if (msg == DHCPV6_MSG_REBIND && t2 != UINT32_MAX)
++		t2 = 0;
++	if ((msg == DHCPV6_MSG_REBIND || msg == DHCPV6_MSG_RENEW) && t1 != UINT32_MAX)
++		t1 = 0;
+ 
+ 	if (msg != DHCPV6_MSG_UNKNOWN)
+ 		dhcpv6_handle_reply(orig, rc, NULL, NULL, NULL);
+@@ -1269,7 +1299,7 @@
+ 				 (otype == DHCPV6_OPT_IA_NA && na_mode != IA_MODE_NONE)) &&
+ 				olen > sizeof(struct dhcpv6_ia_hdr) - DHCPV6_OPT_HDR_SIZE) {
+ 			struct dhcpv6_ia_hdr *ia_hdr = (void*)(&odata[-DHCPV6_OPT_HDR_SIZE]);
+-			dhcpv6_parse_ia(ia_hdr, odata + olen + sizeof(*ia_hdr), NULL);
++			dhcpv6_parse_ia(ia_hdr, odata + olen, NULL);
+ 		}
+ 
+ 		switch (otype) {
+@@ -1566,10 +1596,10 @@
+ 
+ 			case DHCPV6_OPT_AUTH:
+ 				struct dhcpv6_auth *r = (void*)&odata[-DHCPV6_OPT_HDR_SIZE];
+-				if (auth_protocol == AUTH_PROT_RKAP) {
++				if (auth_protocol == AUTH_PROT_RKAP && olen == 28) {
+ 					struct dhcpv6_auth_reconfigure *rkap = (void*)r->data;
+-					if (r->protocol == AUTH_PROT_RKAP || r->algorithm == AUTH_ALG_HMACMD5 ||
+-						r->len == 28 || rkap->reconf_type == RKAP_TYPE_KEY)
++					if (r->protocol == AUTH_PROT_RKAP && r->algorithm == AUTH_ALG_HMACMD5 &&
++						rkap->reconf_type == RKAP_TYPE_KEY)
+ 						memcpy(reconf_key, rkap->key, sizeof(rkap->key));
+ 				}
+ 				break;
+@@ -1621,19 +1651,9 @@
+ 				 * condition by using this option with the IANA-assigned URI for
+ 				 * this purpose. Clients observing the URI value ... may forego
+ 				 * time-consuming forms of captive portal detection. */
+-				if (memcmp(odata, URN_IETF_CAPT_PORT_UNRESTR, ref_len)) {
+-					/* RFC8910 §2.2:
+-					 * Note that the URI parameter is not null terminated.
+-					 * Allocate new buffer including room for '\0' */
+-					size_t uri_len = olen + 1;
+-					uint8_t *copy = malloc(uri_len);
+-					if (!copy)
+-						continue;
+-					memcpy(copy, odata, olen);
+-					copy[uri_len] = '\0';
++				if (olen < ref_len ||
++				    memcmp(odata, URN_IETF_CAPT_PORT_UNRESTR, ref_len) != 0)
+ 					odhcp6c_add_state(STATE_CAPT_PORT_DHCPV6, odata, olen);
+-					free(copy);
+-				}
+ 				break;
+ 
+ 			default:
+@@ -1826,9 +1846,10 @@
+ 
+ 					dhcpv6_log_status_code(code, "IA_PREFIX", status_msg, msg_len);
+ 					if (ret) *ret = 0; // renewal failed
+-				} else if (stype == DHCPV6_OPT_PD_EXCLUDE && slen > 2) {
++				} else if (stype == DHCPV6_OPT_PD_EXCLUDE && slen >= 2) {
+ 					/*	RFC 6603 §4.2 Prefix Exclude option */
+ 					uint8_t exclude_length = sdata[0];
++					uint8_t *excl_subnet_id = &sdata[1];
+ 					if (exclude_length > 64)
+ 						exclude_length = 64;
+ 
+@@ -1837,21 +1858,19 @@
+ 						continue;
+ 					}
+ 
+-					uint8_t bytes_needed = ((exclude_length - entry.length - 1) / 8) + 1;
+-					if (slen <= bytes_needed) {
++					uint8_t excl_subnet_id_nbits = exclude_length - entry.length;
++					uint8_t excl_subnet_id_nbytes = ((excl_subnet_id_nbits - 1) / 8) + 1;
++					if ((excl_subnet_id + excl_subnet_id_nbytes) > (sdata + slen)) {
+ 						update_state = false;
+ 						continue;
+ 					}
+ 
+-					// this decrements through the ipaddr bytes masking against 
+-					// the address in the option until byte 0, the option length field.
+ 					uint32_t excluded_bits = 0;
+-					do {
+-						excluded_bits = excluded_bits << 8 | sdata[bytes_needed];
+-					} while (--bytes_needed);
+-
+-					excluded_bits >>= 8 - ((exclude_length - entry.length) % 8);
+-					excluded_bits <<= 64 - exclude_length;
++					/* Copy subnet ID bits out of the option MSB first */
++					for(size_t i = 0; i < excl_subnet_id_nbytes; i++)
++						excluded_bits = (excluded_bits << 8) | excl_subnet_id[i];
++					excluded_bits >>= (8 * excl_subnet_id_nbytes) - excl_subnet_id_nbits; /* Right align subnet ID bits */
++					excluded_bits <<= (64 - exclude_length); /* Shift subnet ID bits into the low-order bits of the prefix */
+ 
+ 					// Re-using router field to hold the prefix
+ 					entry.router = entry.target; // base prefix
+@@ -1867,6 +1886,12 @@
+ 				info("%s/%d preferred %d valid %d",
+ 						inet_ntop(AF_INET6, &entry.target, buf, sizeof(buf)),
+ 						entry.length, entry.preferred , entry.valid);
++
++				if (entry.exclusion_length) {
++					info("PD_EXCLUDE %s/%d",
++						inet_ntop(AF_INET6, &entry.router, buf, sizeof(buf)),
++						entry.exclusion_length);
++				}
+ 			}
+ 
+ 			entry.priority = 0;
+@@ -2195,6 +2220,8 @@
+ 	odhcp6c_add_state(STATE_SERVER_ID, cand->duid, cand->duid_len);
+ 	accept_reconfig = cand->wants_reconfigure;
+ 	memset(reconf_key, 0, sizeof(reconf_key));
++	reconf_replay = 0;
++	reconf_replay_seen = false;
+ 
+ 	if (cand->ia_na_len) {
+ 		odhcp6c_add_state(STATE_IA_NA, cand->ia_na, cand->ia_na_len);
+--- a/src/odhcp6c.c
++++ b/src/odhcp6c.c
+@@ -67,6 +67,7 @@
+ static bool bound = false, ra = false;
+ static time_t last_update = 0;
+ static char *ifname = NULL;
++static char *pidfile_path = NULL;
+ struct config_dhcp *config_dhcp = NULL;
+ 
+ static void odhcp6c_cleanup(void)
+@@ -85,6 +86,12 @@
+ 	if (urandom_fd >= 0) {
+ 		close(urandom_fd);
+ 		urandom_fd = -1;
++	}
++
++	if (pidfile_path) {
++		unlink(pidfile_path);
++		free(pidfile_path);
++		pidfile_path = NULL;
+ 	}
+ }
+ 
+@@ -290,8 +297,17 @@
+ 
+ 			optpos = strchr(optarg, '/');
+ 			if (optpos) {
+-				strncpy((char *)buf, optarg, optpos - optarg);
+-				buf[optpos - optarg] = '\0';
++				size_t addr_len = optpos - optarg;
++
++				/* Leave room for the terminating NUL; reject anything
++				 * that cannot be a valid IPv6 literal instead of
++				 * overflowing buf. */
++				if (addr_len >= sizeof(buf)) {
++					error("invalid argument: '%s'", optarg);
++					return 1;
++				}
++				strncpy((char *)buf, optarg, addr_len);
++				buf[addr_len] = '\0';
+ 				if (inet_pton(AF_INET6, (char *)buf, &prefix.addr) <= 0) {
+ 					error("invalid argument: '%s'", optarg);
+ 					return 1;
+@@ -521,10 +537,18 @@
+ 			pidfile = (char*)buf;
+ 		}
+ 
+-		FILE *fp = fopen(pidfile, "w");
+-		if (fp) {
+-			fprintf(fp, "%i\n", getpid());
+-			fclose(fp);
++		int pidfd = open(pidfile,
++				O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
++				0644);
++		if (pidfd >= 0) {
++			FILE *fp = fdopen(pidfd, "w");
++			if (fp) {
++				fprintf(fp, "%i\n", getpid());
++				fclose(fp);
++				pidfile_path = strdup(pidfile);
++			} else {
++				close(pidfd);
++			}
+ 		}
+ 	} else {
+ 		config_dhcp->log_syslog = false;
+@@ -988,12 +1012,13 @@
+ 
+ 	uint8_t *n = odhcp6c_resize_state(state, len);
+ 
+-	if (n) {
+-		uint8_t *sdata = state_data[state];
+-
+-		memmove(sdata + offset + len, sdata + offset, len_after);
+-		memcpy(sdata + offset, data, len);
+-	}
++	if (!n)
++		return -1;
++
++	uint8_t *sdata = state_data[state];
++
++	memmove(sdata + offset + len, sdata + offset, len_after);
++	memcpy(sdata + offset, data, len);
+ 
+ 	return 0;
+ }
+@@ -1172,13 +1197,20 @@
+ 			(flags & (IFA_F_DADFAILED | IFA_F_TENTATIVE | IFA_F_DEPRECATED)))
+ 			continue;
+ 
+-		for (i = 0; i < strlen(addr_buf); i++) {
+-			if (!isxdigit(addr_buf[i]) || isupper(addr_buf[i]))
+-				break;
++		size_t addr_len = strlen(addr_buf);
++		bool valid = (addr_len == 2 * sizeof(inet6_addr.s6_addr));
++
++		for (i = 0; valid && i < addr_len; i++) {
++			if (!isxdigit((unsigned char)addr_buf[i]) ||
++			    isupper((unsigned char)addr_buf[i]))
++				valid = false;
+ 		}
+ 
++		if (!valid)
++			continue;
++
+ 		memset(&inet6_addr, 0, sizeof(inet6_addr));
+-		for (i = 0; i < (strlen(addr_buf) / 2); i++) {
++		for (i = 0; i < (addr_len / 2); i++) {
+ 			unsigned char byte;
+ 			static const char hex[] = "0123456789abcdef";
+ 			byte = ((index(hex, addr_buf[i * 2]) - hex) << 4) |
+--- a/src/odhcp6c.h
++++ b/src/odhcp6c.h
+@@ -387,8 +387,10 @@
+ 
+ #define dhcpv6_for_each_option(start, end, otype, olen, odata)\
+ 	for (uint8_t *_o = (uint8_t*)(start); _o + 4 <= (uint8_t*)(end) &&\
+-		((otype) = _o[0] << 8 | _o[1]) && ((odata) = (void*)&_o[4]) &&\
+-		((olen) = _o[2] << 8 | _o[3]) + (odata) <= (uint8_t*)(end); \
++		((otype) = _o[0] << 8 | _o[1],\
++		 (odata) = (void*)&_o[4],\
++		 (olen) = _o[2] << 8 | _o[3],\
++		 (odata) + (olen) <= (uint8_t*)(end)); \
+ 		_o += 4 + (_o[2] << 8 | _o[3]))
+ 
+ 
+@@ -556,7 +558,6 @@
+ 	int strict_rfc7550;
+ };
+ 
+-uint32_t hash_ifname(const char *s);
+ int init_dhcpv6(const char *ifname);
+ int dhcpv6_get_ia_mode(void);
+ int dhcpv6_promote_server_cand(void);
+--- a/src/ra.c
++++ b/src/ra.c
+@@ -600,7 +600,7 @@
+ 
+ 			case ND_OPT_ROUTE_INFORMATION:
+ 				if (opt->len > 3)
+-					return false;
++					continue;
+ 
+ 				struct icmpv6_opt_route_info *ri = (struct icmpv6_opt_route_info *)opt;
+ 
+@@ -633,7 +633,7 @@
+ 
+ 			case ND_OPT_PREFIX_INFORMATION:
+ 				if (opt->len != 4)
+-					return false;
++					continue;
+ 
+ 				/*
+ 				 * We implement draft-ietf-6man-slaac-renum-11 here:
+@@ -677,7 +677,7 @@
+ 
+ 			case ND_OPT_RECURSIVE_DNS:
+ 				if (opt->len <= 2)
+-					return false;
++					continue;
+ 
+ 				entry->router = from.sin6_addr;
+ 				entry->priority = 0;
+@@ -697,7 +697,7 @@
+ 
+ 			case ND_OPT_DNSSL:
+ 				if (opt->len <= 1)
+-					return false;
++					continue;
+ 
+ 				uint32_t *ds_valid = (uint32_t*)&opt->data[2];
+ 				uint8_t *ds_buf = &opt->data[6];
+@@ -730,6 +730,7 @@
+ 
+ 				struct icmpv6_opt_captive_portal *capt_port = (struct icmpv6_opt_captive_portal*)opt;
+ 				uint8_t *cp_buf = &capt_port->data[0];
++				size_t uri_len = (capt_port->len * 8) - 2;
+ 				size_t ref_len = sizeof(URN_IETF_CAPT_PORT_UNRESTR) - 1;
+ 
+ 				/* RFC8910 §2:
+@@ -737,20 +738,13 @@
+ 				 * condition by using this option with the IANA-assigned URI for
+ 				 * this purpose. Clients observing the URI value ... may forego
+ 				 * time-consuming forms of captive portal detection. */
+-				if (memcmp(cp_buf, URN_IETF_CAPT_PORT_UNRESTR, ref_len)) {
+-					/* URI are not guaranteed to be \0 terminated if data is unpadded */
+-					size_t uri_len = (capt_port->len * 8) - 2;
+-					/* Allocate new buffer including room for '\0' */
+-					uint8_t *copy = malloc(uri_len + 1);
+-					if (!copy)
+-						continue;
+-
+-					memcpy(copy, cp_buf, uri_len);
+-					copy[uri_len] = '\0';
+-					odhcp6c_clear_state(STATE_CAPT_PORT_RA);
+-					odhcp6c_add_state(STATE_CAPT_PORT_RA, copy, uri_len);
+-					free(copy);
+-				}
++				odhcp6c_clear_state(STATE_CAPT_PORT_RA);
++				if (uri_len >= ref_len &&
++				    memcmp(cp_buf, URN_IETF_CAPT_PORT_UNRESTR, ref_len) == 0)
++					break;
++
++				/* URI are not guaranteed to be \0 terminated if data is unpadded */
++				odhcp6c_add_state(STATE_CAPT_PORT_RA, cp_buf, uri_len);
+ 				break;
+ 
+ 			default:
+--- a/src/script.c
++++ b/src/script.c
+@@ -14,6 +14,7 @@
+  */
+ 
+ #include <arpa/inet.h>
++#include <errno.h>
+ #include <inttypes.h>
+ #include <netdb.h>
+ #include <netinet/in.h>
+@@ -97,7 +98,10 @@
+ 		const struct in6_addr *addr, size_t cnt)
+ {
+ 	size_t buf_len = strlen(name);
+-	char *buf = realloc(NULL, cnt * INET6_ADDRSTRLEN + buf_len + 2);
++	char *buf = malloc(cnt * INET6_ADDRSTRLEN + buf_len + 2);
++
++	if (!buf)
++		return;
+ 
+ 	memcpy(buf, name, buf_len);
+ 	buf[buf_len++] = '=';
+@@ -120,7 +124,10 @@
+ 	size_t buf_len = strlen(name);
+ 	size_t buf_size = len + buf_len + 2;
+ 	const uint8_t *fqdn_end = fqdn + len;
+-	char *buf = realloc(NULL, len + buf_len + 2);
++	char *buf = malloc(buf_size);
++
++	if (!buf)
++		return;
+ 
+ 	memcpy(buf, name, buf_len);
+ 	buf[buf_len++] = '=';
+@@ -143,26 +150,16 @@
+ 
+ static void string_to_env(const char *name, const uint8_t *string, size_t len)
+ {
+-	size_t buf_len = strlen(name);
+-	const uint8_t *string_end = string + len;
+-	char *buf = realloc(NULL, len + buf_len + 2);
+-
+-	memcpy(buf, name, buf_len);
+-	buf[buf_len++] = '=';
+-
+-	while (string < string_end) {
+-		int l = strlen((const char *)string);
+-		if (l <= 0)
+-			break;
+-		string += l;
+-		buf_len += strlen(&buf[buf_len]);
+-		buf[buf_len++] = ' ';
+-	}
+-
+-	if (buf[buf_len - 1] == ' ')
+-		buf_len--;
+-
+-	buf[buf_len] = '\0';
++	size_t name_len = strlen(name);
++	char *buf = malloc(name_len + 1 + len + 1);
++
++	if (!buf)
++		return;
++
++	memcpy(buf, name, name_len);
++	buf[name_len] = '=';
++	memcpy(&buf[name_len + 1], string, len);
++	buf[name_len + 1 + len] = '\0';
+ 	putenv(buf);
+ }
+ 
+@@ -172,8 +169,11 @@
+ 	uint16_t otype, olen;
+ 
+ 	dhcpv6_for_each_option(opts, oend, otype, olen, odata) {
+-		char *buf = realloc(NULL, 14 + (olen * 2));
++		char *buf = malloc(14 + (olen * 2));
+ 		size_t buf_len = 0;
++
++		if (!buf)
++			continue;
+ 
+ 		snprintf(buf, 14, "OPTION_%hu=", otype);
+ 		buf_len += strlen(buf);
+@@ -193,16 +193,25 @@
+ static void entry_to_env(const char *name, const void *data, size_t len, enum entry_type type)
+ {
+ 	size_t buf_len = strlen(name);
+-	const struct odhcp6c_entry *e = data;
++	const uint8_t *start = data;
+ 	// Worst case: ENTRY_PREFIX with iaid != 1 and exclusion
+ 	const size_t max_entry_len = (INET6_ADDRSTRLEN-1 + 5 + 44 + 15 + 10 +
+ 				      INET6_ADDRSTRLEN-1 + 11 + 1);
+-	char *buf = realloc(NULL, buf_len + 2 + (len / sizeof(*e)) * max_entry_len);
++	/* An upper bound on the entry count: every entry occupies at least
++	 * sizeof(struct odhcp6c_entry) bytes (auxlen rounds up to 4-byte
++	 * stride, never below 0). */
++	char *buf = malloc(buf_len + 2 + (len / sizeof(struct odhcp6c_entry)) * max_entry_len);
++
++	if (!buf)
++		return;
+ 
+ 	memcpy(buf, name, buf_len);
+ 	buf[buf_len++] = '=';
+ 
+-	for (size_t i = 0; i < len / sizeof(*e); ++i) {
++	for (const struct odhcp6c_entry *e = (const struct odhcp6c_entry *)start;
++			(const uint8_t *)e < start + len &&
++			(const uint8_t *)odhcp6c_next_entry(e) <= start + len;
++			e = odhcp6c_next_entry(e)) {
+ 		/*
+ 		 * The only invalid entries allowed to be passed to the script are prefix and RA
+ 		 * entries. This will allow immediate removal of the old ipv6-prefix-assignment
+@@ -211,43 +220,43 @@
+ 		 * router "is not a default router and SHOULD NOT appear on the default router list"
+ 		 * (see RFC 4861, section 4.2).
+ 		 */
+-		if (!e[i].valid && type != ENTRY_PREFIX && type != ENTRY_ROUTE)
++		if (!e->valid && type != ENTRY_PREFIX && type != ENTRY_ROUTE)
+ 			continue;
+ 
+-		inet_ntop(AF_INET6, &e[i].target, &buf[buf_len], INET6_ADDRSTRLEN);
++		inet_ntop(AF_INET6, &e->target, &buf[buf_len], INET6_ADDRSTRLEN);
+ 		buf_len += strlen(&buf[buf_len]);
+ 
+ 		if (type != ENTRY_HOST) {
+-			snprintf(&buf[buf_len], 6, "/%"PRIu16, e[i].length);
++			snprintf(&buf[buf_len], 6, "/%"PRIu16, e->length);
+ 			buf_len += strlen(&buf[buf_len]);
+ 
+ 			if (type == ENTRY_ROUTE) {
+ 				buf[buf_len++] = ',';
+ 
+-				if (!IN6_IS_ADDR_UNSPECIFIED(&e[i].router)) {
+-					inet_ntop(AF_INET6, &e[i].router, &buf[buf_len], INET6_ADDRSTRLEN);
++				if (!IN6_IS_ADDR_UNSPECIFIED(&e->router)) {
++					inet_ntop(AF_INET6, &e->router, &buf[buf_len], INET6_ADDRSTRLEN);
+ 					buf_len += strlen(&buf[buf_len]);
+ 				}
+ 
+-				snprintf(&buf[buf_len], 23, ",%u,%u", e[i].valid, e[i].priority);
++				snprintf(&buf[buf_len], 23, ",%u,%u", e->valid, e->priority);
+ 				buf_len += strlen(&buf[buf_len]);
+ 			} else {
+-				snprintf(&buf[buf_len], 45, ",%u,%u,%u,%u", e[i].preferred, e[i].valid, e[i].t1, e[i].t2);
++				snprintf(&buf[buf_len], 45, ",%u,%u,%u,%u", e->preferred, e->valid, e->t1, e->t2);
+ 				buf_len += strlen(&buf[buf_len]);
+ 			}
+ 
+-			if (type == ENTRY_PREFIX && ntohl(e[i].iaid) != 1) {
+-				snprintf(&buf[buf_len], 16, ",class=%08x", ntohl(e[i].iaid));
++			if (type == ENTRY_PREFIX && ntohl(e->iaid) != 1) {
++				snprintf(&buf[buf_len], 16, ",class=%08x", ntohl(e->iaid));
+ 				buf_len += strlen(&buf[buf_len]);
+ 			}
+ 
+-			if (type == ENTRY_PREFIX && e[i].exclusion_length) {
++			if (type == ENTRY_PREFIX && e->exclusion_length) {
+ 				snprintf(&buf[buf_len], 11, ",excluded=");
+ 				buf_len += strlen(&buf[buf_len]);
+ 				// '.router' is dual-used: for prefixes it contains the prefix
+-				inet_ntop(AF_INET6, &e[i].router, &buf[buf_len], INET6_ADDRSTRLEN);
++				inet_ntop(AF_INET6, &e->router, &buf[buf_len], INET6_ADDRSTRLEN);
+ 				buf_len += strlen(&buf[buf_len]);
+-				snprintf(&buf[buf_len], 12, "/%u", e[i].exclusion_length);
++				snprintf(&buf[buf_len], 12, "/%u", e->exclusion_length);
+ 				buf_len += strlen(&buf[buf_len]);
+ 			}
+ 		}
+@@ -265,8 +274,13 @@
+ static void search_to_env(const char *name, const uint8_t *start, size_t len)
+ {
+ 	size_t buf_len = strlen(name);
+-	char *buf = realloc(NULL, buf_len + 2 + len);
+-	char *c = mempcpy(buf, name, buf_len);
++	char *buf = malloc(buf_len + 2 + len);
++	char *c;
++
++	if (!buf)
++		return;
++
++	c = mempcpy(buf, name, buf_len);
+ 	*c++ = '=';
+ 
+ 	for (struct odhcp6c_entry *e = (struct odhcp6c_entry*)start;
+@@ -289,7 +303,10 @@
+ static void int_to_env(const char *name, int value)
+ {
+ 	size_t len = 13 + strlen(name);
+-	char *buf = realloc(NULL, len);
++	char *buf = malloc(len);
++
++	if (!buf)
++		return;
+ 
+ 	snprintf(buf, len, "%s=%d", name, value);
+ 	putenv(buf);
+@@ -432,10 +449,11 @@
+ 	if (!argv[0])
+ 		return;
+ 
+-	if (running) {
++	pid_t prev = running;
++	if (prev > 0) {
+ 		time_t diff = now - started;
+ 
+-		kill(running, SIGTERM);
++		kill(prev, SIGTERM);
+ 
+ 		if (diff > delay)
+ 			delay -= diff;
+@@ -449,6 +467,12 @@
+ 		strncpy(action, status, sizeof(action) - 1);
+ 
+ 	pid_t pid = fork();
++
++	if (pid < 0) {
++		error("Failed to fork script handler: %s", strerror(errno));
++		running = 0;
++		return;
++	}
+ 
+ 	if (pid > 0) {
+ 		running = pid;
+@@ -498,7 +522,7 @@
+ 		/* RFC8910 §3 */
+ 		if (capt_port_ra_len > 0 && capt_port_dhcpv6_len > 0) {
+ 			if (capt_port_ra_len != capt_port_dhcpv6_len ||
+-				!memcmp(capt_port_dhcpv6, capt_port_ra, capt_port_dhcpv6_len))
++				memcmp(capt_port_dhcpv6, capt_port_ra, capt_port_dhcpv6_len))
+ 				error(
+ 					"%s received via different vectors differ: preferring URI from DHCPv6",
+ 					CAPT_PORT_URI_STR);
+@@ -538,9 +562,11 @@
+ 		int_to_env("RA_RETRANSMIT", ra_get_retransmit());
+ 
+ 		char *buf = malloc(10 + passthru_len * 2);
+-		strncpy(buf, "PASSTHRU=", 10);
+-		script_hexlify(&buf[9], passthru, passthru_len);
+-		putenv(buf);
++		if (buf) {
++			strncpy(buf, "PASSTHRU=", 10);
++			script_hexlify(&buf[9], passthru, passthru_len);
++			putenv(buf);
++		}
+ 
+ 		execv(argv[0], argv);
+ 		_exit(128);
+--- a/src/ubus.c
++++ b/src/ubus.c
+@@ -234,7 +234,7 @@
+ 
+ 	/* Forces re-initialization when we're reusing the same definitions later on. */
+ 	odhcp6c_object.id = 0;
+-	odhcp6c_object.id = 0;
++	odhcp6c_object_type.id = 0;
+ }
+ 
+ static int ipv6_to_blob(const char *name,
+@@ -299,56 +299,63 @@
+ 
+ static int entry_to_blob(const char *name, const void *data, size_t len, enum entry_type type)
+ {
+-	const struct odhcp6c_entry *e = data;
++	const uint8_t *start = data;
+ 
+ 	void *arr = blobmsg_open_array(&b, name);
+ 
+-	for (size_t i = 0; i < len / sizeof(*e); ++i) {
+-		void *entry = blobmsg_open_table(&b, name);
+-
++	for (const struct odhcp6c_entry *e = (const struct odhcp6c_entry *)start;
++			(const uint8_t *)e < start + len &&
++			(const uint8_t *)odhcp6c_next_entry(e) <= start + len;
++			e = odhcp6c_next_entry(e)) {
+ 		/*
+ 		 * The only invalid entries allowed to be passed to the script are prefix entries.
+ 		 * This will allow immediate removal of the old ipv6-prefix-assignment that might
+ 		 * otherwise be kept for up to 2 hours (see L-13 requirement of RFC 7084).
++		 *
++		 * Skip before opening the table: a "continue" after
++		 * blobmsg_open_table() would leave an unclosed nested table and
++		 * corrupt the emitted blob.
+ 		 */
+-		if (!e[i].valid && type != ENTRY_PREFIX)
++		if (!e->valid && type != ENTRY_PREFIX)
+ 			continue;
++
++		void *entry = blobmsg_open_table(&b, name);
+ 
+ 		char *buf = blobmsg_alloc_string_buffer(&b, "target", INET6_ADDRSTRLEN);
+ 		CHECK_ALLOC(buf);
+-		inet_ntop(AF_INET6, &e[i].target, buf, INET6_ADDRSTRLEN);
++		inet_ntop(AF_INET6, &e->target, buf, INET6_ADDRSTRLEN);
+ 		blobmsg_add_string_buffer(&b);
+ 
+ 		if (type != ENTRY_HOST) {
+-			blobmsg_add_u32(&b, "length", e[i].length);
++			blobmsg_add_u32(&b, "length", e->length);
+ 			if (type == ENTRY_ROUTE) {
+-				if (!IN6_IS_ADDR_UNSPECIFIED(&e[i].router)) {
++				if (!IN6_IS_ADDR_UNSPECIFIED(&e->router)) {
+ 					buf = blobmsg_alloc_string_buffer(&b, "router", INET6_ADDRSTRLEN);
+ 					CHECK_ALLOC(buf);
+-					inet_ntop(AF_INET6, &e[i].router, buf, INET6_ADDRSTRLEN);
++					inet_ntop(AF_INET6, &e->router, buf, INET6_ADDRSTRLEN);
+ 					blobmsg_add_string_buffer(&b);
+ 				}
+ 
+-				blobmsg_add_u32(&b, "valid", e[i].valid);
+-				blobmsg_add_u32(&b, "priority", e[i].priority);
++				blobmsg_add_u32(&b, "valid", e->valid);
++				blobmsg_add_u32(&b, "priority", e->priority);
+ 			} else {
+-				blobmsg_add_u32(&b, "valid", e[i].valid);
+-				blobmsg_add_u32(&b, "preferred", e[i].preferred);
+-				blobmsg_add_u32(&b, "t1", e[i].t1);
+-				blobmsg_add_u32(&b, "t2", e[i].t2);
++				blobmsg_add_u32(&b, "valid", e->valid);
++				blobmsg_add_u32(&b, "preferred", e->preferred);
++				blobmsg_add_u32(&b, "t1", e->t1);
++				blobmsg_add_u32(&b, "t2", e->t2);
+ 			}
+ 
+-			if (type == ENTRY_PREFIX && ntohl(e[i].iaid) != 1) {
+-				blobmsg_add_u32(&b, "iaid", ntohl(e[i].iaid));
++			if (type == ENTRY_PREFIX && ntohl(e->iaid) != 1) {
++				blobmsg_add_u32(&b, "iaid", ntohl(e->iaid));
+ 			}
+ 
+-			if (type == ENTRY_PREFIX && e[i].exclusion_length) {
++			if (type == ENTRY_PREFIX && e->exclusion_length) {
+ 				buf = blobmsg_alloc_string_buffer(&b, "excluded", INET6_ADDRSTRLEN);
+ 				CHECK_ALLOC(buf);
+ 				// '.router' is dual-used: for prefixes it contains the prefix
+-				inet_ntop(AF_INET6, &e[i].router, buf, INET6_ADDRSTRLEN);
++				inet_ntop(AF_INET6, &e->router, buf, INET6_ADDRSTRLEN);
+ 				blobmsg_add_string_buffer(&b);
+-				blobmsg_add_u32(&b, "excluded_length", e[i].exclusion_length);
++				blobmsg_add_u32(&b, "excluded_length", e->exclusion_length);
+ 			}
+ 		}
+ 
+@@ -430,8 +437,10 @@
+ 			prefix6len = (prefix6len % 8 == 0) ? prefix6len / 8 : prefix6len / 8 + 1;
+ 
+ 			if (prefix6len > sizeof(in6) ||
+-				olen < sizeof(struct dhcpv6_s46_rule) + prefix6len)
++				olen < sizeof(struct dhcpv6_s46_rule) + prefix6len) {
++				blobmsg_close_table(&b, option);
+ 				continue;
++			}
+ 
+ 			memcpy(&in6, rule->ipv6_prefix, prefix6len);
+ 
+@@ -487,8 +496,10 @@
+ 			prefix6len = (prefix6len % 8 == 0) ? prefix6len / 8 : prefix6len / 8 + 1;
+ 
+ 			if (prefix6len > sizeof(in6) ||
+-				olen < sizeof(struct dhcpv6_s46_v4v6bind) + prefix6len)
++				olen < sizeof(struct dhcpv6_s46_v4v6bind) + prefix6len) {
++				blobmsg_close_table(&b, option);
+ 				continue;
++			}
+ 
+ 			memcpy(&in6, bind->bind_ipv6_prefix, prefix6len);
+ 
+@@ -563,7 +574,7 @@
+ 	/* RFC8910 §3 */
+ 	if (capt_port_ra_len > 0 && capt_port_dhcpv6_len > 0) {
+ 		if (capt_port_ra_len != capt_port_dhcpv6_len ||
+-			!memcmp(capt_port_dhcpv6, capt_port_ra, capt_port_dhcpv6_len))
++			memcmp(capt_port_dhcpv6, capt_port_ra, capt_port_dhcpv6_len))
+ 			error(
+ 				"%s received via different vectors differ: preferring URI from DHCPv6",
+ 				CAPT_PORT_URI_STR);
+@@ -583,10 +594,21 @@
+ 	CHECK(s46_to_blob(STATE_S46_MAPE, s46_mape, s46_mape_len));
+ 	CHECK(s46_to_blob(STATE_S46_MAPT, s46_mapt, s46_mapt_len));
+ 	CHECK(s46_to_blob(STATE_S46_LW, s46_lw, s46_lw_len));
+-	if (capt_port_dhcpv6_len > 0)
+-		blobmsg_add_string(&b, CAPT_PORT_URI_STR, (char *)capt_port_dhcpv6);
+-	else if (capt_port_ra_len > 0)
+-		blobmsg_add_string(&b, CAPT_PORT_URI_STR, (char *)capt_port_ra);
++	if (capt_port_dhcpv6_len > 0 || capt_port_ra_len > 0) {
++		const uint8_t *uri = capt_port_dhcpv6_len > 0 ? capt_port_dhcpv6 : capt_port_ra;
++		size_t uri_len = capt_port_dhcpv6_len > 0 ? capt_port_dhcpv6_len : capt_port_ra_len;
++
++		/* The captive-portal URI is stored unterminated: it is copied
++		 * verbatim from the DHCPv6 option / RA option payload, which is
++		 * not guaranteed to be NUL-terminated. It must therefore not be
++		 * passed to blobmsg_add_string(), which would call strlen() and
++		 * read past the end of the (attacker-controlled) state buffer. */
++		buf = blobmsg_alloc_string_buffer(&b, CAPT_PORT_URI_STR, uri_len + 1);
++		CHECK_ALLOC(buf);
++		memcpy(buf, uri, uri_len);
++		buf[uri_len] = '\0';
++		blobmsg_add_string_buffer(&b);
++	}
+ 	CHECK(bin_to_blob(custom, custom_len));
+ 
+ 	if (odhcp6c_is_bound()) {
+@@ -799,6 +821,9 @@
+ 		config_clear_send_options();
+ 
+ 		blobmsg_for_each_attr(elem, cur, index) {
++			if (blobmsg_type(elem) != BLOBMSG_TYPE_STRING)
++				return UBUS_STATUS_INVALID_ARGUMENT;
++
+ 			string = blobmsg_get_string(elem);
+ 			if (string == NULL || !config_add_send_options(string))
+ 				return UBUS_STATUS_INVALID_ARGUMENT;

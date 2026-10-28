@@ -1,0 +1,844 @@
+Subject: [PATCH] odhcpd: sync public upstream runtime safety fixes
+
+Upstream: https://github.com/openwrt/odhcpd/commit/68f382690bfaec56d5b1f31c3c31c48bcb642e3a
+
+Bring the pinned source runtime code to this upstream snapshot while
+retaining the existing package configuration and installation interface.
+The update includes the parser and memory-safety fixes backported by the
+24.10 branch, adapted upstream to the newer source layout used here.
+
+--- a/src/config.c
++++ b/src/config.c
+@@ -139,6 +139,7 @@
+ 	IFACE_ATTR_NTP,
+ 	IFACE_ATTR_CAPTIVE_PORTAL_URI,
+ 	IFACE_ATTR_IPV6_ONLY_PREFERRED,
++	IFACE_ATTR_DHCPV6_RELAY_SERVERS,
+ 	IFACE_ATTR_MAX
+ };
+ 
+@@ -193,6 +194,7 @@
+ 	[IFACE_ATTR_NTP] = { .name = "ntp", .type = BLOBMSG_TYPE_ARRAY },
+ 	[IFACE_ATTR_CAPTIVE_PORTAL_URI] = { .name = "captive_portal_uri", .type = BLOBMSG_TYPE_STRING },
+ 	[IFACE_ATTR_IPV6_ONLY_PREFERRED] = { .name = "ipv6_only_preferred", .type = BLOBMSG_TYPE_INT32 },
++	[IFACE_ATTR_DHCPV6_RELAY_SERVERS] = { .name = "dhcpv6_relay_servers", .type = BLOBMSG_TYPE_ARRAY },
+ };
+ 
+ const struct uci_blob_param_list interface_attr_list = {
+@@ -351,6 +353,7 @@
+ 	free(iface->dhcpv6_raw);
+ 	free(iface->dhcpv4_ntp);
+ 	free(iface->dhcpv6_ntp);
++	free(iface->dhcpv6_relay_server_addrs6);
+ 	free(iface->dhcpv6_sntp);
+ 	free(iface->captive_portal_uri);
+ 	for (unsigned i = 0; i < iface->dnr_cnt; i++) {
+@@ -953,6 +956,11 @@
+ 					goto err;
+ 				}
+ 
++				if (svc_val_len >= DNR_SVC_MAX) {
++					error("Too many keys for SvcParam 'mandatory'");
++					goto err;
++				}
++
+ 				mkeys[svc_val_len++] = ntohs(mkey);
+ 			}
+ 
+@@ -1328,8 +1336,17 @@
+ 	}
+ 
+ 	if ((c = tb[IFACE_ATTR_CAPTIVE_PORTAL_URI])) {
+-		iface->captive_portal_uri = strdup(blobmsg_get_string(c));
+-		iface->captive_portal_uri_len = strlen(iface->captive_portal_uri);
++		char *uri = strdup(blobmsg_get_string(c));
++
++		if (!uri) {
++			error("Out of memory parsing %s for interface '%s'",
++			      iface_attrs[IFACE_ATTR_CAPTIVE_PORTAL_URI].name,
++			      iface->name);
++			goto err;
++		}
++
++		iface->captive_portal_uri = uri;
++		iface->captive_portal_uri_len = strlen(uri);
+ 		if (iface->captive_portal_uri_len > UINT8_MAX) {
+ 			warn("RFC8910 captive portal URI > %d characters for interface '%s': option via DHCPv4 not possible",
+ 				UINT8_MAX,
+@@ -1710,6 +1727,39 @@
+ 					  &iface->pio_filter_addr,
+ 					  &iface->pio_filter_length);
+ 
++	if (overwrite && (c = tb[IFACE_ATTR_DHCPV6_RELAY_SERVERS])) {
++		struct blob_attr *cur;
++		unsigned rem;
++
++		blobmsg_for_each_attr(cur, c, rem) {
++			struct in6_addr addr6, *tmp6;
++
++			if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING || !blobmsg_check_attr(cur, false))
++				continue;
++
++			if (inet_pton(AF_INET6, blobmsg_get_string(cur), &addr6) == 1) {
++				if (IN6_IS_ADDR_UNSPECIFIED(&addr6)) {
++					error("Invalid %s value configured for interface '%s'",
++					      iface_attrs[IFACE_ATTR_DHCPV6_RELAY_SERVERS].name, iface->name);
++					continue;
++				}
++
++				tmp6 = realloc(iface->dhcpv6_relay_server_addrs6,
++					       (iface->dhcpv6_relay_server_addrs6_cnt + 1) *
++					       sizeof(*iface->dhcpv6_relay_server_addrs6));
++
++				if (!tmp6)
++					goto err;
++
++				iface->dhcpv6_relay_server_addrs6 = tmp6;
++				iface->dhcpv6_relay_server_addrs6[iface->dhcpv6_relay_server_addrs6_cnt++] = addr6;
++			} else {
++				error("Invalid %s value configured for interface '%s'",
++				      iface_attrs[IFACE_ATTR_DHCPV6_RELAY_SERVERS].name, iface->name);
++			}
++		}
++	}
++
+ 	if (overwrite && (c = tb[IFACE_ATTR_NTP])) {
+ 		struct blob_attr *cur;
+ 		unsigned rem;
+@@ -2003,7 +2053,10 @@
+ 	if (tb[IPV6_PXE_ARCH])
+ 		arch = blobmsg_get_u32(tb[IPV6_PXE_ARCH]);
+ 
+-	return ipv6_pxe_entry_new(arch, url) ? -1 : 0;
++	/* ipv6_pxe_entry_new() returns the new entry on success and NULL on
++	 * allocation failure. Mirror that into the int return code the rest
++	 * of the module uses: success -> 0, failure -> -1. */
++	return ipv6_pxe_entry_new(arch, url) ? 0 : -1;
+ }
+ 
+ void odhcpd_reload(void)
+--- a/src/dhcpv4.c
++++ b/src/dhcpv4.c
+@@ -129,7 +129,12 @@
+ 		[DHCPV4_MSG_TLS]		= "DHCPV4_MSG_TLS",
+ 	};
+ 
+-	if (req_msg >= ARRAY_SIZE(dhcpv4_msg_names))
++	/* Designated initializers leave unspecified slots NULL (e.g. index 0,
++	 * which is not a valid DHCP message type but is a valid uint8_t). The
++	 * return value goes straight into %s format strings, so make sure we
++	 * never hand the caller a NULL pointer.
++	 */
++	if (req_msg >= ARRAY_SIZE(dhcpv4_msg_names) || !dhcpv4_msg_names[req_msg])
+ 		return "UNKNOWN";
+ 	return dhcpv4_msg_names[req_msg];
+ }
+@@ -280,13 +285,13 @@
+ 
+ 		error("Failed to send %s to %s - %s: %m", dhcpv4_msg_to_string(fr_msg.data),
+ 		      odhcpd_print_mac(lease->hwaddr, sizeof(lease->hwaddr)),
+-		      inet_ntop(AF_INET, &dest, ipv4_str, sizeof(ipv4_str)));
++		      inet_ntop(AF_INET, &dest.sin_addr, ipv4_str, sizeof(ipv4_str)));
+ 	} else {
+ 		char ipv4_str[INET_ADDRSTRLEN];
+ 
+ 		debug("Sent %s to %s - %s", dhcpv4_msg_to_string(fr_msg.data),
+ 		      odhcpd_print_mac(lease->hwaddr, sizeof(lease->hwaddr)),
+-		      inet_ntop(AF_INET, &dest, ipv4_str, sizeof(ipv4_str)));
++		      inet_ntop(AF_INET, &dest.sin_addr, ipv4_str, sizeof(ipv4_str)));
+ 	}
+ }
+ 
+@@ -748,7 +753,11 @@
+ 
+ 			memcpy(arp.arp_ha.sa_data, req->chaddr, 6);
+ 			memcpy(&arp.arp_pa, dest, sizeof(arp.arp_pa));
+-			memcpy(arp.arp_dev, iface->ifname, sizeof(arp.arp_dev));
++			/* arp_dev is a 16-byte fixed buffer; strdup'd ifname is
++			 * typically shorter than that, so memcpy()ing the full
++			 * field length reads past the allocation. Match the
++			 * strncpy pattern used elsewhere for ifr_name. */
++			strncpy(arp.arp_dev, iface->ifname, sizeof(arp.arp_dev) - 1);
+ 
+ 			if (ioctl(iface->dhcpv4_event.uloop.fd, SIOCSARP, &arp) < 0)
+ 				error("ioctl(SIOCSARP): %m");
+--- a/src/dhcpv4.h
++++ b/src/dhcpv4.h
+@@ -182,10 +182,19 @@
+ };
+ 
+ 
++/* RFC2132 §3.1/§3.2 (orig. RFC1497): the Pad (0) and End (255) options are
++ * 1 octet long and have no length byte. Every other DHCPv4 option is
++ * { code, len, data[len] }. Treat Pad as a 1-byte no-op, End as loop
++ * termination, and reject any other option whose declared length runs past
++ * the buffer.
++ */
+ #define dhcpv4_for_each_option(start, end, opt)\
+-	for (opt = (struct dhcpv4_option*)(start); \
+-		&opt[1] <= (struct dhcpv4_option*)(end) && \
+-			&opt->data[opt->len] <= (end); \
+-		opt = (struct dhcpv4_option*)&opt->data[opt->len])
++	for (uint8_t *_o = (uint8_t *)(start); \
++		_o < (uint8_t *)(end) && \
++		(opt = (struct dhcpv4_option *)_o)->code != DHCPV4_OPT_END && \
++		(opt->code == DHCPV4_OPT_PAD || \
++		 (_o + 2 <= (uint8_t *)(end) && \
++		  _o + 2 + opt->len <= (uint8_t *)(end))); \
++		_o += (opt->code == DHCPV4_OPT_PAD) ? 1 : 2 + opt->len)
+ 
+ #endif /* _DHCPV4_H_ */
+--- a/src/dhcpv6-ia.c
++++ b/src/dhcpv6-ia.c
+@@ -346,8 +346,14 @@
+ 	if (iface->addr6_len < 1)
+ 		return false;
+ 
+-	/* Try honoring the hint first */
+-	uint32_t current = 1, asize = (1 << (64 - assign->length)) - 1;
++	/* Try honoring the hint first.
++	 *
++	 * Subnet-id slots per delegated prefix = 2^(64 - length); the literal
++	 * 1 is plain int, so shifting it by 32-63 bits is undefined behaviour
++	 * for short prefix lengths (the user can drive this via
++	 * dhcpv6_pd_min_len). Compute the shift in uint64_t and truncate.
++	 */
++	uint32_t current = 1, asize = (uint32_t)((1ULL << (64 - assign->length)) - 1);
+ 	if (assign->assigned_subnet_id) {
+ 		list_for_each_entry(c, &iface->ia_assignments, head) {
+ 			if (c->flags & OAF_DHCPV6_NA)
+@@ -362,7 +368,7 @@
+ 				return true;
+ 			}
+ 
+-			current = (c->assigned_subnet_id + (1 << (64 - c->length)));
++			current = (uint32_t)(c->assigned_subnet_id + (1ULL << (64 - c->length)));
+ 		}
+ 	}
+ 
+@@ -384,7 +390,7 @@
+ 			return true;
+ 		}
+ 
+-		current = (c->assigned_subnet_id + (1 << (64 - c->length)));
++		current = (uint32_t)(c->assigned_subnet_id + (1ULL << (64 - c->length)));
+ 	}
+ 
+ 	return false;
+@@ -591,6 +597,9 @@
+ 			.val = htons(status),
+ 		};
+ 
++		if (buflen < ia_len + sizeof(o_status))
++			return 0;
++
+ 		memcpy(buf + ia_len, &o_status, sizeof(o_status));
+ 		ia_len += sizeof(o_status);
+ 
+@@ -807,7 +816,7 @@
+ 					};
+ 
+ 					if (buflen < ia_len + sizeof(o_ia_a))
+-						continue;
++						return 0;
+ 
+ 					memcpy(buf + ia_len, &o_ia_a, sizeof(o_ia_a));
+ 					ia_len += sizeof(o_ia_a);
+@@ -958,7 +967,8 @@
+ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *iface,
+ 		const struct sockaddr_in6 *addr, const void *data, const uint8_t *end)
+ {
+-	struct dhcpv6_lease *first = NULL;
++	uint8_t first_key[16];
++	bool first_key_valid = false;
+ 	const struct dhcpv6_client_header *hdr = data;
+ 	time_t now = odhcpd_time();
+ 	uint16_t otype, olen, duid_len = 0;
+@@ -1018,6 +1028,14 @@
+ 		bool is_na = (otype == DHCPV6_OPT_IA_NA);
+ 		bool ia_addr_present = false;
+ 		if (!is_pd && !is_na)
++			continue;
++
++		/* RFC8415 §21.4 / §21.21: an IA_NA/IA_PD option carries at
++		 * least 12 bytes of fixed payload (iaid + t1 + t2) before any
++		 * sub-options. Without this guard, a crafted option with
++		 * olen < 12 lets us read ia->iaid/t1/t2 out of bounds (the
++		 * iterator only enforces odata + olen <= end). */
++		if (olen < sizeof(struct dhcpv6_ia_hdr) - DHCPV6_OPT_HDR_SIZE)
+ 			continue;
+ 
+ 		struct dhcpv6_ia_hdr *ia = (struct dhcpv6_ia_hdr*)&odata[-DHCPV6_OPT_HDR_SIZE];
+@@ -1200,8 +1218,8 @@
+ 						else
+ 							a->assigned_subnet_id = reqhint;
+ 
+-						if (first)
+-							memcpy(a->key, first->key, sizeof(a->key));
++						if (first_key_valid)
++							memcpy(a->key, first_key, sizeof(a->key));
+ 						else
+ 							odhcpd_urandom(a->key, sizeof(a->key));
+ 
+@@ -1239,10 +1257,13 @@
+ 			}
+ 
+ 			/* Reconfigure Accept */
+-			if (accept_reconf && assigned && !first &&
+-				hdr->msg_type != DHCPV6_MSG_REBIND) {
+-
+-				size_t handshake_len = 4;
++			size_t handshake_len = 4;
++			if (hdr->msg_type == DHCPV6_MSG_REQUEST)
++				handshake_len += sizeof(struct dhcpv6_auth_reconfigure);
++
++			if (accept_reconf && assigned && !first_key_valid &&
++				hdr->msg_type != DHCPV6_MSG_REBIND &&
++				buflen >= handshake_len) {
+ 				buf[0] = 0;
+ 				buf[1] = DHCPV6_OPT_RECONF_ACCEPT;
+ 				buf[2] = 0;
+@@ -1259,15 +1280,15 @@
+ 					};
+ 
+ 					memcpy(auth.key, a->key, sizeof(a->key));
+-					memcpy(buf + handshake_len, &auth, sizeof(auth));
+-					handshake_len += sizeof(auth);
++					memcpy(buf + 4, &auth, sizeof(auth));
+ 				}
+ 
+ 				buf += handshake_len;
+ 				buflen -= handshake_len;
+ 				response_len += handshake_len;
+ 
+-				first = a;
++				memcpy(first_key, a->key, sizeof(first_key));
++				first_key_valid = true;
+ 			}
+ 
+ 			ia_response_len = build_ia(
+@@ -1381,6 +1402,9 @@
+ 			a->bound = true;
+ 			apply_lease(a, true);
+ 		}
++
++		if (ia_response_len > buflen)
++			ia_response_len = buflen;
+ 
+ 		buf += ia_response_len;
+ 		buflen -= ia_response_len;
+--- a/src/dhcpv6-pxe.c
++++ b/src/dhcpv6-pxe.c
+@@ -32,6 +32,11 @@
+ 	ipe->bootfile_url.type = htons(DHCPV6_OPT_BOOTFILE_URL);
+ 
+ 	if (arch == 0xFFFFFFFF) {
++		/* The "default" entry lives outside ipv6_pxe_list; if config
++		 * already supplied one (e.g. two boot6 sections without an
++		 * arch), free the previous one before replacing it, otherwise
++		 * it would leak until ipv6_pxe_clear() runs. */
++		free(ipv6_pxe_default);
+ 		ipv6_pxe_default = ipe;
+ 	}
+ 	else {
+--- a/src/dhcpv6.c
++++ b/src/dhcpv6.c
+@@ -28,7 +28,8 @@
+ #endif
+ 
+ static void relay_client_request(struct sockaddr_in6 *source,
+-		const void *data, size_t len, struct interface *iface);
++		const void *data, size_t len, struct interface *iface,
++		struct in6_addr *dest);
+ static void relay_server_response(uint8_t *data, size_t len);
+ 
+ static void handle_dhcpv6(void *addr, void *data, size_t len,
+@@ -191,7 +192,7 @@
+ 	IOV_TOTAL
+ };
+ 
+-static void handle_nested_message(uint8_t *data, size_t len,
++static void handle_nested_message(uint8_t *data, size_t len, unsigned depth,
+ 				  struct dhcpv6_client_header **c_hdr, uint8_t **opts,
+ 				  uint8_t **end, struct iovec iov[IOV_TOTAL])
+ {
+@@ -215,34 +216,54 @@
+ 		return;
+ 	}
+ 
++	/* Each nested Relay-Forward is one relay hop; RFC8415 bounds a relay
++	 * chain via HOP_COUNT_LIMIT (defined in §7.6, enforced in §19.1.2),
++	 * so refuse to recurse deeper and avoid stack exhaustion on crafted
++	 * relay loops. */
++	if (depth >= DHCPV6_HOP_COUNT_LIMIT)
++		return;
++
+ 	dhcpv6_for_each_option(r_hdr->options, data + len, otype, olen, odata) {
+ 		if (otype == DHCPV6_OPT_RELAY_MSG) {
+ 			iov[IOV_RELAY_MSG].iov_base = odata + olen;
+ 			iov[IOV_RELAY_MSG].iov_len = (((uint8_t *)iov[IOV_NESTED].iov_base) +
+ 					iov[IOV_NESTED].iov_len) - (odata + olen);
+-			handle_nested_message(odata, olen, c_hdr, opts, end, iov);
++			handle_nested_message(odata, olen, depth + 1, c_hdr, opts, end, iov);
+ 			return;
+ 		}
+ 	}
+ }
+ 
+ 
+-static void update_nested_message(uint8_t *data, size_t len, ssize_t pdiff)
++static void update_nested_message(uint8_t *data, size_t len, unsigned depth, ssize_t pdiff)
+ {
+ 	struct dhcpv6_relay_header *hdr = (struct dhcpv6_relay_header*)data;
+ 	if (hdr->msg_type != DHCPV6_MSG_RELAY_FORW)
+ 		return;
+ 
+ 	hdr->msg_type = DHCPV6_MSG_RELAY_REPL;
++
++	/* Bound recursion to mirror handle_nested_message(). */
++	if (depth >= DHCPV6_HOP_COUNT_LIMIT)
++		return;
+ 
+ 	uint16_t otype, olen;
+ 	uint8_t *odata;
+ 	dhcpv6_for_each_option(hdr->options, data + len, otype, olen, odata) {
+ 		if (otype == DHCPV6_OPT_RELAY_MSG) {
+-			olen += pdiff;
+-			odata[-2] = (olen >> 8) & 0xff;
+-			odata[-1] = olen & 0xff;
+-			update_nested_message(odata, olen - pdiff, pdiff);
++			ssize_t newlen = (ssize_t)olen + pdiff;
++
++			/* olen was validated to lie within the buffer by the option
++			 * iterator. Reject a pdiff that would make the rewritten
++			 * RELAY_MSG length wrap the 16-bit field, which would also feed
++			 * a bogus length into the recursion below and walk options past
++			 * the end of the (untrusted) packet buffer. */
++			if (newlen < 0 || newlen > UINT16_MAX)
++				return;
++
++			odata[-2] = (newlen >> 8) & 0xff;
++			odata[-1] = newlen & 0xff;
++			update_nested_message(odata, olen, depth + 1, pdiff);
+ 			return;
+ 		}
+ 	}
+@@ -303,6 +324,19 @@
+ 
+ 	if (!msgv4_data || msgv4_len == 0) {
+ 		error("4o6: missing DHCPv4 message option (%d)", DHCPV6_OPT_DHCPV4_MSG);
++		return -1;
++	}
++
++	/* dhcpv4_handle_msg() reads the full BOOTP fixed header (op, htype,
++	 * hlen, hops, xid, secs, flags, ciaddr, yiaddr, siaddr, giaddr,
++	 * chaddr, sname, file, cookie = offsetof(options) bytes) before
++	 * parsing options. The normal DHCPv4 socket path enforces this via a
++	 * BPF filter, but the DHCPv4-over-DHCPv6 path bypasses that filter,
++	 * so validate the length here to prevent an out-of-bounds read on a
++	 * truncated DHCPV4_MSG option. RFC7341 §7.1 defines the DHCPv4 Message
++	 * option but mandates no minimum length, so this floor is ours. */
++	if (msgv4_len < offsetof(struct dhcpv4_message, options)) {
++		error("4o6: encapsulated DHCPv4 message too short (%u)", msgv4_len);
+ 		return -1;
+ 	}
+ 
+@@ -508,7 +542,11 @@
+ 
+ 	uint16_t otype, olen;
+ 	uint8_t *odata;
+-	uint16_t *reqopts = NULL;
++	/* OPTION_ORO payload is an array of uint16_t but the underlying buffer
++	 * isn't guaranteed to be 2-byte aligned (it's at an arbitrary offset
++	 * inside the packed wire packet), so keep it as a byte pointer and
++	 * memcpy each value out rather than casting to uint16_t *. */
++	uint8_t *reqopts = NULL;
+ 	size_t reqopts_cnt = 0;
+ 
+ 	/* FIXME: this should be merged with the second loop further down */
+@@ -516,14 +554,17 @@
+ 		/* Requested options, array of uint16_t, RFC 8415 §21.7 */
+ 		if (otype == DHCPV6_OPT_ORO) {
+ 			reqopts_cnt = olen / sizeof(uint16_t);
+-			reqopts = (uint16_t *)odata;
++			reqopts = odata;
+ 			break;
+ 		}
+ 	}
+ 
+ 	/* Requested options */
+ 	for (size_t i = 0; i < reqopts_cnt; i++) {
+-		uint16_t opt = ntohs(reqopts[i]);
++		uint16_t opt;
++
++		memcpy(&opt, &reqopts[i * sizeof(uint16_t)], sizeof(opt));
++		opt = ntohs(opt);
+ 
+ 		switch (opt) {
+ 		case DHCPV6_OPT_SNTP_SERVERS:
+@@ -656,7 +697,7 @@
+ 	};
+ 
+ 	if (hdr->msg_type == DHCPV6_MSG_RELAY_FORW)
+-		handle_nested_message(data, len, &hdr, &opts, &opts_end, iov);
++		handle_nested_message(data, len, 0, &hdr, &opts, &opts_end, iov);
+ 
+ 	if (!IN6_IS_ADDR_MULTICAST((struct in6_addr *)dest_addr) && iov[IOV_NESTED].iov_len == 0 &&
+ 	    (hdr->msg_type == DHCPV6_MSG_SOLICIT || hdr->msg_type == DHCPV6_MSG_CONFIRM ||
+@@ -679,8 +720,12 @@
+ 			iov[IOV_RAPID_COMMIT].iov_len = sizeof(rapid_commit);
+ 			o_rapid_commit = true;
+ 		} else if (otype == DHCPV6_OPT_ORO) {
+-			for (int i=0; i < olen/2; i++) {
+-				uint16_t option = ntohs(((uint16_t *)odata)[i]);
++			for (int i = 0; i < olen / 2; i++) {
++				uint16_t option;
++
++				/* odata is not guaranteed to be uint16-aligned. */
++				memcpy(&option, &odata[i * 2], sizeof(option));
++				option = ntohs(option);
+ 
+ 				switch (option) {
+ #ifdef DHCPV4_SUPPORT
+@@ -709,16 +754,22 @@
+ 					break;
+ 				}
+ 			}
+-		} else if (otype == DHCPV6_OPT_CLIENT_ARCH) {
+-			uint16_t arch_code = ntohs(((uint16_t*)odata)[0]);
++		} else if (otype == DHCPV6_OPT_CLIENT_ARCH && olen >= sizeof(uint16_t)) {
++			uint16_t arch_code;
++
++			/* odata is not guaranteed to be uint16-aligned, and
++			 * RFC5970 §3.3 mandates olen be a multiple of 2 with
++			 * at least one architecture entry — read defensively. */
++			memcpy(&arch_code, odata, sizeof(arch_code));
++			arch_code = ntohs(arch_code);
+ 			ipv6_pxe_serve_boot_url(arch_code, &iov[IOV_BOOTFILE_URL]);
+ 		}
+ 	}
+ 
+-	if (dest.serverid_length == clientid.len && 
+-	    !memcmp(clientid.buf, dest.serverid_buf, dest.serverid_length)) {
++	if (dest.serverid_length == clientid.len &&
++	    !memcmp(clientid.buf, dest.serverid_buf, ntohs(dest.serverid_length))) {
+ 		/* Bail if we are in a network loop where we talk with ourself */
+-		return;		
++		return;
+ 	}
+ 
+ 	if (!IN6_IS_ADDR_MULTICAST((struct in6_addr *)dest_addr) && iov[IOV_NESTED].iov_len == 0 &&
+@@ -779,7 +830,7 @@
+ 	}
+ 
+ 	if (iov[IOV_NESTED].iov_len > 0) /* Update length */
+-		update_nested_message(data, len, iov[IOV_DEST].iov_len + iov[IOV_MAXRT].iov_len +
++		update_nested_message(data, len, 0, iov[IOV_DEST].iov_len + iov[IOV_MAXRT].iov_len +
+ 				      iov[IOV_RAPID_COMMIT].iov_len + iov[IOV_DNS].iov_len +
+ 				      iov[IOV_DNS_ADDR].iov_len + iov[IOV_SEARCH].iov_len +
+ 				      iov[IOV_SEARCH_DOMAIN].iov_len + iov[IOV_PDBUF].iov_len +
+@@ -806,10 +857,15 @@
+ 	if (iface->dhcpv6 == MODE_SERVER) {
+ 		handle_client_request(addr, data, len, iface, dest_addr);
+ 	} else if (iface->dhcpv6 == MODE_RELAY) {
+-		if (iface->master)
++		if (iface->master) {
+ 			relay_server_response(data, len);
+-		else
+-			relay_client_request(addr, data, len, iface);
++		} else if (iface->dhcpv6_relay_server_addrs6_cnt > 0) {
++			for (size_t i = 0; i < iface->dhcpv6_relay_server_addrs6_cnt; i++) {
++				relay_client_request(addr, data, len, iface, &iface->dhcpv6_relay_server_addrs6[i]);
++			}
++		} else {
++			relay_client_request(addr, data, len, iface, NULL);
++		}
+ 	}
+ }
+ 
+@@ -926,7 +982,8 @@
+ 
+ /* Relay client request (regular DHCPv6-relay) */
+ static void relay_client_request(struct sockaddr_in6 *source,
+-		const void *data, size_t len, struct interface *iface)
++		const void *data, size_t len, struct interface *iface,
++		struct in6_addr *dest)
+ {
+ 	const struct dhcpv6_relay_header *h = data;
+ 	/* Construct our forwarding envelope */
+@@ -942,6 +999,14 @@
+ 	struct interface *c;
+ 	struct odhcpd_ipaddr *ip;
+ 	struct sockaddr_in6 s;
++
++	/* A bare UDP socket can deliver a zero/short payload; the relay-reply
++	 * path (relay_server_response) checks this but the client-side relay
++	 * did not. relay_client_request() reads h->msg_type, plus h->hop_count
++	 * for a RELAY_FORW, out of the relay header and forwards the rest
++	 * verbatim, so require at least those two leading header bytes. */
++	if (len < offsetof(struct dhcpv6_relay_header, link_address))
++		return;
+ 
+ 	switch (h->msg_type) {
+ 	/* Valid message types from clients */
+@@ -988,7 +1053,11 @@
+ 	memset(&s, 0, sizeof(s));
+ 	s.sin6_family = AF_INET6;
+ 	s.sin6_port = htons(DHCPV6_SERVER_PORT);
+-	inet_pton(AF_INET6, ALL_DHCPV6_SERVERS, &s.sin6_addr);
++
++	if (dest)
++		s.sin6_addr = *dest;
++	else
++		inet_pton(AF_INET6, ALL_DHCPV6_SERVERS, &s.sin6_addr);
+ 
+ 	avl_for_each_element(&interfaces, c, avl) {
+ 		if (!c->master || c->dhcpv6 != MODE_RELAY)
+--- a/src/ndp.c
++++ b/src/ndp.c
+@@ -382,6 +382,15 @@
+ 	if (len < sizeof(*ip6) + sizeof(*req))
+ 		return; // Invalid total length
+ 
++	/* RFC4861 §7.1.1: a Neighbor Solicitation MUST be silently discarded
++	 * if the IP Hop Limit field is not 255 or the ICMP Code is non-zero.
++	 * The hop-limit check is what protects against off-link attackers
++	 * forging NS / DAD messages, so it must not be skipped. Because the
++	 * NDP socket is AF_PACKET (not a kernel-managed ICMPv6 socket), we
++	 * have to enforce it ourselves. */
++	if (ip6->ip6_hlim != 255 || req->nd_ns_hdr.icmp6_code != 0)
++		return;
++
+ 	if (IN6_IS_ADDR_LINKLOCAL(&req->nd_ns_target) ||
+ 			IN6_IS_ADDR_LOOPBACK(&req->nd_ns_target) ||
+ 			IN6_IS_ADDR_MULTICAST(&req->nd_ns_target))
+--- a/src/netlink.c
++++ b/src/netlink.c
+@@ -587,8 +587,14 @@
+ 	memset(&oaddrs[ctxt->ret], 0, sizeof(oaddrs[ctxt->ret]));
+ 	oaddrs[ctxt->ret].prefix_len = ifa->ifa_prefixlen;
+ 
+-	if (ifa->ifa_family == AF_INET)
+-		oaddrs[ctxt->ret].netmask = htonl(~((1U << (32 - ifa->ifa_prefixlen)) - 1));
++	if (ifa->ifa_family == AF_INET) {
++		/* ifa_prefixlen is 0..32. A /0 prefix turns "32 - prefix" into a
++		 * 32-bit shift on a 32-bit type, which is undefined behaviour;
++		 * compute the host mask in 64-bit and truncate so /0 yields a
++		 * zero netmask as expected. */
++		uint32_t host_bits = (uint32_t)((1ULL << (32 - ifa->ifa_prefixlen)) - 1);
++		oaddrs[ctxt->ret].netmask = htonl(~host_bits);
++	}
+ 
+ 	nla_memcpy(&oaddrs[ctxt->ret].addr, nla_addr, sizeof(oaddrs[ctxt->ret].addr));
+ 
+--- a/src/odhcpd.h
++++ b/src/odhcpd.h
+@@ -468,6 +468,8 @@
+ 	bool dhcpv6_na;
+ 	uint32_t dhcpv6_hostid_len;
+ 	uint32_t dhcpv6_pd_min_len; // minimum delegated prefix length
++	struct in6_addr *dhcpv6_relay_server_addrs6;
++	size_t dhcpv6_relay_server_addrs6_cnt;
+ 
+ 	char *upstream;
+ 	size_t upstream_len;
+--- a/src/router.c
++++ b/src/router.c
+@@ -902,6 +902,12 @@
+ 			dns_addrs6_cnt = 1;
+ 		}
+ 
++		/* The RDNSS len field is a uint8_t counting 8-byte units, so it
++		 * holds at most 127 addresses (1 + 2*127 == 255); drop any extra
++		 * so the on-wire length stays consistent with the bytes sent. */
++		if (dns_addrs6_cnt > 127)
++			dns_addrs6_cnt = 127;
++
+ 		if (dns_addrs6_cnt) {
+ 			dns_sz = sizeof(*dns) + dns_addrs6_cnt * sizeof(*dns_addrs6);
+ 
+@@ -917,7 +923,11 @@
+ 	iov[IOV_RA_DNS].iov_len = dns_sz;
+ 
+ 	/* DNS Search List aka DNSSL; RFC8106, §5.2 */
+-	if (iface->ra_dns && iface->dns_search_len > 0) {
++	/* The DNSSL len field is a uint8_t counting 8-byte units, so the whole
++	 * option must fit in UINT8_MAX*8 bytes; skip it otherwise rather than
++	 * emit an option whose length field does not match its real size. */
++	if (iface->ra_dns && iface->dns_search_len > 0 &&
++	    sizeof(*search) + ((iface->dns_search_len + 7) & ~7) <= UINT8_MAX * 8) {
+ 		search_sz = sizeof(*search) + ((iface->dns_search_len + 7) & ~7);
+ 		search = alloca(search_sz);
+ 		memset(search, 0, search_sz);
+@@ -1174,7 +1184,7 @@
+ 	/* Rewrite options */
+ 	uint8_t *end = data + len;
+ 	uint8_t *mac_ptr = NULL;
+-	struct in6_addr *dns_addrs6 = NULL;
++	struct in6_addr *dns_addrs6 = NULL, *dns_addrs6_orig = NULL;
+ 	size_t dns_addrs6_cnt = 0;
+ 	// MTU option
+ 	struct nd_opt_mtu *mtu_opt = NULL;
+@@ -1247,9 +1257,24 @@
+ 	all_nodes.sin6_family = AF_INET6;
+ 	inet_pton(AF_INET6, ALL_IPV6_NODES, &all_nodes.sin6_addr);
+ 
++	/* Preserve the upstream DNS addresses: they are rewritten in place in the
++	 * single shared packet buffer, so without restoring them a later slave
++	 * would inherit a previous slave's rewritten values. */
++	if (dns_addrs6 && dns_addrs6_cnt > 0) {
++		dns_addrs6_orig = alloca(dns_addrs6_cnt * sizeof(*dns_addrs6_orig));
++		memcpy(dns_addrs6_orig, dns_addrs6, dns_addrs6_cnt * sizeof(*dns_addrs6_orig));
++	}
++
+ 	avl_for_each_element(&interfaces, c, avl) {
+ 		if (c->ra != MODE_RELAY || c->master)
+ 			continue;
++
++		/* Restore the upstream DNS addresses and MTU value that a previous
++		 * slave may have rewritten in the shared buffer. */
++		if (dns_addrs6_orig)
++			memcpy(dns_addrs6, dns_addrs6_orig, dns_addrs6_cnt * sizeof(*dns_addrs6));
++		if (mtu_opt)
++			mtu_opt->nd_opt_mtu_mtu = htonl(ingress_mtu_val);
+ 
+ 		/* Fixup source hardware address option */
+ 		if (mac_ptr)
+--- a/src/statefiles.c
++++ b/src/statefiles.c
+@@ -51,11 +51,13 @@
+ 		return NULL;
+ 
+ 	fd = openat(dirfd, ODHCPD_TMP_FILE, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+-	if (fd < 0)
+-		goto err;
++	if (fd < 0) {
++		error("Failed to create temporary file: %m");
++		return NULL;
++	}
+ 
+ 	if (lockf(fd, F_LOCK, 0) < 0)
+-		goto err;
++		goto err_del;
+ 
+ 	if (ftruncate(fd, 0) < 0)
+ 		goto err_del;
+@@ -67,10 +69,12 @@
+ 	return fp;
+ 
+ err_del:
++	/* Log before unlinkat()/close() so they don't clobber errno. The
++	 * old code also called close(fd) on the openat-failure path, which
++	 * meant close(-1) overwrote errno with EBADF before %m printed it. */
++	error("Failed to create temporary file: %m");
+ 	unlinkat(dirfd, ODHCPD_TMP_FILE, 0);
+-err:
+ 	close(fd);
+-	error("Failed to create temporary file: %m");
+ 	return NULL;
+ }
+ 
+@@ -361,7 +365,13 @@
+ {
+ 	char exp_dn[DNS_MAX_NAME_LEN];
+ 
+-	if (dn_expand(ctxt->iface->dns_search, ctxt->iface->dns_search + ctxt->iface->dns_search_len,
++	/* Since the DNS search-domain fallback was dropped, dns_search may
++	 * legitimately be NULL on interfaces with no configured domain. Skip
++	 * dn_expand() in that case to avoid pointer arithmetic on NULL and
++	 * libc-specific NULL handling in dn_expand(). */
++	if (ctxt->iface->dns_search && ctxt->iface->dns_search_len > 0 &&
++	    dn_expand(ctxt->iface->dns_search,
++		      ctxt->iface->dns_search + ctxt->iface->dns_search_len,
+ 		      ctxt->iface->dns_search, exp_dn, sizeof(exp_dn)) > 0)
+ 		fprintf(ctxt->fp, "%s\t%s.%s\t%s\n", ipbuf, hostname, exp_dn, hostname);
+ 	else
+@@ -477,9 +487,49 @@
+ 	fprintf(ctxt->fp, " %s/%" PRIu8, ipbuf, prefix_len);
+ }
+ 
++/*
++ * Escape a client-supplied hostname so it is safe to write as a single field
++ * into the space-delimited, line-based state file: every byte that is not a
++ * bare LDH character (the RFC 1035 section 2.3.1 "preferred name syntax" set
++ * accepted by odhcpd_hostname_valid()) is encoded as \xNN. A DHCP client
++ * controls its requested hostname (DHCPv4 option 12, DHCPv6 FQDN option) and,
++ * since DNS labels may carry any octet (RFC 2181 section 11), dn_expand()/the
++ * option parser copy the bytes verbatim - so without escaping a hostname could
++ * embed a newline (forging an extra '#'-prefixed lease record) or a space
++ * (forging additional fields). Valid hostnames are pure LDH and are copied
++ * unchanged. The result is written into dst (always NUL-terminated, truncated
++ * if it would not fit) and returned.
++ */
++static const char *statefiles_escape_hostname(char *dst, size_t dstlen, const char *src)
++{
++	size_t pos = 0;
++
++	if (dstlen == 0)
++		return dst;
++
++	for (const unsigned char *c = (const unsigned char *)src; *c; c++) {
++		if ((*c >= '0' && *c <= '9') ||
++		    (*c >= 'A' && *c <= 'Z') ||
++		    (*c >= 'a' && *c <= 'z') ||
++		    *c == '-' || *c == '_' || *c == '.') {
++			if (pos + 1 >= dstlen)
++				break;
++			dst[pos++] = *c;
++		} else {
++			if (pos + 4 >= dstlen)
++				break;
++			pos += sprintf(&dst[pos], "\\x%02x", *c);
++		}
++	}
++
++	dst[pos] = '\0';
++	return dst;
++}
++
+ static void statefiles_write_state6(struct write_ctxt *ctxt, struct dhcpv6_lease *lease)
+ {
+ 	char duidbuf[DUID_HEXSTRLEN];
++	char hostbuf[DNS_MAX_NAME_LEN * 4];
+ 
+ 	if (ctxt->fp) {
+ 		odhcpd_hexlify(duidbuf, lease->duid, lease->duid_len);
+@@ -489,7 +539,8 @@
+ 			"# %s %s %x %s%s %" PRId64 " %" PRIx64 " %" PRIu8,
+ 			ctxt->iface->ifname, duidbuf, ntohl(lease->iaid),
+ 			lease->hostname && !lease->hostname_valid ? "broken\\x20": "",
+-			lease->hostname ? lease->hostname : "-",
++			statefiles_escape_hostname(hostbuf, sizeof(hostbuf),
++						   lease->hostname ? lease->hostname : "-"),
+ 			(lease->valid_until > ctxt->now ?
+ 			 (int64_t)(lease->valid_until - ctxt->now + ctxt->wall_time) :
+ 			 (INFINITE_VALID(lease->valid_until) ? -1 : 0)),
+@@ -508,6 +559,7 @@
+ static void statefiles_write_state4(struct write_ctxt *ctxt, struct dhcpv4_lease *lease)
+ {
+ 	char ipbuf[INET6_ADDRSTRLEN];
++	char hostbuf[DNS_MAX_NAME_LEN * 4];
+ 
+ 	if (lease->hostname && lease->hostname_valid) {
+ 		md5_hash(&lease->ipv4, sizeof(lease->ipv4), &ctxt->md5);
+@@ -525,7 +577,8 @@
+ 		ctxt->iface->ifname,
+ 		ether_ntoa((struct ether_addr *)lease->hwaddr),
+ 		lease->hostname && !lease->hostname_valid ? "broken\\x20" : "",
+-		lease->hostname ? lease->hostname : "-",
++		statefiles_escape_hostname(hostbuf, sizeof(hostbuf),
++					   lease->hostname ? lease->hostname : "-"),
+ 		(lease->valid_until > ctxt->now ?
+ 		 (int64_t)(lease->valid_until - ctxt->now + ctxt->wall_time) :
+ 		 (INFINITE_VALID(lease->valid_until) ? -1 : 0)),
+--- a/src/ubus.c
++++ b/src/ubus.c
+@@ -52,7 +52,7 @@
+ 				buf = blobmsg_alloc_string_buffer(&b, "duid", DUID_HEXSTRLEN + 1);
+ 				odhcpd_hexlify(buf, c->duid, c->duid_len);
+ 				blobmsg_add_string_buffer(&b);
+-				blobmsg_add_u32(&b, "iaid", ntohl(c->iaid));
++				blobmsg_add_u32(&b, "iaid", c->iaid);
+ 			}
+ 
+ 			blobmsg_add_string(&b, "hostname", (c->hostname) ? c->hostname : "");
