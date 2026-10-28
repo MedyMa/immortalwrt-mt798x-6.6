@@ -1185,10 +1185,10 @@ Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
  /* include statistics in the dump */
 --- a/kernel/bpf/syscall.c
 +++ b/kernel/bpf/syscall.c
-@@ -35,8 +35,9 @@
- #include <linux/rcupdate_trace.h>
+@@ -36,8 +36,9 @@
  #include <linux/memcontrol.h>
  #include <linux/trace_events.h>
+ #include <linux/cookie.h>
 -#include <net/netfilter/nf_bpf_link.h>
  
 +#include <net/netfilter/nf_bpf_link.h>

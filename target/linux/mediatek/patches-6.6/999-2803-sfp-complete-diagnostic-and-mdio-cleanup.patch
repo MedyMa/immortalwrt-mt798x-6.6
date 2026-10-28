@@ -8,15 +8,7 @@ stop hwmon producers during teardown.
 
 --- a/drivers/net/phy/sfp.c
 +++ b/drivers/net/phy/sfp.c
-@@ -866,6 +866,7 @@
- static void sfp_i2c_mdiobus_destroy(struct sfp *sfp)
- {
- 	mdiobus_unregister(sfp->i2c_mii);
-+	mdiobus_free(sfp->i2c_mii);
- 	sfp->i2c_mii = NULL;
- }
- 
-@@ -1723,6 +1724,9 @@
+@@ -1724,6 +1724,9 @@
  	struct sfp *sfp = container_of(work, struct sfp, hwmon_probe.work);
  	int err;
  
@@ -26,7 +18,7 @@ stop hwmon producers during teardown.
  	/* hwmon interface needs to access 16bit registers in atomic way to
  	 * guarantee coherency of the diagnostic monitoring data. If it is not
  	 * possible to guarantee coherency because EEPROM is broken in such way
-@@ -1738,8 +1742,11 @@
+@@ -1739,8 +1742,11 @@
  	}
  
  	err = sfp_read(sfp, true, 0, &sfp->diag, sizeof(sfp->diag));
@@ -40,7 +32,7 @@ stop hwmon producers during teardown.
  			mod_delayed_work(system_wq, &sfp->hwmon_probe,
  					 T_PROBE_RETRY_SLOW);
  		} else {
-@@ -1752,6 +1759,7 @@
+@@ -1753,6 +1759,7 @@
  	sfp->hwmon_name = hwmon_sanitize_name(dev_name(sfp->dev));
  	if (IS_ERR(sfp->hwmon_name)) {
  		dev_err(sfp->dev, "out of memory for hwmon name\n");
@@ -48,7 +40,7 @@ stop hwmon producers during teardown.
  		return;
  	}
  
-@@ -1759,29 +1767,34 @@
+@@ -1760,29 +1767,34 @@
  							 sfp->hwmon_name, sfp,
  							 &sfp_hwmon_chip_info,
  							 NULL);
@@ -102,7 +94,7 @@ stop hwmon producers during teardown.
  }
  
  static int sfp_hwmon_init(struct sfp *sfp)
-@@ -1793,7 +1806,8 @@
+@@ -1794,7 +1806,8 @@
  
  static void sfp_hwmon_exit(struct sfp *sfp)
  {

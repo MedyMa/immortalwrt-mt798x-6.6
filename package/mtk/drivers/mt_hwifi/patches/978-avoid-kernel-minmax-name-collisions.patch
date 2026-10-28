@@ -1,0 +1,101 @@
+Subject: [PATCH] wifi: avoid kernel MIN/MAX collisions and bound SSID matches
+
+Use the native min_t helper for NSS fields and guard portable macros.
+The local RRM MIN macros actually selected the greater length. Compare
+SSID lengths before comparing bytes, avoiding both an over-read and a
+prefix-only SSID match.
+
+--- a/mt_wifi/common/cmm_info.c
++++ b/mt_wifi/common/cmm_info.c
+@@ -39,7 +39,6 @@
+ #endif
+ 
+ #define MCAST_WCID_TO_REMOVE 0 /* Pat: TODO */
+-#define MIN(a, b)					((a) < (b) ? (a) : (b))
+ INT UNII4BandSupportRegions[] = {25, 26};
+ INT MCSMappingRateTable[] = {
+ 	2,  4, 11, 22, 12,  18,  24,  36, 48,  72,  96, 108, 109, 110, 111, 112,/* CCK and OFDM */
+@@ -9044,7 +9043,7 @@
+ 
+ 	pMbss = &pAd->ApCfg.MBSSID[apidx];
+ 
+-	ucTxPath = MIN(MCS_NSS_CAP(pAd)->max_nss,
++	ucTxPath = min_t(u32, MCS_NSS_CAP(pAd)->max_nss,
+ 		MCS_NSS_CAP(pAd)->max_path[MAX_PATH_TX]);
+ 
+ 
+@@ -9092,7 +9091,7 @@
+ 
+ 	pMbss = &pAd->ApCfg.MBSSID[apidx];
+ 
+-	ucTxPath = MIN(MCS_NSS_CAP(pAd)->max_nss,
++	ucTxPath = min_t(u32, MCS_NSS_CAP(pAd)->max_nss,
+ 		MCS_NSS_CAP(pAd)->max_path[MAX_PATH_TX]);
+ 
+ #ifdef ANTENNA_CONTROL_SUPPORT
+@@ -9147,7 +9146,7 @@
+ 
+ 	pMbss = &pAd->ApCfg.MBSSID[apidx];
+ 
+-	ucRxPath = MIN(MCS_NSS_CAP(pAd)->max_nss,
++	ucRxPath = min_t(u32, MCS_NSS_CAP(pAd)->max_nss,
+ 		MCS_NSS_CAP(pAd)->max_path[MAX_PATH_RX]);
+ 
+ 	Value = os_str_tol(arg, 0, 10);
+--- a/mt_wifi/feature/rrm/rrm.c
++++ b/mt_wifi/feature/rrm/rrm.c
+@@ -2504,7 +2504,6 @@
+ 		IN PRTMP_ADAPTER pAd,
+ 		IN MLME_QUEUE_ELEM *Elem)
+ {
+-#define MIN(_x, _y) ((_x) > (_y) ? (_x) : (_y))
+ 	MEASURE_REQ_INFO MeasureReqInfo;
+ 	RRM_BEACON_REQ_INFO BcnReq;
+ 	PFRAME_802_11 pFr = (PFRAME_802_11)Elem->Msg;
+@@ -2562,8 +2561,8 @@
+ 			isWildcardBssid = RTMPEqualMemory(BcnReq.Bssid, WildCardBssid, MAC_ADDR_LEN);
+ 			if (isWildcardBssid == TRUE) {
+ 				if (SsidLen != 0) {
+-					BssMatch = RTMPEqualMemory(pBssEntry->Ssid, pSsid,
+-							MIN(SsidLen, pBssEntry->SsidLen));
++					BssMatch = SsidLen == pBssEntry->SsidLen &&
++						RTMPEqualMemory(pBssEntry->Ssid, pSsid, SsidLen);
+ 					if (BssMatch)
+ 						RRM_EnqueuePeerBeaconRep(pAd, pFr->Hdr.Addr2, pFr->Hdr.Addr1, DialogToken, MeasureReqInfo,
+ 						BcnReq, pBssEntry);
+--- a/mt_wifi/feature/rrm/rrm_tlv.c
++++ b/mt_wifi/feature/rrm/rrm_tlv.c
+@@ -979,7 +979,6 @@
+ 	IN PCHAR pSsid,
+ 	IN UINT8 SsidLen)
+ {
+-#define MIN(_x, _y) ((_x) > (_y) ? (_x) : (_y))
+ 	UINT loop;
+ 	HEADER_802_11 ActHdr;
+ 	PUCHAR pOutBuffer = NULL;
+@@ -1043,8 +1042,8 @@
+ 			break;
+ 
+ 		if (SsidLen != 0)
+-			BssMatch = RTMPEqualMemory(pBssEntry->Ssid, pSsid,
+-									   MIN(SsidLen, pBssEntry->SsidLen));
++			BssMatch = SsidLen == pBssEntry->SsidLen &&
++						RTMPEqualMemory(pBssEntry->Ssid, pSsid, SsidLen);
+ 		else
+ 			BssMatch = TRUE;
+ 
+--- a/mt_wifi/include/wlanif/wlan_common.h
++++ b/mt_wifi/include/wlanif/wlan_common.h
+@@ -107,8 +107,12 @@
+ 	ACL_POLICY_ALLOW	= 2				/* allow traffic from MAC */
+ };
+ 
++#ifndef MIN
+ #define MIN(a, b)					((a) < (b) ? (a) : (b))
++#endif
++#ifndef MAX
+ #define MAX(a, b)					((a) > (b) ? (a) : (b))
++#endif
+ 
+ #define SETBIT(a,i)					((a)[(i) >> 3] |= 1 << ((i) & (NBBY - 1)))
+ #define CLRBIT(a,i)					((a)[(i) >> 3] &= ~(1 << ((i) & (NBBY - 1))))

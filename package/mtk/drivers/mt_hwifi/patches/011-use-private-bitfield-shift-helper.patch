@@ -1,0 +1,28 @@
+Subject: [PATCH] hwifi: keep bitfield shift helper private to the driver
+
+Do not redefine the kernel internal __bf_shf macro. Its spelling changed
+in the stable kernel; a driver-local name also avoids affecting FIELD_*
+users included after this header.
+
+--- a/wlan_hwifi/utility.h
++++ b/wlan_hwifi/utility.h
+@@ -33,16 +33,16 @@
+ 
+ #include "os/mt_linux.h"
+ 
+-#define __bf_shf(x) (__builtin_ffsll(x) - 1)
++#define __mtk_bf_shf(x) (__builtin_ffsll(x) - 1)
+ 
+ #define field_prep(_mask, _val)						\
+ 	({								\
+-		((typeof(_mask))(_val) << __bf_shf(_mask)) & (_mask);	\
++		((typeof(_mask))(_val) << __mtk_bf_shf(_mask)) & (_mask);	\
+ 	})
+ 
+ #define field_get(_mask, _reg)						\
+ 	({								\
+-		(typeof(_mask))(((_reg) & (_mask)) >> __bf_shf(_mask));	\
++		(typeof(_mask))(((_reg) & (_mask)) >> __mtk_bf_shf(_mask));	\
+ 	})
+ 
+ #define SET_FIELD(_field, _val)	\

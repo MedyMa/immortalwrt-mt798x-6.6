@@ -15,7 +15,7 @@ WiFi roams.
 
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -4243,6 +4243,11 @@ static int mtk_open(struct net_device *d
+@@ -4262,6 +4262,11 @@
  			mtk_ppe_start(eth->ppe[i]);
  #endif
  
@@ -27,18 +27,18 @@ WiFi roams.
  		for (i = 0; i < MTK_MAX_DEVS; i++) {
  			if (!eth->netdev[i])
  				continue;
-@@ -4404,6 +4409,8 @@ static int mtk_stop(struct net_device *d
+@@ -4426,6 +4431,8 @@
+ 	mtk_stop_dma(eth, eth->soc->reg_map->pdma.glo_cfg);
  
  	mtk_dma_free(eth);
- 
-+	// mtk_ppe_roaming_stop(eth);
 +
++	// mtk_ppe_roaming_stop(eth);
+ 
  #if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
  	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
- 		mtk_ppe_stop(eth->ppe[i]);
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
-@@ -1709,10 +1709,15 @@ struct mtk_eth {
+@@ -1709,9 +1709,14 @@
  
  	struct metadata_dst		*dsa_meta[MTK_MAX_DSA_PORTS];
  
@@ -46,14 +46,13 @@ WiFi roams.
  	u8				qos_toggle;
  	struct mtk_ppe			*ppe[3];
  	struct rhashtable		flow_table;
- 
++
 +	struct socket			*ppe_roam_sock;
 +	struct work_struct		ppe_roam_work;
 +	unsigned char			ppe_roam_buf[1024];
-+
+ 
  	struct bpf_prog			__rcu *prog;
  
- 	struct {
 --- a/drivers/net/ethernet/mediatek/mtk_ppe.c
 +++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
 @@ -10,6 +10,7 @@
@@ -64,7 +63,7 @@ WiFi roams.
  #include "mtk_eth_soc.h"
  #include "mtk_ppe.h"
  #include "mtk_ppe_regs.h"
-@@ -525,6 +526,28 @@ mtk_flow_entry_match(struct mtk_eth *eth
+@@ -525,6 +526,28 @@
  	return !memcmp(&entry->data.data, &data->data, len - 4);
  }
  
@@ -93,7 +92,7 @@ WiFi roams.
  static void
  __mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
  		      bool set_state)
-@@ -1132,3 +1155,191 @@ int mtk_ppe_stop(struct mtk_ppe *ppe)
+@@ -1162,3 +1185,191 @@
  
  	return 0;
  }
@@ -145,7 +144,7 @@ WiFi roams.
 +		if (type > MTK_PPE_PKT_TYPE_IPV4_DSLITE) {
 +			tuple.l3proto = NFPROTO_IPV6;
 +			tuple.src_port = htons(entry->ipv6.src_port);
-+			tuple.dst_port = htons(entry->ipv6.src_port);
++			tuple.dst_port = htons(entry->ipv6.dest_port);
 +			for (j = 0; j < 4; j ++) {
 +				tuple.src_v6.s6_addr32[j] = htonl(entry->ipv6.src_ip[j]);
 +				tuple.dst_v6.s6_addr32[j] = htonl(entry->ipv6.dest_ip[j]);
@@ -287,18 +286,18 @@ WiFi roams.
 +}
 --- a/drivers/net/ethernet/mediatek/mtk_ppe.h
 +++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
-@@ -349,6 +349,8 @@ struct mtk_ppe {
+@@ -349,6 +349,8 @@
  struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base, int index);
  
  void mtk_ppe_deinit(struct mtk_eth *eth);
 +int mtk_ppe_roaming_start(struct mtk_eth *eth);
 +int mtk_ppe_roaming_stop(struct mtk_eth *eth);
+ void mtk_ppe_update_mtu(struct mtk_ppe *ppe, int mtu);
  void mtk_ppe_start(struct mtk_ppe *ppe);
  int mtk_ppe_stop(struct mtk_ppe *ppe);
- int mtk_ppe_prepare_reset(struct mtk_ppe *ppe);
 --- a/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
 +++ b/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
-@@ -252,6 +252,60 @@ static const struct file_operations mtk_
+@@ -252,6 +252,60 @@
  };
  
  static int
@@ -359,7 +358,7 @@ WiFi roams.
  mtk_ppe_internal_debugfs_foe_all_show(struct seq_file *m, void *private)
  {
  	struct mtk_eth *eth = m->private;
-@@ -310,6 +364,8 @@ int mtk_ppe_internal_debugfs_init(struct
+@@ -310,6 +364,8 @@
  			    &mtk_ppe_internal_debugfs_foe_bind_fops);
  	debugfs_create_file("qos_toggle", S_IRUGO, root, eth,
  			    &mtk_ppe_internal_debugfs_qos_fops);

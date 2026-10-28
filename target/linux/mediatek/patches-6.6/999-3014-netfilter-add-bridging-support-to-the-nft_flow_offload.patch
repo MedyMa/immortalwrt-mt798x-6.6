@@ -21,7 +21,7 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  
  struct nft_flow_offload {
  	struct nft_flowtable	*flowtable;
-@@ -45,7 +46,47 @@ static bool nft_is_valid_ether_device(co
+@@ -45,7 +46,47 @@
  	return true;
  }
  
@@ -70,17 +70,17 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  				     const struct dst_entry *dst_cache,
  				     const struct nf_conn *ct,
  				     enum ip_conntrack_dir dir, u8 *ha,
-@@ -59,6 +100,9 @@ static int nft_dev_fill_forward_path(con
- 	if (!nft_is_valid_ether_device(dev))
- 		goto out;
+@@ -57,6 +98,9 @@
+ 	u8 nud_state;
  
-+	if (!is_zero_ether_addr(ha))
+ 	if (!nft_is_valid_ether_device(dev))
 +		goto out;
 +
++	if (!is_zero_ether_addr(ha))
+ 		goto out;
+ 
  	n = dst_neigh_lookup(dst_cache, daddr);
- 	if (!n)
- 		return -1;
-@@ -73,7 +117,26 @@ static int nft_dev_fill_forward_path(con
+@@ -73,7 +117,26 @@
  		return -1;
  
  out:
@@ -108,7 +108,7 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  }
  
  struct nft_forward_info {
-@@ -102,12 +165,12 @@ static void nft_dev_path_info(const stru
+@@ -102,12 +165,12 @@
  
  	for (i = 0; i < stack->num_paths; i++) {
  		path = &stack->path[i];
@@ -122,17 +122,30 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  			if (is_zero_ether_addr(info->h_source))
  				memcpy(info->h_source, path->dev->dev_addr, ETH_ALEN);
  
-@@ -145,7 +208,8 @@ static void nft_dev_path_info(const stru
+@@ -137,7 +200,8 @@
+ 
+ 			switch (path->bridge.vlan_mode) {
+ 			case DEV_PATH_BR_VLAN_UNTAG_HW:
+-				info->ingress_vlans |= BIT(info->num_encaps - 1);
++				if (info->num_encaps)
++					info->ingress_vlans |= BIT(info->num_encaps - 1);
+ 				break;
+ 			case DEV_PATH_BR_VLAN_TAG:
+ 				if (info->num_encaps >= NF_FLOW_TABLE_ENCAP_MAX) {
+@@ -149,10 +213,8 @@
  				info->num_encaps++;
  				break;
  			case DEV_PATH_BR_VLAN_UNTAG:
--				info->num_encaps--;
+-				if (WARN_ON_ONCE(info->num_encaps-- == 0)) {
+-					info->indev = NULL;
+-					break;
+-				}
 +				if (info->num_encaps > 0)
 +					info->num_encaps--;
  				break;
  			case DEV_PATH_BR_VLAN_KEEP:
  				break;
-@@ -153,7 +217,6 @@ static void nft_dev_path_info(const stru
+@@ -160,7 +222,6 @@
  			info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  			break;
  		default:
@@ -140,7 +153,7 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  			break;
  		}
  	}
-@@ -184,22 +247,44 @@ static bool nft_flowtable_find_dev(const
+@@ -191,22 +252,44 @@
  	return found;
  }
  
@@ -191,19 +204,21 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  
  	route->tuple[!dir].in.ifindex = info.indev->ifindex;
  	for (i = 0; i < info.num_encaps; i++) {
-@@ -216,13 +301,15 @@ static void nft_dev_forward_path(struct
+@@ -223,13 +306,15 @@
  		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
  		route->tuple[dir].xmit_type = info.xmit_type;
  	}
-+
-+	return 0;
- }
- 
+-}
+-
 -static int nft_flow_route(const struct nft_pktinfo *pkt,
 -			  const struct nf_conn *ct,
 -			  struct nf_flow_route *route,
 -			  enum ip_conntrack_dir dir,
 -			  struct nft_flowtable *ft)
++
++	return 0;
++}
++
 +static int nft_flow_route_routing(const struct nft_pktinfo *pkt,
 +				  const struct nf_conn *ct,
 +				  struct nf_flow_route *route,
@@ -212,7 +227,7 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  {
  	struct dst_entry *this_dst = skb_dst(pkt->skb);
  	struct dst_entry *other_dst = NULL;
-@@ -264,11 +351,87 @@ static int nft_flow_route(const struct n
+@@ -271,11 +356,87 @@
  
  	if (route->tuple[dir].xmit_type	== FLOW_OFFLOAD_XMIT_NEIGH &&
  	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
@@ -221,9 +236,9 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
 +		if (nft_dev_forward_path(pkt, route, ct, dir, ft) ||
 +		    nft_dev_forward_path(pkt, route, ct, !dir, ft))
 +		    return -ENOENT;
-+	}
-+
-+	return 0;
+ 	}
+ 
+ 	return 0;
 +}
 +
 +static int
@@ -290,9 +305,9 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
 +			ret = -ENOENT;
 +			goto err_route_dir2;
 +		}
- 	}
- 
- 	return 0;
++	}
++
++	return 0;
 +
 +err_route_dir2:
 +	dst_release(route->tuple[!dir].dst);
@@ -302,7 +317,7 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  }
  
  static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
-@@ -320,10 +483,12 @@ static void nft_flow_offload_eval(const
+@@ -327,10 +488,12 @@
  
  	switch (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum) {
  	case IPPROTO_TCP:
@@ -317,7 +332,7 @@ Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
  			goto out;
  		break;
  	case IPPROTO_UDP:
-@@ -356,8 +521,13 @@ static void nft_flow_offload_eval(const
+@@ -363,8 +526,13 @@
  		goto out;
  
  	dir = CTINFO2DIR(ctinfo);

@@ -24,28 +24,19 @@ Signed-off-by: Richard Weinberger <richard@nod.at>
  #include <linux/slab.h>
  #include <linux/major.h>
  #include "ubi.h"
-@@ -1214,43 +1215,43 @@ static struct mtd_info * __init open_mtd
+@@ -1219,43 +1220,43 @@
  	return mtd;
  }
  
 -static int __init ubi_init(void)
 +static void ubi_notify_add(struct mtd_info *mtd)
- {
--	int err, i, k;
++{
 +	struct device_node *np = mtd_get_of_node(mtd);
 +	int err;
- 
--	/* Ensure that EC and VID headers have correct size */
--	BUILD_BUG_ON(sizeof(struct ubi_ec_hdr) != 64);
--	BUILD_BUG_ON(sizeof(struct ubi_vid_hdr) != 64);
++
 +	if (!of_device_is_compatible(np, "linux,ubi"))
 +		return;
- 
--	if (mtd_devs > UBI_MAX_DEVICES) {
--		pr_err("UBI error: too many MTD devices, maximum is %d\n",
--		       UBI_MAX_DEVICES);
--		return -EINVAL;
--	}
++
 +	/*
 +	 * we are already holding &mtd_table_mutex, but still need
 +	 * to bump refcount
@@ -53,14 +44,42 @@ Signed-off-by: Richard Weinberger <richard@nod.at>
 +	err = __get_mtd_device(mtd);
 +	if (err)
 +		return;
- 
--	/* Create base sysfs directory and sysfs files */
--	err = class_register(&ubi_class);
++
 +	/* called while holding mtd_table_mutex */
 +	mutex_lock_nested(&ubi_devices_mutex, SINGLE_DEPTH_NESTING);
-+	err = ubi_attach_mtd_dev(mtd, UBI_DEV_NUM_AUTO, 0, 0, false);
++	err = ubi_attach_mtd_dev(mtd, UBI_DEV_NUM_AUTO, 0, 0, false, false);
 +	mutex_unlock(&ubi_devices_mutex);
- 	if (err < 0)
++	if (err < 0)
++		__put_mtd_device(mtd);
++}
++
++static void ubi_notify_remove(struct mtd_info *mtd)
++{
++	/* do nothing for now */
++}
++
++static struct mtd_notifier ubi_mtd_notifier = {
++	.add = ubi_notify_add,
++	.remove = ubi_notify_remove,
++};
++
++static int __init ubi_init_attach(void)
+ {
+ 	int err, i, k;
+-
+-	/* Ensure that EC and VID headers have correct size */
+-	BUILD_BUG_ON(sizeof(struct ubi_ec_hdr) != 64);
+-	BUILD_BUG_ON(sizeof(struct ubi_vid_hdr) != 64);
+-
+-	if (mtd_devs > UBI_MAX_DEVICES) {
+-		pr_err("UBI error: too many MTD devices, maximum is %d\n",
+-		       UBI_MAX_DEVICES);
+-		return -EINVAL;
+-	}
+-
+-	/* Create base sysfs directory and sysfs files */
+-	err = class_register(&ubi_class);
+-	if (err < 0)
 -		return err;
 -
 -	err = misc_register(&ubi_ctrl_cdev);
@@ -68,9 +87,7 @@ Signed-off-by: Richard Weinberger <richard@nod.at>
 -		pr_err("UBI error: cannot register device\n");
 -		goto out;
 -	}
-+		__put_mtd_device(mtd);
-+}
- 
+-
 -	ubi_wl_entry_slab = kmem_cache_create("ubi_wl_entry_slab",
 -					      sizeof(struct ubi_wl_entry),
 -					      0, 0, NULL);
@@ -78,38 +95,34 @@ Signed-off-by: Richard Weinberger <richard@nod.at>
 -		err = -ENOMEM;
 -		goto out_dev_unreg;
 -	}
-+static void ubi_notify_remove(struct mtd_info *mtd)
-+{
-+	/* do nothing for now */
-+}
- 
+-
 -	err = ubi_debugfs_init();
 -	if (err)
 -		goto out_slab;
-+static struct mtd_notifier ubi_mtd_notifier = {
-+	.add = ubi_notify_add,
-+	.remove = ubi_notify_remove,
-+};
- 
-+static int __init ubi_init_attach(void)
-+{
-+	int err, i, k;
+-
  
  	/* Attach MTD devices */
  	for (i = 0; i < mtd_devs; i++) {
-@@ -1298,25 +1299,79 @@ static int __init ubi_init(void)
+@@ -1304,15 +1305,6 @@
  		}
  	}
  
-+	return 0;
-+
-+out_detach:
-+	for (k = 0; k < i; k++)
-+		if (ubi_devices[k]) {
-+			mutex_lock(&ubi_devices_mutex);
-+			ubi_detach_mtd_dev(ubi_devices[k]->ubi_num, 1);
-+			mutex_unlock(&ubi_devices_mutex);
-+		}
+-	err = ubiblock_init();
+-	if (err) {
+-		pr_err("UBI error: block: cannot initialize, error %d\n", err);
+-
+-		/* See comment above re-ubi_is_module(). */
+-		if (ubi_is_module())
+-			goto out_detach;
+-	}
+-
+ 	return 0;
+ 
+ out_detach:
+@@ -1322,6 +1314,71 @@
+ 			ubi_detach_mtd_dev(k, 1);
+ 			mutex_unlock(&ubi_devices_mutex);
+ 		}
 +	return err;
 +}
 +#ifndef CONFIG_MTD_UBI_MODULE
@@ -153,14 +166,13 @@ Signed-off-by: Richard Weinberger <richard@nod.at>
 +	if (err)
 +		goto out_slab;
 +
- 	err = ubiblock_init();
- 	if (err) {
- 		pr_err("UBI error: block: cannot initialize, error %d\n", err);
- 
- 		/* See comment above re-ubi_is_module(). */
- 		if (ubi_is_module())
--			goto out_detach;
-+			goto out_slab;
++	err = ubiblock_init();
++	if (err) {
++		pr_err("UBI error: block: cannot initialize, error %d\n", err);
++
++		/* See comment above re-ubi_is_module(). */
++		if (ubi_is_module())
++			goto out_debugfs;
 +	}
 +
 +	register_mtd_user(&ubi_mtd_notifier);
@@ -169,24 +181,17 @@ Signed-off-by: Richard Weinberger <richard@nod.at>
 +		err = ubi_init_attach();
 +		if (err)
 +			goto out_mtd_notifier;
- 	}
- 
- 	return 0;
- 
--out_detach:
--	for (k = 0; k < i; k++)
--		if (ubi_devices[k]) {
--			mutex_lock(&ubi_devices_mutex);
--			ubi_detach_mtd_dev(ubi_devices[k]->ubi_num, 1);
--			mutex_unlock(&ubi_devices_mutex);
--		}
--	ubi_debugfs_exit();
++	}
++
++	return 0;
++
 +out_mtd_notifier:
 +	unregister_mtd_user(&ubi_mtd_notifier);
++out_debugfs:
+ 	ubi_debugfs_exit();
  out_slab:
  	kmem_cache_destroy(ubi_wl_entry_slab);
- out_dev_unreg:
-@@ -1326,13 +1381,15 @@ out:
+@@ -1332,13 +1389,15 @@
  	pr_err("UBI error: cannot initialize UBI, error %d\n", err);
  	return err;
  }

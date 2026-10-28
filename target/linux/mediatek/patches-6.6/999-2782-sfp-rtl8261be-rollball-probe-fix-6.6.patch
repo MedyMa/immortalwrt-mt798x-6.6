@@ -17,7 +17,7 @@ diff --git a/drivers/net/mdio/mdio-i2c.c b/drivers/net/mdio/mdio-i2c.c
 index da2001e..379d956 100644
 --- a/drivers/net/mdio/mdio-i2c.c
 +++ b/drivers/net/mdio/mdio-i2c.c
-@@ -352,6 +352,50 @@ static int i2c_mii_write_rollball(struct mii_bus *bus, int phy_id, int devad,
+@@ -352,6 +352,50 @@
  	return 0;
  }
  
@@ -68,10 +68,16 @@ index da2001e..379d956 100644
  static int i2c_mii_init_rollball(struct i2c_adapter *i2c)
  {
  	struct i2c_msg msg;
-@@ -372,10 +416,16 @@ static int i2c_mii_init_rollball(struct i2c_adapter *i2c)
+@@ -370,12 +414,18 @@
+ 	msg.buf = pw;
+ 
  	ret = i2c_transfer(i2c, &msg, 1);
 -	if (ret < 0)
 -		return ret;
+-	else if (ret != 1)
+-		return -EIO;
+-	else
+-		return 0;
 +	if (ret < 0) {
 +		/* A module without the RollBall bridge firmware answers
 +		 * the 0x51 command interface with NACK; treat it as a
@@ -84,14 +90,10 @@ index da2001e..379d956 100644
 +		return -ENODEV;
 +
 +	return i2c_mii_probe_rollball(i2c);
--	else if (ret != 1)
--		return -EIO;
--	else
--		return 0;
  }
  
  struct mii_bus *mdio_i2c_alloc(struct device *parent, struct i2c_adapter *i2c,
-@@ -399,9 +443,10 @@ struct mii_bus *mdio_i2c_alloc(struct device *parent, struct i2c_adapter *i2c,
+@@ -399,9 +449,10 @@
  	case MDIO_I2C_ROLLBALL:
  		ret = i2c_mii_init_rollball(i2c);
  		if (ret < 0) {
@@ -105,11 +107,9 @@ index da2001e..379d956 100644
  			mdiobus_free(mii);
  			return ERR_PTR(ret);
  		}
-diff --git a/drivers/net/phy/sfp.c b/drivers/net/phy/sfp.c
-index 1fdd4e1..63c4713 100644
 --- a/drivers/net/phy/sfp.c
 +++ b/drivers/net/phy/sfp.c
-@@ -232,6 +232,7 @@ struct sfp {
+@@ -232,6 +232,7 @@
  	struct mii_bus *i2c_mii;
  	struct sfp_bus *sfp_bus;
  	enum mdio_i2c_proto mdio_protocol;
@@ -117,7 +117,7 @@ index 1fdd4e1..63c4713 100644
  	struct phy_device *mod_phy;
  	const struct sff_data *type;
  	size_t i2c_block_size;
-@@ -539,6 +540,7 @@ static const struct sfp_quirk sfp_quirks[] = {
+@@ -584,6 +585,7 @@
  	// OEM SFP-GE-T is a 1000Base-T module with broken TX_FAULT indicator
  	SFP_QUIRK_F("OEM", "SFP-GE-T", sfp_fixup_ignore_tx_fault),
  
@@ -125,7 +125,7 @@ index 1fdd4e1..63c4713 100644
  	SFP_QUIRK_F("ETU", "ESP-T5-R", sfp_fixup_rollball_cc),
  	SFP_QUIRK_F("OEM", "SFP-10G-T", sfp_fixup_rollball_cc),
  	SFP_QUIRK_M("OEM", "SFP-2.5G-T", sfp_quirk_oem_2_5g),
-@@ -736,8 +738,18 @@ static int sfp_i2c_mdiobus_create(struct sfp *sfp)
+@@ -787,8 +789,18 @@
  	int ret;
  
  	i2c_mii = mdio_i2c_alloc(sfp->dev, sfp->i2c, sfp->mdio_protocol);
@@ -145,10 +145,10 @@ index 1fdd4e1..63c4713 100644
  
  	i2c_mii->name = "SFP I2C Bus";
  	i2c_mii->phy_mask = ~0;
-@@ -2419,6 +2431,7 @@ static int sfp_sm_mod_probe(struct sfp *sfp, bool report)
+@@ -2500,6 +2512,7 @@
  	sfp->phy_t_retry = T_PHY_RETRY;
  
- 	sfp->tx_fault_ignore = false;
+ 	sfp->state_ignore_mask = 0;
 +	sfp->no_rollball_bridge = false;
  
  	if (sfp->id.base.extended_cc == SFF8024_ECC_10GBASE_T_SFI ||

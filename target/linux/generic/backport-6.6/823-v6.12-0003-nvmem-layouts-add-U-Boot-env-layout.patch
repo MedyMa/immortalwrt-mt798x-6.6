@@ -41,7 +41,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
-@@ -21998,6 +21998,7 @@ U-BOOT ENVIRONMENT VARIABLES
+@@ -22001,6 +22001,7 @@
  M:	Rafał Miłecki <rafal@milecki.pl>
  S:	Maintained
  F:	Documentation/devicetree/bindings/nvmem/u-boot,env.yaml
@@ -51,7 +51,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  UACCE ACCELERATOR FRAMEWORK
 --- a/drivers/nvmem/Kconfig
 +++ b/drivers/nvmem/Kconfig
-@@ -363,8 +363,7 @@ config NVMEM_SUNXI_SID
+@@ -363,8 +363,7 @@
  config NVMEM_U_BOOT_ENV
  	tristate "U-Boot environment variables support"
  	depends on OF && MTD
@@ -63,7 +63,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  	  support for verifying & exporting such data. It also exposes variables
 --- a/drivers/nvmem/layouts/Kconfig
 +++ b/drivers/nvmem/layouts/Kconfig
-@@ -26,6 +26,17 @@ config NVMEM_LAYOUT_ONIE_TLV
+@@ -26,6 +26,17 @@
  
  	  If unsure, say N.
  
@@ -185,7 +185,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 +	size_t crc32_data_offset;
 +	size_t crc32_data_len;
 +	size_t crc32_offset;
-+	__le32 *crc32_addr;
++	uint32_t *crc32_addr;
 +	size_t data_offset;
 +	size_t data_len;
 +	size_t dev_size;
@@ -236,8 +236,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 +		goto err_kfree;
 +	}
 +
-+	crc32_addr = (__le32 *)(buf + crc32_offset);
-+	crc32 = le32_to_cpu(*crc32_addr);
++	crc32_addr = (uint32_t *)(buf + crc32_offset);
++	crc32 = *crc32_addr;
 +	crc32_data_len = dev_size - crc32_data_offset;
 +	data_len = dev_size - data_offset;
 +
@@ -347,10 +347,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  
  struct u_boot_env {
  	struct device *dev;
-@@ -29,24 +21,6 @@ struct u_boot_env {
+@@ -28,24 +20,6 @@
+ 
  	struct mtd_info *mtd;
  };
- 
+-
 -struct u_boot_env_image_single {
 -	__le32 crc32;
 -	uint8_t data[];
@@ -368,14 +369,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 -	__le32 crc32;
 -	DECLARE_FLEX_ARRAY(uint8_t, data);
 -} __packed;
--
+ 
  static int u_boot_env_read(void *context, unsigned int offset, void *val,
  			   size_t bytes)
- {
-@@ -69,141 +43,6 @@ static int u_boot_env_read(void *context
- 	return 0;
- }
+@@ -67,141 +41,6 @@
+ 	}
  
+ 	return 0;
+-}
+-
 -static int u_boot_env_read_post_process_ethaddr(void *context, const char *id, int index,
 -						unsigned int offset, void *buf, size_t bytes)
 -{
@@ -439,7 +441,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 -	size_t crc32_data_offset;
 -	size_t crc32_data_len;
 -	size_t crc32_offset;
--	__le32 *crc32_addr;
+-	uint32_t *crc32_addr;
 -	size_t data_offset;
 -	size_t data_len;
 -	size_t dev_size;
@@ -490,8 +492,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 -		goto err_kfree;
 -	}
 -
--	crc32_addr = (__le32 *)(buf + crc32_offset);
--	crc32 = le32_to_cpu(*crc32_addr);
+-	crc32_addr = (uint32_t *)(buf + crc32_offset);
+-	crc32 = *crc32_addr;
 -	crc32_data_len = dev_size - crc32_data_offset;
 -	data_len = dev_size - data_offset;
 -
@@ -509,12 +511,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 -	kfree(buf);
 -err_out:
 -	return err;
--}
--
+ }
+ 
  static int u_boot_env_probe(struct platform_device *pdev)
- {
- 	struct nvmem_config config = {
-@@ -235,7 +74,7 @@ static int u_boot_env_probe(struct platf
+@@ -235,7 +74,7 @@
  	if (IS_ERR(priv->nvmem))
  		return PTR_ERR(priv->nvmem);
  

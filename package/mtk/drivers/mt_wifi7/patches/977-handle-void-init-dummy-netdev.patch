@@ -1,0 +1,17 @@
+Subject: [PATCH] wifi: retain wrapper ABI after init_dummy_netdev became void
+
+The initializer cannot fail. Call it separately and return zero so the
+exported MTK wrapper keeps its existing int signature on both kernel APIs.
+
+--- a/mt_wifi/os/linux/mt_linux.c
++++ b/mt_wifi/os/linux/mt_linux.c
+@@ -198,7 +198,8 @@
+ 
+ int mt_init_dummy_netdev(struct net_device *dev)
+ {
+-	return init_dummy_netdev(dev);
++	init_dummy_netdev(dev);
++	return 0;
+ }
+ EXPORT_SYMBOL(mt_init_dummy_netdev);
+ 

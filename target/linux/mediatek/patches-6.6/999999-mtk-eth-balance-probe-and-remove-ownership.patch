@@ -1,0 +1,621 @@
+Subject: [PATCH] net: mediatek: balance MAC ownership and quiesce teardown
+
+Track successful notifier registration and release the default phylink
+separately from borrowed mux channels. Unwind partial PCS acquisition and
+MAC allocation once, and keep NAPI, clocks and PCS alive until netdevice
+unregistration closes every running port. Drain producers and diagnostics
+before removing their backing device. Propagate reset-notifier and mux
+setup errors and release their partial resources.
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_dbg.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_dbg.c
+@@ -874,6 +874,7 @@
+ void mtketh_debugfs_exit(struct mtk_eth *eth)
+ {
+ 	debugfs_remove_recursive(eth_debug.root);
++	eth_debug.root = NULL;
+ }
+ 
+ int mtketh_debugfs_init(struct mtk_eth *eth)
+@@ -882,9 +883,10 @@
+ 	int i, ret = 0;
+ 
+ 	eth_debug.root = debugfs_create_dir("mtketh", NULL);
+-	if (!eth_debug.root) {
+-		dev_notice(eth->dev, "%s:err at %d\n", __func__, __LINE__);
+-		ret = -ENOMEM;
++	if (IS_ERR_OR_NULL(eth_debug.root)) {
++		ret = eth_debug.root ? PTR_ERR(eth_debug.root) : -ENOMEM;
++		eth_debug.root = NULL;
++		return ret;
+ 	}
+ 
+ 	debugfs_create_file("phy_regs", 0444,
+@@ -931,7 +933,7 @@
+ 	return 0;
+ 
+ err:
+-	debugfs_remove_recursive(eth_debug.root);
++	mtketh_debugfs_exit(eth);
+ 	return ret;
+ }
+ 
+@@ -2420,6 +2422,8 @@
+ 
+ 	if (!proc_reg_dir)
+ 		proc_reg_dir = proc_mkdir(PROCREG_DIR, NULL);
++	if (!proc_reg_dir)
++		return -ENOMEM;
+ 
+ 	proc_tx_ring =
+ 	    proc_create(PROCREG_TXRING, 0, proc_reg_dir, &tx_ring_fops);
+@@ -2484,38 +2488,17 @@
+ 
+ void debug_proc_exit(void)
+ {
+-	if (proc_tx_ring)
+-		remove_proc_entry(PROCREG_TXRING, proc_reg_dir);
+-
+-	if (proc_hwtx_ring)
+-		remove_proc_entry(PROCREG_HWTXRING, proc_reg_dir);
+-
+-	if (proc_rx_ring)
+-		remove_proc_entry(PROCREG_RXRING, proc_reg_dir);
+-
+-	if (proc_esw_cnt)
+-		remove_proc_entry(PROCREG_ESW_CNT, proc_reg_dir);
+-
+-	if (proc_mac_cnt)
+-		remove_proc_entry(PROCREG_MAC_CNT, proc_reg_dir);
+-
+-	if (proc_xfi_cnt)
+-		remove_proc_entry(PROCREG_XFI_CNT, proc_reg_dir);
+-
+-	if (proc_reg_dir)
+-		remove_proc_entry(PROCREG_DIR, 0);
+-
+-	if (proc_dbg_regs)
+-		remove_proc_entry(PROCREG_DBG_REGS, proc_reg_dir);
+-
+-	if (g_eth->hwlro) {
+-		if (proc_hw_lro_stats)
+-			remove_proc_entry(PROCREG_HW_LRO_STATS, proc_reg_dir);
+-
+-		if (proc_hw_lro_auto_tlb)
+-			remove_proc_entry(PROCREG_HW_LRO_AUTO_TLB, proc_reg_dir);
+-	}
+-
+-	if (proc_reset_event)
+-		remove_proc_entry(PROCREG_RESET_EVENT, proc_reg_dir);
+-}
++	/* Remove children and drain their readers before releasing the parent. */
++	proc_remove(proc_reg_dir);
++	proc_reg_dir = NULL;
++	proc_tx_ring = NULL;
++	proc_hwtx_ring = NULL;
++	proc_rx_ring = NULL;
++	proc_esw_cnt = NULL;
++	proc_mac_cnt = NULL;
++	proc_xfi_cnt = NULL;
++	proc_dbg_regs = NULL;
++	proc_hw_lro_stats = NULL;
++	proc_hw_lro_auto_tlb = NULL;
++	proc_reset_event = NULL;
++}
+--- a/drivers/net/ethernet/mediatek/mtk_eth_reset.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_reset.c
+@@ -71,7 +71,8 @@
+ 		break;
+ 	case MTK_FE_START_RESET_INIT:
+ 		pr_info("%s rcv fe start reset init event:%lx\n", __func__, event);
+-		if (!test_bit(MTK_RESETTING, &eth->state)) {
++		if (!test_bit(MTK_RESETTING, &eth->state) &&
++		    !test_bit(MTK_STOPPING, &eth->state)) {
+ 			mtk_reset_flag = MTK_FE_START_RESET;
+ 			schedule_work(&eth->pending_work);
+ 		}
+@@ -89,10 +90,23 @@
+ 
+ int mtk_eth_netdevice_event_init(struct mtk_eth *eth)
+ {
+-	g_eth = eth;
++	int ret;
+ 
+ 	eth->reset.netdevice_notifier.notifier_call = mtk_eth_netdevice_event;
+-	register_netdevice_notifier(&eth->reset.netdevice_notifier);
++	ret = register_netdevice_notifier(&eth->reset.netdevice_notifier);
++	if (ret)
++		return ret;
+ 
++	eth->reset.notifier_registered = true;
+ 	return 0;
+ }
++
++void mtk_eth_netdevice_event_deinit(struct mtk_eth *eth)
++{
++	if (eth->reset.notifier_registered) {
++		unregister_netdevice_notifier(&eth->reset.netdevice_notifier);
++		eth->reset.notifier_registered = false;
++	}
++	if (READ_ONCE(g_eth) == eth)
++		WRITE_ONCE(g_eth, NULL);
++}
+--- a/drivers/net/ethernet/mediatek/mtk_eth_reset.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_reset.h
+@@ -31,4 +31,5 @@
+ 
+ void mtk_set_pse_drop(u32 config);
+ int mtk_eth_netdevice_event_init(struct mtk_eth *eth);
++void mtk_eth_netdevice_event_deinit(struct mtk_eth *eth);
+ #endif		/* MTK_ETH_RESET_H */
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5137,6 +5137,9 @@
+ 	struct mtk_eth *eth = container_of(del_work, struct mtk_eth,
+ 					   reset.monitor_work);
+ 
++	if (test_bit(MTK_STOPPING, &eth->state))
++		return;
++
+ 	if (test_bit(MTK_RESETTING, &eth->state))
+ 		goto out;
+ 
+@@ -5145,8 +5148,9 @@
+ 		schedule_work(&eth->pending_work);
+ 
+ out:
+-	schedule_delayed_work(&eth->reset.monitor_work,
+-			      MTK_DMA_MONITOR_TIMEOUT);
++	if (!test_bit(MTK_STOPPING, &eth->state))
++		schedule_delayed_work(&eth->reset.monitor_work,
++				      MTK_DMA_MONITOR_TIMEOUT);
+ }
+ 
+ static int mtk_napi_init(struct mtk_eth *eth)
+@@ -5595,6 +5599,10 @@
+ 	int i;
+ 
+ 	rtnl_lock();
++	if (test_bit(MTK_STOPPING, &eth->state)) {
++		rtnl_unlock();
++		return;
++	}
+ 	set_bit(MTK_RESETTING, &eth->state);
+ 
+ 	mtk_hw_dump_all(eth);
+@@ -5721,15 +5729,43 @@
+ 	}
+ }
+ 
++static void mtk_unregister_mac_notifier(struct mtk_mac *mac)
++{
++	if (!mac->notifier_registered)
++		return;
++
++	unregister_netdevice_notifier(&mac->device_notifier);
++	mac->notifier_registered = false;
++}
++
++static void mtk_free_mac(struct mtk_eth *eth, int id)
++{
++	struct net_device *dev = eth->netdev[id];
++	struct mtk_mac *mac;
++
++	if (!dev)
++		return;
++
++	mac = netdev_priv(dev);
++	mtk_unregister_mac_notifier(mac);
++	if (mac->phylink_default)
++		phylink_destroy(mac->phylink_default);
++	if (!IS_ERR_OR_NULL(mac->sgmii_pcs))
++		mtk_pcs_lynxi_put(mac->sgmii_pcs);
++	if (!IS_ERR_OR_NULL(mac->usxgmii_pcs))
++		mtk_usxgmii_pcs_put(mac->usxgmii_pcs);
++
++	eth->netdev[id] = NULL;
++	eth->mac[id] = NULL;
++	free_netdev(dev);
++}
++
+ static int mtk_free_dev(struct mtk_eth *eth)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < MTK_MAX_DEVS; i++) {
+-		if (!eth->netdev[i])
+-			continue;
+-		free_netdev(eth->netdev[i]);
+-	}
++	for (i = 0; i < MTK_MAX_DEVS; i++)
++		mtk_free_mac(eth, i);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->dsa_meta); i++) {
+ 		if (!eth->dsa_meta[i])
+@@ -5749,8 +5785,7 @@
+ 		if (!eth->netdev[i])
+ 			continue;
+ 		mac = netdev_priv(eth->netdev[i]);
+-		if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA))
+-			unregister_netdevice_notifier(&mac->device_notifier);
++		mtk_unregister_mac_notifier(mac);
+ 
+ 		if (eth->netdev[i]->reg_state != NETREG_REGISTERED)
+ 			continue;
+@@ -5771,9 +5806,9 @@
+ 
+ static int mtk_cleanup(struct mtk_eth *eth)
+ {
+-	mtk_sgmii_destroy(eth);
+ 	mtk_unreg_dev(eth);
+ 	mtk_free_dev(eth);
++	mtk_sgmii_destroy(eth);
+ 	cancel_work_sync(&eth->pending_work);
+ 	cancel_delayed_work_sync(&eth->reset.monitor_work);
+ 
+@@ -6181,16 +6216,25 @@
+ 	unsigned int new_channel;
+ 	int sfp_present;
+ 
++	if (test_bit(MTK_STOPPING, &eth->state))
++		return;
++
+ 	if (IS_ERR(mux->mod_def0_gpio) || IS_ERR(mux->chan_sel_gpio))
+ 		goto reschedule;
+ 
+ 	sfp_present = gpiod_get_value_cansleep(mux->mod_def0_gpio);
++	if (sfp_present < 0)
++		goto reschedule;
+ 	new_channel = sfp_present ? mux->sfp_present_channel : !mux->sfp_present_channel;
+ 
+ 	if (mux->channel == new_channel || !netif_running(dev))
+ 		goto reschedule;
+ 
+ 	rtnl_lock();
++	if (test_bit(MTK_STOPPING, &eth->state) || !netif_running(dev)) {
++		rtnl_unlock();
++		goto reschedule;
++	}
+ 
+ 	mtk_stop(dev);
+ 
+@@ -6208,7 +6252,8 @@
+ 	mux->channel = new_channel;
+ 
+ reschedule:
+-	mod_delayed_work(system_wq, &mux->poll, msecs_to_jiffies(100));
++	if (!test_bit(MTK_STOPPING, &eth->state))
++		mod_delayed_work(system_wq, &mux->poll, msecs_to_jiffies(100));
+ }
+ 
+ static int mtk_add_mux_channel(struct mtk_mux *mux, struct device_node *np)
+@@ -6232,6 +6277,9 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (mux->data[id])
++		return -EEXIST;
++
+ 	data = kmalloc(sizeof(*data), GFP_KERNEL);
+ 	if (unlikely(!data)) {
+ 		dev_err(eth->dev, "failed to create mux data structure\n");
+@@ -6317,12 +6365,18 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	mux = kmalloc(sizeof(struct mtk_mux), GFP_KERNEL);
++	if (!eth->mac[id])
++		return -EINVAL;
++	if (eth->mux[id])
++		return -EEXIST;
++
++	mux = kzalloc(sizeof(*mux), GFP_KERNEL);
+ 	if (unlikely(!mux)) {
+ 		dev_err(eth->dev, "failed to create mux structure\n");
+ 		return -ENOMEM;
+ 	}
+ 
++	INIT_DELAYED_WORK(&mux->poll, mux_poll);
+ 	eth->mux[id] = mux;
+ 	mux->mac = eth->mac[id];
+ 	mux->channel = 0;
+@@ -6343,33 +6397,36 @@
+ 	if (IS_ERR(mux->chan_sel_gpio)) {
+ 		dev_err(eth->dev, "failed to requset gpio for chan-sel\n");
+ 		err = PTR_ERR(mux->chan_sel_gpio);
+-		goto err_put_mod_def0;
++		goto err_free_mux;
+ 	}
+ 
+ 	of_property_read_u32(np, "sfp-present-channel",
+ 		&mux->sfp_present_channel);
++	if (mux->sfp_present_channel > 1) {
++		err = -EINVAL;
++		goto err_free_mux;
++	}
+ 
+ 	for_each_child_of_node(np, child) {
+ 		err = mtk_add_mux_channel(mux, child);
+ 		if (err) {
+ 			dev_err(eth->dev, "failed to add mtk_mux\n");
+ 			of_node_put(child);
+-			goto err_put_chan_sel;
+-		}
+-	}
+-
+-	INIT_DELAYED_WORK(&mux->poll, mux_poll);
++			goto err_free_mux;
++		}
++	}
++
++	if (!mux->data[0] || !mux->data[1]) {
++		err = -EINVAL;
++		goto err_free_mux;
++	}
++
+ 	mod_delayed_work(system_wq, &mux->poll, msecs_to_jiffies(3000));
+ 
+ 	return 0;
+ 
+-err_put_chan_sel:
+-	gpiod_put(mux->chan_sel_gpio);
+-err_put_mod_def0:
+-	gpiod_put(mux->mod_def0_gpio);
+ err_free_mux:
+-	kfree(mux);
+-	eth->mux[id] = NULL;
++	mtk_release_mux(eth, id);
+ 	return err;
+ }
+ 
+@@ -6416,26 +6473,26 @@
+ 	pcs_np = of_parse_phandle(mac->of_node, "pcs-handle", 0);
+ 	if (pcs_np) {
+ 		mac->sgmii_pcs = mtk_pcs_lynxi_get(eth->dev, pcs_np);
++		of_node_put(pcs_np);
+ 		if (IS_ERR(mac->sgmii_pcs)) {
+-			if (PTR_ERR(mac->sgmii_pcs) == -EPROBE_DEFER)
+-				return -EPROBE_DEFER;
+-
+-			dev_err(eth->dev, "cannot select SGMII PCS, error %ld\n",
+-				PTR_ERR(mac->sgmii_pcs));
+-			return PTR_ERR(mac->sgmii_pcs);
++			err = PTR_ERR(mac->sgmii_pcs);
++			if (err != -EPROBE_DEFER)
++				dev_err(eth->dev, "cannot select SGMII PCS, error %d\n",
++					err);
++			goto free_netdev;
+ 		}
+ 	}
+ 
+ 	pcs_np = of_parse_phandle(mac->of_node, "pcs-handle", 1);
+ 	if (pcs_np) {
+ 		mac->usxgmii_pcs = mtk_usxgmii_pcs_get(eth->dev, pcs_np);
++		of_node_put(pcs_np);
+ 		if (IS_ERR(mac->usxgmii_pcs)) {
+-			if (PTR_ERR(mac->usxgmii_pcs) == -EPROBE_DEFER)
+-				return -EPROBE_DEFER;
+-
+-			dev_err(eth->dev, "cannot select USXGMII PCS, error %ld\n",
+-				PTR_ERR(mac->usxgmii_pcs));
+-			return PTR_ERR(mac->usxgmii_pcs);
++			err = PTR_ERR(mac->usxgmii_pcs);
++			if (err != -EPROBE_DEFER)
++				dev_err(eth->dev, "cannot select USXGMII PCS, error %d\n",
++					err);
++			goto free_netdev;
+ 		}
+ 	}
+ 
+@@ -6550,6 +6607,7 @@
+ 	}
+ 
+ 	mac->phylink = phylink;
++	mac->phylink_default = phylink;
+ 
+ 	SET_NETDEV_DEV(eth->netdev[id], eth->dev);
+ 	eth->netdev[id]->watchdog_timeo = 5 * HZ;
+@@ -6570,7 +6628,10 @@
+ 
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA)) {
+ 		mac->device_notifier.notifier_call = mtk_device_event;
+-		register_netdevice_notifier(&mac->device_notifier);
++		err = register_netdevice_notifier(&mac->device_notifier);
++		if (err)
++			goto free_netdev;
++		mac->notifier_registered = true;
+ 	}
+ 
+ 	if (mtk_page_pool_enabled(eth))
+@@ -6582,7 +6643,7 @@
+ 	return 0;
+ 
+ free_netdev:
+-	free_netdev(eth->netdev[id]);
++	mtk_free_mac(eth, id);
+ 	return err;
+ }
+ 
+@@ -6681,8 +6742,7 @@
+ 		if (!eth->netdev[i])
+ 			continue;
+ 		mac = netdev_priv(eth->netdev[i]);
+-		if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA))
+-			unregister_netdevice_notifier(&mac->device_notifier);
++		mtk_unregister_mac_notifier(mac);
+ 	}
+ }
+ 
+@@ -6898,7 +6958,7 @@
+ 		err = mtk_add_mac(eth, mac_np);
+ 		if (err) {
+ 			of_node_put(mac_np);
+-			goto err_deinit_hw;
++			goto err_free_dev;
+ 		}
+ 	}
+ 
+@@ -6908,7 +6968,7 @@
+ 
+ 		err = mtk_mac_assign_address(eth, i, true);
+ 		if (err)
+-			goto err_deinit_hw;
++			goto err_free_dev;
+ 	}
+ 
+ 	for (i = 0; i < MTK_MAX_DEVS; i++) {
+@@ -6917,7 +6977,7 @@
+ 
+ 		err = mtk_mac_assign_address(eth, i, false);
+ 		if (err)
+-			goto err_deinit_hw;
++			goto err_free_dev;
+ 	}
+ 
+ 	err = mtk_napi_init(eth);
+@@ -6994,11 +7054,13 @@
+ 				continue;
+ 
+ 			err = mtk_add_mux(eth, child);
+-			if (err)
+-				dev_err(&pdev->dev, "failed to add mux\n");
+-
+-			of_node_put(mux_np);
+-		};
++			if (err) {
++				of_node_put(child);
++				of_node_put(mux_np);
++				goto err_deinit_ppe;
++			}
++		}
++		of_node_put(mux_np);
+ 	}
+ 
+ #if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
+@@ -7076,10 +7138,16 @@
+ 	mtketh_debugfs_init(eth);
+ 	debug_proc_init(eth);
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_HNAT)
++	err = mtk_eth_netdevice_event_init(eth);
++	if (err) {
++		debug_proc_exit();
++		mtketh_debugfs_exit(eth);
++		mtk_eth_netdevice_event_deinit(eth);
++		goto err_unreg_netdev;
++	}
++#endif
+ 	platform_set_drvdata(pdev, eth);
+-#if defined(CONFIG_NET_MEDIATEK_HNAT) || defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
+-	mtk_eth_netdevice_event_init(eth);
+-#endif
+ 	schedule_delayed_work(&eth->reset.monitor_work,
+ 			      MTK_DMA_MONITOR_TIMEOUT);
+ 
+@@ -7096,7 +7164,8 @@
+ err_free_dev:
+ 	mtk_unregister_notifier(eth);
+ 	mtk_free_dev(eth);
+-err_deinit_hw:
++	if (eth->esw_base)
++		iounmap(eth->esw_base);
+ 	mtk_hw_deinit(eth);
+ err_wed_exit:
+ 	mtk_wed_exit();
+@@ -7109,34 +7178,36 @@
+ static int mtk_remove(struct platform_device *pdev)
+ {
+ 	struct mtk_eth *eth = platform_get_drvdata(pdev);
+-	struct mtk_mac *mac;
+ 	int i;
++
++	/* Drain producers before unregistering ports or releasing PCS objects. */
++	set_bit(MTK_STOPPING, &eth->state);
++	debug_proc_exit();
++	mtketh_debugfs_exit(eth);
++	mtk_unregister_notifier(eth);
++	for (i = 0; i < MTK_MAX_DEVS; i++) {
++		if (eth->mux[i])
++			cancel_delayed_work_sync(&eth->mux[i]->poll);
++	}
++	cancel_delayed_work_sync(&eth->reset.monitor_work);
++	cancel_work_sync(&eth->pending_work);
++	mtk_eth_netdevice_event_deinit(eth);
++
++	/* unregister_netdev() closes each running port under RTNL, while its
++	 * NAPI, phylink and PCS dependencies are still alive.
++	 */
++	mtk_unreg_dev(eth);
++	mtk_release_all_muxes(eth);
++	mtk_napi_del(eth);
++	mtk_wed_exit();
++	mtk_cleanup(eth);
++	free_netdev(eth->dummy_dev);
++	mtk_ppe_deinit(eth);
++	mtk_mdio_cleanup(eth);
++	mtk_hw_deinit(eth);
+ 
+ 	if (eth->esw_base)
+ 		iounmap(eth->esw_base);
+-
+-	/* stop all devices to make sure that dma is properly shut down */
+-	for (i = 0; i < MTK_MAX_DEVS; i++) {
+-		if (!eth->netdev[i])
+-			continue;
+-		mtk_stop(eth->netdev[i]);
+-		mac = netdev_priv(eth->netdev[i]);
+-		phylink_disconnect_phy(mac->phylink);
+-		if (mac->sgmii_pcs)
+-			mtk_pcs_lynxi_put(mac->sgmii_pcs);
+-
+-		if (mac->usxgmii_pcs)
+-			mtk_usxgmii_pcs_put(mac->usxgmii_pcs);
+-	}
+-
+-	mtk_wed_exit();
+-	mtk_hw_deinit(eth);
+-
+-	mtk_napi_del(eth);
+-	mtk_cleanup(eth);
+-	free_netdev(eth->dummy_dev);
+-	mtk_mdio_cleanup(eth);
+-	mtk_release_all_muxes(eth);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1040,7 +1040,8 @@
+ 
+ enum mtk_dev_state {
+ 	MTK_HW_INIT,
+-	MTK_RESETTING
++	MTK_RESETTING,
++	MTK_STOPPING
+ };
+ 
+ /* PSE Port Definition */
+@@ -1687,6 +1688,7 @@
+ 	struct {
+ 		struct delayed_work monitor_work;
+ 		struct notifier_block netdevice_notifier;
++		bool notifier_registered;
+ 		atomic_t force;
+ 		u32 event;
+ 		u32 wdidx[3];
+@@ -1722,6 +1724,7 @@
+ 	int				speed;
+ 	struct device_node		*of_node;
+ 	struct phylink			*phylink;
++	struct phylink			*phylink_default;
+ 	struct phylink_config		phylink_config;
+ 	struct phylink_pcs		*sgmii_pcs;
+ 	struct phylink_pcs		*usxgmii_pcs;
+@@ -1733,6 +1736,7 @@
+ 	bool				tx_lpi_enabled;
+ 	u32				tx_lpi_timer;
+ 	struct notifier_block		device_notifier;
++	bool				notifier_registered;
+ };
+ 
+ /* struct mtk_mux_data -	the structure that holds the private data about the

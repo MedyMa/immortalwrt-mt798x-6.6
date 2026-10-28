@@ -17,7 +17,7 @@ diff --git a/drivers/net/phy/sfp.c b/drivers/net/phy/sfp.c
 index 63c4713..a9138d2 100644
 --- a/drivers/net/phy/sfp.c
 +++ b/drivers/net/phy/sfp.c
-@@ -207,6 +207,19 @@ static const enum gpiod_flags gpio_flags[] = {
+@@ -207,6 +207,19 @@
  #define T_PROBE_RETRY_SLOW	msecs_to_jiffies(5000)
  #define R_PROBE_RETRY_SLOW	12
  
@@ -37,7 +37,7 @@ index 63c4713..a9138d2 100644
  /* SFP modules appear to always have their PHY configured for bus address
   * 0x56 (which with mdio-i2c, translates to a PHY address of 22).
   * RollBall SFPs access phy via SFP Enhanced Digital Diagnostic Interface
-@@ -262,6 +275,7 @@ struct sfp {
+@@ -263,6 +276,7 @@
  
  	struct delayed_work poll;
  	struct delayed_work timeout;
@@ -45,7 +45,7 @@ index 63c4713..a9138d2 100644
  	struct mutex sm_mutex;			/* Protects state machine */
  	unsigned char sm_mod_state;
  	unsigned char sm_mod_tries_init;
-@@ -270,6 +284,9 @@ struct sfp {
+@@ -271,6 +285,9 @@
  	unsigned short sm_state;
  	unsigned char sm_fault_retries;
  	unsigned char sm_phy_retries;
@@ -55,7 +55,7 @@ index 63c4713..a9138d2 100644
  
  	struct sfp_eeprom_id id;
  	unsigned int module_power_mW;
-@@ -1872,7 +1889,8 @@ static int sfp_sm_probe_phy(struct sfp *sfp, int addr, bool is_c45)
+@@ -1950,7 +1967,8 @@
  static void sfp_sm_link_up(struct sfp *sfp)
  {
  	sfp_link_up(sfp->sfp_bus);
@@ -65,23 +65,15 @@ index 63c4713..a9138d2 100644
  }
  
  static void sfp_sm_link_down(struct sfp *sfp)
-@@ -2432,6 +2450,7 @@ static int sfp_sm_mod_probe(struct sfp *sfp, bool report)
+@@ -2513,6 +2531,7 @@
  
- 	sfp->tx_fault_ignore = false;
+ 	sfp->state_ignore_mask = 0;
  	sfp->no_rollball_bridge = false;
 +	sfp->sm_reprobe_enabled = false;
  
  	if (sfp->id.base.extended_cc == SFF8024_ECC_10GBASE_T_SFI ||
  	    sfp->id.base.extended_cc == SFF8024_ECC_10GBASE_T_SR ||
-@@ -2454,6 +2473,7 @@ static int sfp_sm_mod_probe(struct sfp *sfp, bool report)
- 
- 	if (sfp->quirk && sfp->quirk->fixup)
- 		sfp->quirk->fixup(sfp);
-+
- 	mutex_unlock(&sfp->st_mutex);
- 
- 	return 0;
-@@ -2508,6 +2528,10 @@ static void sfp_sm_module(struct sfp *sfp, unsigned int event)
+@@ -2591,6 +2610,10 @@
  
  	/* Handle remove event globally, it resets this state machine */
  	if (event == SFP_E_REMOVE) {
@@ -92,7 +84,7 @@ index 63c4713..a9138d2 100644
  		sfp_sm_mod_remove(sfp);
  		sfp_sm_mod_next(sfp, SFP_MOD_EMPTY, 0);
  		return;
-@@ -2529,6 +2553,9 @@ static void sfp_sm_module(struct sfp *sfp, unsigned int event)
+@@ -2612,6 +2635,9 @@
  			sfp_sm_mod_next(sfp, SFP_MOD_PROBE, T_SERIAL);
  			sfp->sm_mod_tries_init = R_PROBE_RETRY_INIT;
  			sfp->sm_mod_tries = R_PROBE_RETRY_SLOW;
@@ -102,7 +94,7 @@ index 63c4713..a9138d2 100644
  		}
  		break;
  
-@@ -2710,6 +2737,7 @@ static void sfp_sm_main(struct sfp *sfp, unsigned int event)
+@@ -2792,6 +2818,7 @@
  				sfp_sm_next(sfp, SFP_S_FAIL, 0);
  				break;
  			}
@@ -110,7 +102,7 @@ index 63c4713..a9138d2 100644
  			sfp->sm_phy_retries = R_PHY_RETRY;
  			goto phy_probe;
  		}
-@@ -2742,6 +2770,14 @@ static void sfp_sm_main(struct sfp *sfp, unsigned int event)
+@@ -2824,6 +2851,14 @@
  			sfp_sm_next(sfp, SFP_S_FAIL, 0);
  			break;
  		}
@@ -125,7 +117,7 @@ index 63c4713..a9138d2 100644
  		sfp_sm_link_check_los(sfp);
  
  		/* Reset the fault retry count */
-@@ -2763,7 +2799,12 @@ static void sfp_sm_main(struct sfp *sfp, unsigned int event)
+@@ -2845,7 +2880,12 @@
  		break;
  
  	case SFP_S_LINK_UP:
@@ -139,7 +131,7 @@ index 63c4713..a9138d2 100644
  			sfp_sm_link_down(sfp);
  			sfp_sm_fault(sfp, SFP_S_TX_FAULT, true);
  		} else if (sfp_los_event_active(sfp, event)) {
-@@ -3013,6 +3054,36 @@ static void sfp_poll(struct work_struct *work)
+@@ -3090,6 +3130,36 @@
  		mod_delayed_work(system_wq, &sfp->poll, poll_jiffies);
  }
  
@@ -176,7 +168,7 @@ index 63c4713..a9138d2 100644
  static struct sfp *sfp_alloc(struct device *dev)
  {
  	struct sfp *sfp;
-@@ -3028,6 +3099,7 @@ static struct sfp *sfp_alloc(struct device *dev)
+@@ -3105,6 +3175,7 @@
  	mutex_init(&sfp->st_mutex);
  	INIT_DELAYED_WORK(&sfp->poll, sfp_poll);
  	INIT_DELAYED_WORK(&sfp->timeout, sfp_timeout);
@@ -184,19 +176,19 @@ index 63c4713..a9138d2 100644
  
  	sfp_hwmon_init(sfp);
  
-@@ -3042,6 +3114,7 @@ static void sfp_cleanup(void *data)
+@@ -3118,6 +3189,7 @@
+ 	sfp_hwmon_exit(sfp);
  
  	cancel_delayed_work_sync(&sfp->poll);
 +	cancel_delayed_work_sync(&sfp->reprobe);
  	cancel_delayed_work_sync(&sfp->timeout);
  	if (sfp->i2c_mii) {
  		mdiobus_unregister(sfp->i2c_mii);
- 		mdiobus_free(sfp->i2c_mii);
-@@ -3229,6 +3302,7 @@ static void sfp_shutdown(struct platform_device *pdev)
+@@ -3305,6 +3377,7 @@
+ 	}
  
  	cancel_delayed_work_sync(&sfp->poll);
 +	cancel_delayed_work_sync(&sfp->reprobe);
  	cancel_delayed_work_sync(&sfp->timeout);
  }
  
- static struct platform_driver sfp_driver = {

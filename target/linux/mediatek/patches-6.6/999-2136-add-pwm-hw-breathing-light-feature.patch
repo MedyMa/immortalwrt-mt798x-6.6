@@ -21,7 +21,7 @@ Subject: [PATCH] add pwm hw breathing light support for mt7987
  #define PWM_CLK_DIV_MAX		7
  
  struct pwm_mediatek_of_data {
-@@ -38,6 +43,8 @@ struct pwm_mediatek_of_data {
+@@ -38,6 +43,8 @@
  	bool pwm45_fixup;
  	bool has_ck_26m_sel;
  	const unsigned int *reg_offset;
@@ -30,7 +30,7 @@ Subject: [PATCH] add pwm hw breathing light support for mt7987
  };
  
  /**
-@@ -57,6 +64,7 @@ struct pwm_mediatek_chip {
+@@ -57,6 +64,7 @@
  	struct clk *clk_main;
  	struct clk **clk_pwms;
  	const struct pwm_mediatek_of_data *soc;
@@ -38,10 +38,12 @@ Subject: [PATCH] add pwm hw breathing light support for mt7987
  };
  
  static const unsigned int mtk_pwm_reg_offset_v1[] = {
-@@ -122,6 +130,85 @@ static inline void pwm_mediatek_writel(s
+@@ -120,6 +128,85 @@
+ 				       u32 value)
+ {
  	writel(value, chip->regs + chip->soc->reg_offset[num] + offset);
- }
- 
++}
++
 +static inline int pwm_bl_set_thres(struct pwm_mediatek_chip *chip, int pwm,
 +				    int idx, int value, int scale)
 +{
@@ -119,21 +121,19 @@ Subject: [PATCH] add pwm hw breathing light support for mt7987
 +	       chip->regs + mtk_pwm_reg_offset_v3[pwm] + PWM_BREATHING_CON);
 +
 +	return 0;
-+}
-+
- static int pwm_mediatek_config(struct pwm_chip *chip, struct pwm_device *pwm,
- 			       int duty_ns, int period_ns)
- {
-@@ -133,6 +220,8 @@ static int pwm_mediatek_config(struct pw
+ }
+ 
+ static void pwm_mediatek_enable(struct pwm_chip *chip, struct pwm_device *pwm)
+@@ -153,6 +240,8 @@
  	    reg_width = PWMDWIDTH, reg_thres = PWMTHRES;
  	unsigned long clk_rate;
  	u64 resolution;
-+	u32 max_cnt_period = 8191;
++	u32 max_cnt_period = 8192;
 +	int thres_num;
  	int ret;
  
  	ret = pwm_mediatek_clk_enable(chip, pwm);
-@@ -147,15 +236,24 @@ static int pwm_mediatek_config(struct pw
+@@ -169,10 +258,18 @@
  	if (pc->soc->has_ck_26m_sel)
  		writel(0, pc->regs + PWM_CK_26M_SEL);
  
@@ -152,30 +152,30 @@ Subject: [PATCH] add pwm hw breathing light support for mt7987
  	/* Using resolution to calculate cnt_period which represents
  	 * the effective range of the PWM period counter
  	 */
- 	cnt_period = DIV_ROUND_CLOSEST_ULL((u64)period_ns * 1000, resolution);
--	while (cnt_period > 8191) {
-+
+@@ -182,7 +279,7 @@
+ 		goto out;
+ 	}
+ 
+-	while (cnt_period > 8192) {
 +	while (cnt_period > max_cnt_period) {
- 		/* Using clkdiv to reduce clock frequency and calculate
- 		 * new resolution based on new clock speed
- 		 */
-@@ -199,8 +297,14 @@ static int pwm_mediatek_config(struct pw
- 				    clkdiv);
- 	else
- 		pwm_mediatek_writel(pc, pwm->hwpwm, PWMCON, BIT(15) | clkdiv);
-+
- 	pwm_mediatek_writel(pc, pwm->hwpwm, reg_width, cnt_period);
--	pwm_mediatek_writel(pc, pwm->hwpwm, reg_thres, cnt_duty);
-+
-+	/* use array of bw_thres instead of normal thres in bw_mode */
-+	if (pc->bw_mode[pwm->hwpwm])
-+		pwm_config_bl_thres(pc, pwm->hwpwm, cnt_period, thres_num);
-+	else
-+		pwm_mediatek_writel(pc, pwm->hwpwm, reg_thres, cnt_duty);
+ 		resolution *= 2;
+ 		clkdiv++;
+ 		if (clkdiv > PWM_CLK_DIV_MAX && !clksel) {
+@@ -222,7 +319,12 @@
+ 			    BIT(15) | (clksel ? BIT(3) : 0) | clkdiv);
+ 	pwm_mediatek_writel(pc, pwm->hwpwm, reg_width, cnt_period - 1);
  
- 	pwm_mediatek_clk_disable(chip, pwm);
- 
-@@ -268,6 +372,7 @@ static const struct pwm_ops pwm_mediatek
+-	if (cnt_duty) {
++	if (pc->bw_mode[pwm->hwpwm]) {
++		ret = pwm_config_bl_thres(pc, pwm->hwpwm, cnt_period, thres_num);
++		if (ret)
++			goto out;
++		pwm_mediatek_enable(chip, pwm);
++	} else if (cnt_duty) {
+ 		pwm_mediatek_writel(pc, pwm->hwpwm, reg_thres, cnt_duty - 1);
+ 		pwm_mediatek_enable(chip, pwm);
+ 	} else {
+@@ -269,6 +371,7 @@
  
  static int pwm_mediatek_probe(struct platform_device *pdev)
  {
@@ -183,7 +183,7 @@ Subject: [PATCH] add pwm hw breathing light support for mt7987
  	struct pwm_mediatek_chip *pc;
  	unsigned int i;
  	int ret;
-@@ -299,6 +404,7 @@ static int pwm_mediatek_probe(struct pla
+@@ -300,6 +403,7 @@
  
  	for (i = 0; i < pc->soc->num_pwms; i++) {
  		char name[8];
@@ -191,7 +191,7 @@ Subject: [PATCH] add pwm hw breathing light support for mt7987
  
  		snprintf(name, sizeof(name), "pwm%d", i + 1);
  
-@@ -306,6 +412,12 @@ static int pwm_mediatek_probe(struct pla
+@@ -307,6 +411,12 @@
  		if (IS_ERR(pc->clk_pwms[i]))
  			return dev_err_probe(&pdev->dev, PTR_ERR(pc->clk_pwms[i]),
  					     "Failed to get %s clock\n", name);
@@ -204,7 +204,7 @@ Subject: [PATCH] add pwm hw breathing light support for mt7987
  	}
  
  	pc->chip.dev = &pdev->dev;
-@@ -380,6 +492,8 @@ static const struct pwm_mediatek_of_data
+@@ -381,6 +491,8 @@
  	.pwm45_fixup = false,
  	.has_ck_26m_sel = false,
  	.reg_offset = mtk_pwm_reg_offset_v3,
