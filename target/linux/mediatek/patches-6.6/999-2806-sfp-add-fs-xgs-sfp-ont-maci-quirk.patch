@@ -1,0 +1,32 @@
+From 03fa69146f2fe18742c0e12cfbf1d10c23d5b567 Mon Sep 17 00:00:00 2001
+From: Martino Dell'Ambrogio <tillo@tillo.ch>
+Date: Wed, 12 Aug 2026 17:47:08 +0200
+Subject: [PATCH] net: sfp: add the FS XGS-SFP-ONT-MACI quirk
+
+Backport the remaining Fiberstore entry from upstream commit
+03fa69146f2fe18742c0e12cfbf1d10c23d5b567. The OEM XGSPONST2001 entry
+and prefix matching are already present in this tree.
+
+This MAC-mode ONT uses TX_FAULT and LOS for serial passthrough and
+needs the extended startup delay supplied by sfp_fixup_potron(). Keep
+the vendor and complete part-number match exact so other FS modules
+retain their existing signal handling.
+
+Signed-off-by: Martino Dell'Ambrogio <tillo@tillo.ch>
+Link: https://patch.msgid.link/20260812154708.2201266-3-tillo@tillo.ch
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+---
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -571,6 +571,11 @@
+ 	SFP_QUIRK("FS", "GPON-ONU-34-20BI", sfp_quirk_2500basex,
+ 		  sfp_fixup_ignore_tx_fault),
+ 
++	// The MAC-mode ONT uses TX_FAULT/LOS for serial passthrough and
++	// needs extra startup time. The 16-byte PN field is fully occupied
++	// by the truncated product name, so match the complete field.
++	SFP_QUIRK_F("FS", "XGS-SFP-ONT-MACI", sfp_fixup_potron),
++
+ 	/* Zaram ZXOS11NPI XGS-PON module (SFP+) */
+ 	SFP_QUIRK_F("Zaram", "ZXOS11NPI", sfp_fixup_ignore_tx_fault),
+ 	/* HSGQ NU-STICK1.0 XGS-PON module (SFP+) */
