@@ -22,6 +22,7 @@ define KernelPackage/npu-nf_hnat
 	@MTK_NPU_24_10_TUNNEL_BACKEND \
 	kmod-npu \
 	kmod-mediatek_hnat \
+	+MTK_NPU_24_10_MCAST_BACKEND:kmod-npu-mcast \
 	+@MTK_NPU_HNAT
 endef
 

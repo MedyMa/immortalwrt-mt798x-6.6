@@ -5,8 +5,13 @@
 # Author: Ren-Ting Wang <ren-ting.wang@mediatek.com>
 #
 
-obj-$(CONFIG_MTK_NPU_DPDK) += npu-dpdk/
-obj-$(CONFIG_MTK_NPU_FLOW) += npu-flow/
+# The adapter borrows the core mapping and follows the same platform lifetime.
+npu-$(CONFIG_MTK_NPU_DPDK) += npu-dpdk/init.o npu-dpdk/cdev.o npu-dpdk/mac-filter.o
+ifneq ($(filter y m,$(CONFIG_MTK_NPU_DPDK)),)
+npu-$(CONFIG_PROC_FS) += npu-dpdk/procfs.o
+npu-$(CONFIG_SYSFS) += npu-dpdk/sysfs.o
+endif
+npu-$(CONFIG_MTK_NPU_FLOW) += npu-flow/init.o npu-flow/net-event.o npu-flow/tnl-offload.o
 # The 24.10 HNAT adapter shares the core's platform/worker lifetime.
 npu-$(CONFIG_MTK_NPU_HNAT) += npu-nf_hnat/init.o
 npu-$(CONFIG_MTK_NPU_HNAT) += npu-nf_hnat/tnl-offload.o
@@ -14,13 +19,20 @@ npu-$(CONFIG_MTK_NPU_HNAT) += npu-nf_hnat/net-event.o
 ifneq ($(filter y m,$(CONFIG_MTK_NPU_HNAT)),)
 npu-$(CONFIG_MTK_NPU_STATISTIC) += npu-nf_hnat/statistic.o
 endif
-obj-$(CONFIG_MTK_NPU_MCAST) += npu-mcast/
+npu-$(CONFIG_MTK_NPU_MCAST) += npu-mcast/init.o npu-mcast/mcast.o
+ifneq ($(filter y m,$(CONFIG_MTK_NPU_MCAST)),)
+npu-$(CONFIG_PROC_FS) += npu-mcast/procfs.o
+npu-$(CONFIG_SYSFS) += npu-mcast/sysfs.o
+endif
 
 obj-m += npu.o
 
 ccflags-y += -I$(src)/inc
 ccflags-y += -I$(src)/protocol/inc
 ccflags-y += -I$(src)/npu-nf_hnat/inc
+ccflags-y += -I$(src)/npu-flow/inc
+ccflags-y += -I$(src)/npu-dpdk/inc
+ccflags-y += -I$(src)/npu-mcast/inc
 
 npu-y += firmware.o
 npu-y += hwspinlock.o

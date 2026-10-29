@@ -1,0 +1,1344 @@
+From: MedyMa <MedyMa@users.noreply.github.com>
+Subject: [PATCH] net: mediatek: add exclusive native TOPS flowtable provider
+
+Add typed, RCU protected leases for the optional NETSYSv3 native PPE
+backend. Only supported plain IPv4 PPTP/L2TP paths enter this backend;
+unsupported encapsulation remains on the software path. Keep inner
+software packets away from direct physical transmit, retain tunnel owner
+identity in both directions, and drain packet accounting on retirement.
+Quiesce PPP channel close and peer driven L2TP framing changes before
+reusing hardware state. Vendor HNAT remains a separate exclusive mode.
+
+diff --git a/drivers/net/ethernet/mediatek/Kconfig b/drivers/net/ethernet/mediatek/Kconfig
+--- a/drivers/net/ethernet/mediatek/Kconfig
++++ b/drivers/net/ethernet/mediatek/Kconfig
+@@ -56,4 +56,14 @@
+ 	  in the MediaTek MT7988/MT7986/MT2701/MT7622/MT7629/MT7621 chipset
+ 	  family.
+ 
++config NET_MEDIATEK_NPU_FLOW
++	bool "MediaTek NPU support for native Linux flowtables"
++	depends on NET_MEDIATEK_SOC && NF_FLOW_TABLE && INET && PPP
++	select MTK_PPP_TUNNEL_INFO
++	depends on MEDIATEK_NETSYS_V3 && NET_MEDIATEK_HNAT=n
++	default n
++	help
++	  Use the native PPE flowtable driver as the owner of NPU tunnel actions.
++	  Vendor HNAT uses the same PPE tables and cannot be enabled together.
++
+ endif #NET_VENDOR_MEDIATEK
+diff --git a/drivers/net/ethernet/mediatek/mtk_ppe.c b/drivers/net/ethernet/mediatek/mtk_ppe.c
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -2,6 +2,7 @@
+ /* Copyright (C) 2020 Felix Fietkau <nbd@nbd.name> */
+ 
+ #include <linux/kernel.h>
++#include <linux/module.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/etherdevice.h>
+@@ -740,6 +741,19 @@
+ 		return;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	if (entry->npu.entry) {
++		entry->npu_retired = true;
++		hlist_del_init(&entry->list);
++		if (entry->hash != 0xffff &&
++		    (!ppe->npu_owner || ppe->npu_owner[entry->hash] != entry)) {
++			/* A stale software record cannot clear/count a replacement. */
++			entry->hash = 0xffff;
++			return;
++		}
++		set_state = true;
++	}
++#endif
+ 	if (entry->hash != 0xffff && set_state) {
+ 		struct mtk_foe_entry *hwe = mtk_foe_get_entry(ppe, entry->hash);
+ 		int queue;
+@@ -763,6 +777,18 @@
+ 		if (state == MTK_FOE_STATE_BIND)
+ 			mtk_ppe_cache_clear(ppe);
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++		if (entry->npu.entry) {
++			struct mtk_foe_accounting *acct;
++
++			acct = mtk_ppe_mib_entry_read(ppe, entry->hash);
++			if (acct) {
++				entry->prev_packets += acct->packets;
++				entry->prev_bytes += acct->bytes;
++			}
++			ppe->npu_owner[entry->hash] = NULL;
++		}
++#endif
+ 		entry->hash = 0xffff;
+ 	}
+ 
+@@ -799,13 +825,28 @@
+ 
+ 	if (hash == 0xffff)
+ 		return false;
+-
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	if (entry->npu.entry &&
++	    (!ppe->npu_owner || ppe->npu_owner[hash] != entry)) {
++		entry->hash = 0xffff;
++		entry->npu_retired = true;
++		return false;
++	}
++#endif
+ 	hwe = mtk_foe_get_entry(ppe, hash);
+ 	len = mtk_flow_entry_match_len(ppe->eth, &entry->data);
+ 	memcpy(&foe, hwe, len);
+ 
+ 	if (!mtk_flow_entry_match(ppe->eth, entry, &foe, len) ||
+ 	    FIELD_GET(MTK_FOE_IB1_STATE, foe.ib1) != MTK_FOE_STATE_BIND) {
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++		if (entry->npu.entry) {
++			__mtk_foe_entry_clear(ppe, entry, true);
++			*packets = entry->prev_packets;
++			*bytes = entry->prev_bytes;
++			return false;
++		}
++#endif
+ 		acct = mtk_ppe_acct_data(ppe, hash);
+ 		if (acct) {
+ 			entry->prev_packets += acct->packets;
+@@ -862,10 +903,9 @@
+ void mtk_foe_entry_get_stats(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ 			     int *idle)
+ {
++	spin_lock_bh(&ppe_lock);
+ 	entry->packets = entry->prev_packets;
+ 	entry->bytes = entry->prev_bytes;
+-
+-	spin_lock_bh(&ppe_lock);
+ 
+ 	if (entry->type == MTK_FLOW_TYPE_L2)
+ 		mtk_flow_entry_update_l2(ppe, entry);
+@@ -877,9 +917,32 @@
+ 	spin_unlock_bh(&ppe_lock);
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++static void __mtk_npu_flow_claim(struct mtk_ppe *ppe,
++				 struct mtk_flow_entry *owner, u16 hash)
++{
++	struct mtk_flow_entry *previous;
++
++	if (!ppe->npu_owner)
++		return;
++	previous = ppe->npu_owner[hash];
++	if (previous) {
++		__mtk_foe_entry_clear(ppe, previous, true);
++		if (previous == owner) {
++			/* Aged hardware may learn the same still-live flow again. */
++			owner->npu_retired = false;
++			hlist_add_head(&owner->list,
++				       &ppe->foe_flow[hash / ppe->eth->soc->hash_offset]);
++		}
++	}
++	owner->hash = hash;
++	ppe->npu_owner[hash] = owner->npu.entry ? owner : NULL;
++}
++#endif
++
+ static void
+ __mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_foe_entry *entry,
+-		       u16 hash)
++		       u16 hash, struct mtk_flow_entry *owner)
+ {
+ 	struct mtk_foe_accounting *acct;
+ 	struct mtk_eth *eth = ppe->eth;
+@@ -888,6 +951,9 @@
+ 	u32 val, *ib2;
+ 	int queue;
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	__mtk_npu_flow_claim(ppe, owner, hash);
++#endif
+ 	hwe = mtk_foe_get_entry(ppe, hash);
+ 
+ 	if (mtk_is_netsys_v2_or_greater(eth)) {
+@@ -1022,7 +1088,7 @@
+ 
+ 	*mtk_foe_entry_ib2(ppe->eth, &flow_info->data) = entry->data.bridge.ib2;
+ 
+-	__mtk_foe_entry_commit(ppe, &flow_info->data, hash);
++	__mtk_foe_entry_commit(ppe, &flow_info->data, hash, flow_info);
+ }
+ 
+ void __mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
+@@ -1055,8 +1121,21 @@
+ 			continue;
+ 		}
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++		if (entry->npu.entry) {
++			struct mtk_npu_flow_guard guard;
++
++			if (entry->npu_retired || !mtk_npu_flow_lock(&entry->npu, &guard))
++				goto out;
++			entry->hash = hash;
++			__mtk_foe_entry_commit(ppe, &entry->data, hash, entry);
++			mtk_npu_flow_unlock(&guard);
++			found = true;
++			continue;
++		}
++#endif
+ 		entry->hash = hash;
+-		__mtk_foe_entry_commit(ppe, &entry->data, hash);
++		__mtk_foe_entry_commit(ppe, &entry->data, hash, entry);
+ 		found = true;
+ 	}
+ 
+@@ -1164,6 +1243,12 @@
+ 
+ 	foe_flow_size = (MTK_PPE_ENTRIES / soc->hash_offset) *
+ 			sizeof(*ppe->foe_flow);
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	ppe->npu_owner = devm_kcalloc(dev, MTK_PPE_ENTRIES,
++				    sizeof(*ppe->npu_owner), GFP_KERNEL);
++	if (!ppe->npu_owner)
++		goto err_free_l2_flows;
++#endif
+ 	ppe->foe_flow = devm_kzalloc(dev, foe_flow_size, GFP_KERNEL);
+ 	if (!ppe->foe_flow)
+ 		goto err_free_l2_flows;
+@@ -1588,3 +1673,54 @@
+ 
+ 	return 0;
+ }
++
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++/* Keep retired software records for the normal flowtable stats/destroy cycle.
++ * No table mutex is taken: this also serves protocol changes in softirq.
++ */
++void mtk_npu_flow_flush_ppe(struct mtk_eth *eth, u32 tunnel_entry)
++{
++	struct mtk_flow_entry *entry;
++	struct hlist_node *next;
++	unsigned int p, first, bucket, end;
++
++	if (!eth || !mtk_is_netsys_v3_or_greater(eth))
++		return;
++	for (p = 0; p < ARRAY_SIZE(eth->ppe); p++) {
++		struct mtk_ppe *ppe = eth->ppe[p];
++		unsigned int buckets;
++
++		if (!ppe || !ppe->foe_table || !ppe->foe_flow)
++			continue;
++		buckets = MTK_PPE_ENTRIES / eth->soc->hash_offset;
++		for (first = 0; first < buckets; first += 64) {
++			end = min(first + 64, buckets);
++			spin_lock_bh(&ppe_lock);
++			for (bucket = first; bucket < end; bucket++) {
++				hlist_for_each_entry_safe(entry, next, &ppe->foe_flow[bucket], list) {
++					if (!entry->npu.entry || entry->npu_retired ||
++					    (tunnel_entry && entry->npu.entry != tunnel_entry))
++						continue;
++					__mtk_foe_entry_clear(ppe, entry, true);
++					hlist_del_init(&entry->list);
++				}
++			}
++			spin_unlock_bh(&ppe_lock);
++		}
++	}
++}
++EXPORT_SYMBOL_GPL(mtk_npu_flow_flush_ppe);
++
++void mtk_npu_flow_retire_entry(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
++			       u64 *packets, u64 *bytes)
++{
++	spin_lock_bh(&ppe_lock);
++	__mtk_foe_entry_clear(ppe, entry, true);
++	hlist_del_init(&entry->list);
++	*packets = entry->prev_packets - entry->packets;
++	*bytes = entry->prev_bytes - entry->bytes;
++	entry->packets = entry->prev_packets;
++	entry->bytes = entry->prev_bytes;
++	spin_unlock_bh(&ppe_lock);
++}
++#endif
+diff --git a/drivers/net/ethernet/mediatek/mtk_ppe.h b/drivers/net/ethernet/mediatek/mtk_ppe.h
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -3,6 +3,8 @@
+ 
+ #ifndef __MTK_PPE_H
+ #define __MTK_PPE_H
++
++#include <net/mtk_npu_flow.h>
+ 
+ #include <linux/kernel.h>
+ #include <linux/bitfield.h>
+@@ -100,6 +102,7 @@
+ #define MTK_FOE_UDF_KEEP_ECN		BIT(9)
+ #define MTK_FOE_UDF_KEEP_DSCP		BIT(10)
+ 
++#define MTK_FOE_TOPS_ENTRY		GENMASK(13, 8)
+ #define MTK_FOE_TPORT_IDX		GENMASK(3, 0)
+ 
+ enum {
+@@ -314,6 +317,10 @@
+ 	unsigned long cookie;
+ 	u64 prev_packets, prev_bytes;
+ 	u64 packets, bytes;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	struct mtk_npu_flow_token npu;
++	bool npu_retired;
++#endif
+ };
+ 
+ struct mtk_mib_entry {
+@@ -347,6 +354,9 @@
+ 
+ 	u16 foe_check_time[MTK_PPE_ENTRIES];
+ 	struct hlist_head *foe_flow;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	struct mtk_flow_entry **npu_owner;
++#endif
+ 
+ 	struct rhashtable l2_flows;
+ 
+@@ -424,4 +434,10 @@
+ bool mtk_flow_entry_match(struct mtk_eth *eth, struct mtk_flow_entry *entry,
+ 			  struct mtk_foe_entry *data, int len);
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++void mtk_npu_flow_flush_ppe(struct mtk_eth *eth, u32 tunnel_entry);
++void mtk_npu_flow_retire_entry(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
++			       u64 *packets, u64 *bytes);
+ #endif
++
++#endif
+diff --git a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+@@ -46,6 +46,9 @@
+ 		u16 sid;
+ 		u8 num;
+ 	} pppoe;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	struct mtk_npu_flow_token npu;
++#endif
+ };
+ 
+ static const struct rhashtable_params mtk_flow_ht_params = {
+@@ -483,6 +486,14 @@
+ 		case FLOW_ACTION_REDIRECT:
+ 			odev = act->dev;
+ 			break;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++		case FLOW_ACTION_NPU_ENCAP:
++			if (data.npu.entry || act->npu.entry < MTK_NPU_FLOW_FIRST ||
++			    act->npu.entry > MTK_NPU_FLOW_LAST)
++				return -EINVAL;
++			data.npu = act->npu;
++			break;
++#endif
+ 		case FLOW_ACTION_CSUM:
+ 			break;
+ 		case FLOW_ACTION_VLAN_PUSH:
+@@ -509,6 +520,15 @@
+ 		}
+ 	}
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	if (data.npu.entry &&
++	    (!mtk_is_netsys_v3_or_greater(eth) ||
++	     offload_type != MTK_PPE_PKT_TYPE_IPV4_HNAPT ||
++	     ((data.npu.flags & MTK_NPU_FLOW_F_ENCAP) &&
++	      (data.vlan.num || data.pppoe.num || !odev ||
++	       odev->ifindex != data.npu.egress_ifindex))))
++		return -EOPNOTSUPP;
++#endif
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+ 	    !is_valid_ether_addr(data.eth.h_dest))
+ 		return -EINVAL;
+@@ -606,6 +626,18 @@
+ 	if (!entry)
+ 		return -ENOMEM;
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	if (data.npu.entry && (data.npu.flags & MTK_NPU_FLOW_F_ENCAP)) {
++		struct mtk_foe_mac_info *l2 = &foe.ipv4.l2;
++
++		l2->tinfo &= ~MTK_FOE_TOPS_ENTRY;
++		l2->tinfo |= FIELD_PREP(MTK_FOE_TOPS_ENTRY, data.npu.entry);
++		l2->tport &= ~MTK_FOE_TPORT_IDX;
++		/* Official NETSYSv3 NPU -> QDMA path (TPORT_NPU_QDMA). */
++		l2->tport |= FIELD_PREP(MTK_FOE_TPORT_IDX, 5);
++	}
++	entry->npu = data.npu;
++#endif
+ 	entry->cookie = f->cookie;
+ 	memcpy(&entry->data, &foe, sizeof(entry->data));
+ 	entry->wed_index = wed_index;
+@@ -641,7 +673,17 @@
+ 	if (!entry)
+ 		return -ENOENT;
+ 
+-	mtk_foe_entry_clear(eth->ppe[entry->ppe_index], entry);
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	if (entry->npu.entry) {
++		u64 packets, bytes;
++
++		mtk_npu_flow_retire_entry(eth->ppe[entry->ppe_index], entry,
++					  &packets, &bytes);
++		f->stats.pkts += packets;
++		f->stats.bytes += bytes;
++	} else
++#endif
++		mtk_foe_entry_clear(eth->ppe[entry->ppe_index], entry);
+ 	rhashtable_remove_fast(&eth->flow_table, &entry->node,
+ 			       mtk_flow_ht_params);
+ 	if (entry->wed_index >= 0)
+diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -179,7 +179,7 @@
+ {
+ 	int ret = 0;
+ 
+-	if (!ops || !ops->quiesce)
++	if (!ops || !ops->quiesce || !ops->invalidate)
+ 		return -EINVAL;
+ 	mutex_lock(&ppp_tunnel_admin);
+ 	if (rcu_access_pointer(ppp_tunnel_ops))
+@@ -1742,6 +1742,33 @@
+ }
+ EXPORT_SYMBOL_GPL(ppp_channel_tunnel_quiesce);
+ 
++void ppp_channel_tunnel_invalidate(struct ppp_channel *chan)
++{
++	struct channel *pch = chan ? chan->ppp : NULL;
++	const struct ppp_tunnel_offload_ops *ops;
++	struct net_device *dev = NULL;
++	int idx;
++
++	if (!pch)
++		return;
++	read_lock_bh(&pch->upl);
++	if (pch->ppp) {
++		WRITE_ONCE(pch->ppp->tunnel_offload_blocked, true);
++		dev = pch->ppp->dev;
++		dev_hold(dev);
++	}
++	read_unlock_bh(&pch->upl);
++	if (!dev)
++		return;
++	idx = srcu_read_lock(&ppp_tunnel_srcu);
++	ops = srcu_dereference(ppp_tunnel_ops, &ppp_tunnel_srcu);
++	if (ops)
++		ops->invalidate(dev);
++	srcu_read_unlock(&ppp_tunnel_srcu, idx);
++	dev_put(dev);
++}
++EXPORT_SYMBOL_GPL(ppp_channel_tunnel_invalidate);
++
+ int ppp_netdev_get_tunnel_info(struct net_device *dev, struct ppp_tunnel_info *info)
+ {
+ 	struct ppp *ppp;
+@@ -1812,27 +1839,35 @@
+ #endif /* CONFIG_NF_FLOW_TABLE */
+ 
+ static int ppp_fill_forward_path(struct net_device_path_ctx *ctx,
+-				 struct net_device_path *path)
++                                 struct net_device_path *path)
+ {
+ 	struct ppp *ppp = netdev_priv(ctx->dev);
++
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	const struct net_device *dev = ctx->dev;
++#endif
+ 	struct ppp_channel *chan;
+ 	struct channel *pch;
+-
+-	if (ppp->flags & SC_MULTILINK)
+-		return -EOPNOTSUPP;
+-
+-	pch = list_first_or_null_rcu(&ppp->channels, struct channel, clist);
+-	if (!pch)
+-		return -ENODEV;
+-
+-	chan = READ_ONCE(pch->chan);
+-	if (!chan)
+-		return -ENODEV;
+-
+-	if (!chan->ops->fill_forward_path)
+-		return -EOPNOTSUPP;
+-
+-	return chan->ops->fill_forward_path(ctx, path, chan);
++	int ret = -EOPNOTSUPP;
++
++	ppp_xmit_lock(ppp);
++	if ((ppp->flags & SC_MULTILINK) || ppp->n_channels != 1 ||
++	    list_empty(&ppp->channels))
++		goto unlock;
++	pch = list_first_entry(&ppp->channels, struct channel, clist);
++	spin_lock(&pch->downl);
++	chan = pch->chan;
++	if (chan && chan->ops->fill_forward_path)
++		ret = chan->ops->fill_forward_path(ctx, path, chan);
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	if (!ret && (path->type == DEV_PATH_L2TP || path->type == DEV_PATH_PPTP) &&
++	    !ppp_netdev_tunnel_offload_allowed(dev))
++		ret = -EOPNOTSUPP;
++#endif
++	spin_unlock(&pch->downl);
++unlock:
++	ppp_xmit_unlock(ppp);
++	return ret;
+ }
+ 
+ static const struct net_device_ops ppp_netdev_ops = {
+@@ -3226,6 +3261,11 @@
+ 	if (!pch)
+ 		return;		/* should never happen */
+ 
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	if (ppp_channel_tunnel_quiesce(chan))
++		pr_warn_ratelimited("PPP: tunnel hardware teardown pending during channel unregister\n");
++#endif
++
+ 	chan->ppp = NULL;
+ 
+ 	/*
+@@ -3761,6 +3801,8 @@
+ 	if (hdrlen > ppp->dev->hard_header_len)
+ 		ppp->dev->hard_header_len = hdrlen;
+ 	list_add_tail_rcu(&pch->clist, &ppp->channels);
++	if (!ppp->n_channels)
++		WRITE_ONCE(ppp->tunnel_offload_blocked, false);
+ 	++ppp->n_channels;
+ 	pch->ppp = ppp;
+ 	refcount_inc(&ppp->file.refcnt);
+diff --git a/drivers/net/ppp/pptp.c b/drivers/net/ppp/pptp.c
+--- a/drivers/net/ppp/pptp.c
++++ b/drivers/net/ppp/pptp.c
+@@ -36,6 +36,7 @@
+ #include <net/route.h>
+ #include <net/gre.h>
+ #include <net/pptp.h>
++#include <net/mtk_npu_flow.h>
+ #include <net/netfilter/nf_flow_table.h>
+ 
+ #include <linux/uaccess.h>
+@@ -890,7 +891,49 @@
+ 	return err;
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++static int pptp_fill_forward_path(struct net_device_path_ctx *ctx,
++				  struct net_device_path *path,
++				  const struct ppp_channel *chan)
++{
++	struct sock *sk = chan->private;
++	struct pppox_sock *po = pppox_sk(sk);
++	struct ppp_tunnel_info info;
++	struct flowi4 fl4;
++	struct rtable *rt;
++	int ret;
++
++	if (!mtk_npu_flow_supported(DEV_PATH_PPTP))
++		return -EOPNOTSUPP;
++	ret = pptp_get_tunnel_info((struct ppp_channel *)chan, &info);
++	if (ret)
++		return ret;
++	rt = pptp_route_output(po, &fl4);
++	if (IS_ERR(rt))
++		return PTR_ERR(rt);
++	ret = mtk_npu_flow_neigh(&rt->dst, info.peer_addr, path);
++	if (!ret) {
++		path->type = DEV_PATH_PPTP;
++		path->dev = ctx->dev;
++		path->tunnel.sip.ip = info.local_addr;
++		path->tunnel.dip.ip = info.peer_addr;
++		path->tunnel.ttl = ip4_dst_hoplimit(&rt->dst);
++		path->tunnel.tos = 0;
++		path->tunnel.pptp.call_id = info.tunnel_id;
++		path->tunnel.pptp.peer_call_id = info.peer_tunnel_id;
++		path->tunnel.pptp.seq_sent = info.sequence;
++		path->tunnel.pptp.cookie = info.cookie;
++		ctx->dev = rt->dst.dev;
++	}
++	ip_rt_put(rt);
++	return ret;
++}
++#endif
++
+ static const struct ppp_channel_ops pptp_chan_ops = {
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	.fill_forward_path = pptp_fill_forward_path,
++#endif
+ #if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
+ 	.get_tunnel_info = pptp_get_tunnel_info,
+ #endif
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -918,6 +918,8 @@
+ 	DEV_PATH_DSLITE,
+ 	DEV_PATH_6RD,
+ 	DEV_PATH_TNL,
++	DEV_PATH_L2TP,
++	DEV_PATH_PPTP,
+ };
+ 
+ struct net_device_path {
+@@ -951,6 +953,28 @@
+ 			u8 amsdu;
+ 			u8 tid;
+ 		} mtk_wdma;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++		/* Native NPU flowtable path: supported outer headers are IPv4.
++		 * Socket/session pointers and borrowed routes never escape here.
++		 */
++		struct {
++			u8 h_source[ETH_ALEN], h_dest[ETH_ALEN];
++			struct { __be32 ip; } sip, dip;
++			__be16 sport, dport;
++			u8 ttl, tos;
++			u32 underlay_ifindex;
++			union {
++				struct {
++					__be16 ul_tid, dl_tid, ul_sid, dl_sid;
++				} l2tp;
++				struct {
++					u16 call_id, peer_call_id;
++					u32 seq_sent;
++					u64 cookie;
++				} pptp;
++			};
++		} tunnel;
++#endif
+ 	};
+ };
+ 
+diff --git a/include/linux/ppp_channel.h b/include/linux/ppp_channel.h
+--- a/include/linux/ppp_channel.h
++++ b/include/linux/ppp_channel.h
+@@ -47,11 +47,14 @@
+ 	 * compression/encryption or another software-only packet policy.
+ 	 */
+ 	int (*quiesce)(struct net_device *dev);
++	/* Atomic: block new binds and retire PPE before a peer changes framing. */
++	void (*invalidate)(struct net_device *dev);
+ };
+ int ppp_tunnel_offload_register(const struct ppp_tunnel_offload_ops *ops);
+ int ppp_tunnel_offload_unregister(const struct ppp_tunnel_offload_ops *ops);
+ bool ppp_netdev_tunnel_offload_allowed(const struct net_device *dev);
+ int ppp_channel_tunnel_quiesce(struct ppp_channel *chan);
++void ppp_channel_tunnel_invalidate(struct ppp_channel *chan);
+ 
+ struct ppp_channel_ops {
+ 	/* Send a packet (or multilink fragment) on this channel.
+diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -1,5 +1,7 @@
+ #ifndef _NET_FLOW_OFFLOAD_H
+ #define _NET_FLOW_OFFLOAD_H
++
++#include <net/mtk_npu_flow.h>
+ 
+ #include <linux/kernel.h>
+ #include <linux/list.h>
+@@ -184,6 +186,7 @@
+ 	FLOW_ACTION_VLAN_PUSH_ETH,
+ 	FLOW_ACTION_VLAN_POP_ETH,
+ 	FLOW_ACTION_CONTINUE,
++	FLOW_ACTION_NPU_ENCAP,
+ 	NUM_FLOW_ACTIONS,
+ };
+ 
+@@ -327,6 +330,9 @@
+ 		struct {				/* FLOW_ACTION_PPPOE_PUSH */
+ 			u16		sid;
+ 		} pppoe;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++		struct mtk_npu_flow_token npu;
++#endif
+ 	};
+ 	struct flow_action_cookie *user_cookie; /* user defined action cookie */
+ };
+diff --git a/include/net/mtk_npu_flow.h b/include/net/mtk_npu_flow.h
+--- /dev/null
++++ b/include/net/mtk_npu_flow.h
+@@ -0,0 +1,81 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NET_MTK_NPU_FLOW_H
++#define _NET_MTK_NPU_FLOW_H
++
++#include <linux/errno.h>
++#include <linux/netdevice.h>
++
++#define MTK_NPU_FLOW_F_ENCAP BIT(0)
++#define MTK_NPU_FLOW_FIRST 32
++#define MTK_NPU_FLOW_LAST 63
++
++/* Scalar identity only: tokens may outlive a provider registration or slot. */
++struct mtk_npu_flow_token {
++	u64 provider;
++	u64 generation;
++	u64 allocation;
++	u32 entry;
++	u32 tunnel_ifindex;
++	u32 egress_ifindex;
++	u32 flags;
++};
++
++struct mtk_npu_flow_ops {
++	bool (*supported)(enum net_device_path_type type);
++	int (*prepare)(const struct net_device_path *path,
++		       struct mtk_npu_flow_token *token);
++	/* Called under the PPE bind spinlock. Never acquire the PPE or flow
++	 * table locks here. The successful guard pins tunnel state until unlock.
++	 */
++	bool (*bind)(const struct mtk_npu_flow_token *token, void **owner);
++	void (*unbind)(void *owner);
++};
++
++struct mtk_npu_flow_guard {
++	const struct mtk_npu_flow_ops *ops;
++	void *owner;
++};
++struct dst_entry;
++
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++int mtk_npu_flow_register(const struct mtk_npu_flow_ops *ops);
++int mtk_npu_flow_unregister(const struct mtk_npu_flow_ops *ops);
++bool mtk_npu_flow_supported(enum net_device_path_type type);
++int mtk_npu_flow_prepare(const struct net_device_path *path,
++			 struct mtk_npu_flow_token *token);
++bool mtk_npu_flow_lock(const struct mtk_npu_flow_token *token,
++		       struct mtk_npu_flow_guard *guard);
++void mtk_npu_flow_unlock(struct mtk_npu_flow_guard *guard);
++int mtk_npu_flow_neigh(struct dst_entry *dst, __be32 peer,
++		       struct net_device_path *path);
++#else
++static inline int mtk_npu_flow_register(const struct mtk_npu_flow_ops *ops)
++{
++	return -EOPNOTSUPP;
++}
++static inline int mtk_npu_flow_unregister(const struct mtk_npu_flow_ops *ops)
++{
++	return -EOPNOTSUPP;
++}
++static inline bool mtk_npu_flow_supported(enum net_device_path_type type)
++{
++	return false;
++}
++static inline int mtk_npu_flow_prepare(const struct net_device_path *path,
++				      struct mtk_npu_flow_token *token)
++{
++	return -EOPNOTSUPP;
++}
++static inline bool mtk_npu_flow_lock(const struct mtk_npu_flow_token *token,
++				    struct mtk_npu_flow_guard *guard)
++{
++	return false;
++}
++static inline void mtk_npu_flow_unlock(struct mtk_npu_flow_guard *guard) { }
++static inline int mtk_npu_flow_neigh(struct dst_entry *dst, __be32 peer,
++				    struct net_device_path *path)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++#endif
+diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -11,6 +11,7 @@
+ #include <net/flow_offload.h>
+ #include <net/dst.h>
+ #include <linux/if_pppox.h>
++#include <net/mtk_npu_flow.h>
+ #include <linux/ppp_defs.h>
+ 
+ struct nf_flowtable;
+@@ -154,6 +155,9 @@
+ 			u32		iifidx;
+ 		} tc;
+ 	};
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	struct mtk_npu_flow_token npu;
++#endif
+ };
+ 
+ struct flow_offload_tuple_rhash {
+@@ -241,6 +245,9 @@
+ 			u8			h_dest[ETH_ALEN];
+ 		} out;
+ 		enum flow_offload_xmit_type	xmit_type;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++		struct mtk_npu_flow_token npu;
++#endif
+ 	} tuple[FLOW_OFFLOAD_DIR_MAX];
+ };
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -89,6 +89,10 @@
+ #include <linux/interrupt.h>
+ #include <linux/if_ether.h>
+ #include <linux/netdevice.h>
++#include <net/mtk_npu_flow.h>
++#include <net/ip.h>
++#include <net/xfrm.h>
++#include <net/dsa.h>
+ #include <linux/etherdevice.h>
+ #include <linux/ethtool.h>
+ #include <linux/skbuff.h>
+@@ -158,6 +162,156 @@
+ #include "dev.h"
+ #include "net-sysfs.h"
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++static DEFINE_MUTEX(mtk_npu_flow_admin);
++static const struct mtk_npu_flow_ops __rcu *mtk_npu_flow_ops;
++static u64 mtk_npu_flow_generation;
++
++int mtk_npu_flow_register(const struct mtk_npu_flow_ops *ops)
++{
++	int ret = 0;
++
++	if (!ops || !ops->supported || !ops->prepare || !ops->bind || !ops->unbind)
++		return -EINVAL;
++	mutex_lock(&mtk_npu_flow_admin);
++	if (rcu_access_pointer(mtk_npu_flow_ops)) {
++		ret = -EBUSY;
++	} else {
++		if (!++mtk_npu_flow_generation)
++			mtk_npu_flow_generation++;
++		rcu_assign_pointer(mtk_npu_flow_ops, ops);
++	}
++	mutex_unlock(&mtk_npu_flow_admin);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_npu_flow_register);
++
++int mtk_npu_flow_unregister(const struct mtk_npu_flow_ops *ops)
++{
++	int ret = 0;
++
++	mutex_lock(&mtk_npu_flow_admin);
++	if (!ops || rcu_access_pointer(mtk_npu_flow_ops) != ops) {
++		ret = -ENOENT;
++	} else {
++		RCU_INIT_POINTER(mtk_npu_flow_ops, NULL);
++		synchronize_net();
++	}
++	mutex_unlock(&mtk_npu_flow_admin);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_npu_flow_unregister);
++
++bool mtk_npu_flow_supported(enum net_device_path_type type)
++{
++	const struct mtk_npu_flow_ops *ops;
++	bool ret = false;
++
++	rcu_read_lock_bh();
++	ops = rcu_dereference_bh(mtk_npu_flow_ops);
++	if (ops)
++		ret = ops->supported(type);
++	rcu_read_unlock_bh();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_npu_flow_supported);
++
++int mtk_npu_flow_prepare(const struct net_device_path *path,
++			 struct mtk_npu_flow_token *token)
++{
++	const struct mtk_npu_flow_ops *ops;
++	struct mtk_npu_flow_token result = {};
++	int ret = -EOPNOTSUPP;
++
++	if (!path || !token)
++		return -EINVAL;
++	memset(token, 0, sizeof(*token));
++	rcu_read_lock_bh();
++	ops = rcu_dereference_bh(mtk_npu_flow_ops);
++	if (ops && ops->supported(path->type)) {
++		ret = ops->prepare(path, &result);
++		if (!ret) {
++			if (result.entry < MTK_NPU_FLOW_FIRST ||
++			    result.entry > MTK_NPU_FLOW_LAST || !result.generation ||
++			    !result.allocation || !result.tunnel_ifindex || !result.egress_ifindex) {
++				ret = -ERANGE;
++			} else {
++				result.provider = READ_ONCE(mtk_npu_flow_generation);
++				result.flags = MTK_NPU_FLOW_F_ENCAP;
++				*token = result;
++			}
++		}
++	}
++	rcu_read_unlock_bh();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_npu_flow_prepare);
++
++bool mtk_npu_flow_lock(const struct mtk_npu_flow_token *token,
++		       struct mtk_npu_flow_guard *guard)
++{
++	const struct mtk_npu_flow_ops *ops;
++
++	if (!token || !guard || token->entry < MTK_NPU_FLOW_FIRST ||
++	    token->entry > MTK_NPU_FLOW_LAST || !token->generation ||
++	    !token->allocation || !token->tunnel_ifindex || !token->egress_ifindex ||
++	    (token->flags & ~MTK_NPU_FLOW_F_ENCAP))
++		return false;
++	guard->ops = NULL;
++	guard->owner = NULL;
++	rcu_read_lock_bh();
++	ops = rcu_dereference_bh(mtk_npu_flow_ops);
++	if (ops && token->provider == READ_ONCE(mtk_npu_flow_generation) &&
++	    ops->bind(token, &guard->owner)) {
++		guard->ops = ops;
++		return true;
++	}
++	rcu_read_unlock_bh();
++	return false;
++}
++EXPORT_SYMBOL_GPL(mtk_npu_flow_lock);
++
++void mtk_npu_flow_unlock(struct mtk_npu_flow_guard *guard)
++{
++	if (WARN_ON_ONCE(!guard || !guard->ops))
++		return;
++	guard->ops->unbind(guard->owner);
++	guard->ops = NULL;
++	guard->owner = NULL;
++	rcu_read_unlock_bh();
++}
++EXPORT_SYMBOL_GPL(mtk_npu_flow_unlock);
++
++int mtk_npu_flow_neigh(struct dst_entry *dst, __be32 peer,
++                       struct net_device_path *path)
++{
++	struct neighbour *neigh;
++
++	/* The native backend initially accepts a plain Ethernet underlay. The
++	 * HNAT backend owns the separate VLAN/PPPoE/bridge adaptation path.
++	 */
++	if (!dst || !path || !dst_check(dst, 0) || dst_xfrm(dst) ||
++	    dst->dev->type != ARPHRD_ETHER || !netif_running(dst->dev) ||
++	    is_vlan_dev(dst->dev) || netif_is_bridge_master(dst->dev) ||
++	    netdev_uses_dsa(dst->dev))
++		return -EOPNOTSUPP;
++	neigh = dst_neigh_lookup(dst, &peer);
++	if (!neigh)
++		return -EHOSTUNREACH;
++	if (!(READ_ONCE(neigh->nud_state) & NUD_VALID)) {
++		neigh_release(neigh);
++		return -EHOSTUNREACH;
++	}
++	neigh_ha_snapshot(path->tunnel.h_dest, neigh, dst->dev);
++	ether_addr_copy(path->tunnel.h_source, dst->dev->dev_addr);
++	path->tunnel.underlay_ifindex = dst->dev->ifindex;
++	neigh_release(neigh);
++	return is_valid_ether_addr(path->tunnel.h_dest) &&
++	       is_valid_ether_addr(path->tunnel.h_source) ? 0 : -EHOSTUNREACH;
++}
++EXPORT_SYMBOL_GPL(mtk_npu_flow_neigh);
++#endif
++
+ static DEFINE_SPINLOCK(ptype_lock);
+ struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
+ struct list_head ptype_all __read_mostly;	/* Taps */
+diff --git a/net/l2tp/l2tp_core.c b/net/l2tp/l2tp_core.c
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@ -697,6 +697,10 @@
+ 		 */
+ 		if (!session->lns_mode && !session->send_seq) {
+ 			trace_session_seqnum_lns_enable(session);
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++			if (session->offload_invalidate)
++				session->offload_invalidate(session);
++#endif
+ 			session->send_seq = 1;
+ 			l2tp_session_set_header_len(session, tunnel->version);
+ 		}
+diff --git a/net/l2tp/l2tp_core.h b/net/l2tp/l2tp_core.h
+--- a/net/l2tp/l2tp_core.h
++++ b/net/l2tp/l2tp_core.h
+@@ -110,6 +110,9 @@
+ 	 * reordering, if data sequence numbers are enabled for the session.
+ 	 */
+ 	void (*recv_skb)(struct l2tp_session *session, struct sk_buff *skb, int data_len);
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	void (*offload_invalidate)(struct l2tp_session *session);
++#endif
+ 
+ 	/* Session close handler.
+ 	 * Each pseudowire implementation may implement this callback in order to carry
+diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -93,6 +93,9 @@
+ #include <net/netfilter/nf_flow_table.h>
+ #endif
+ #include <net/ip.h>
++#include <net/route.h>
++#include <net/mtk_npu_flow.h>
++#include <linux/security.h>
+ #include <net/udp.h>
+ #include <net/inet_common.h>
+ 
+@@ -159,7 +162,65 @@
+ }
+ #endif
+ 
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++static int pppol2tp_fill_forward_path(struct net_device_path_ctx *ctx,
++				     struct net_device_path *path,
++				     const struct ppp_channel *chan)
++{
++	struct sock *sk = chan->private;
++	struct ppp_tunnel_info info;
++	struct l2tp_session *session;
++	struct inet_sock *inet;
++	struct sock *transport;
++	struct flowi4 fl4;
++	struct rtable *rt;
++	int ret;
++
++	if (!mtk_npu_flow_supported(DEV_PATH_L2TP))
++		return -EOPNOTSUPP;
++	ret = pppol2tp_get_tunnel_info((struct ppp_channel *)chan, &info);
++	if (ret)
++		return ret;
++	/* Generic PPP holds its unit/downl locks over this callback. */
++	session = READ_ONCE(sk->sk_user_data);
++	transport = session->tunnel->sock;
++	if (!transport || transport->sk_family != AF_INET)
++		return -EOPNOTSUPP;
++	inet = inet_sk(transport);
++	flowi4_init_output(&fl4, transport->sk_bound_dev_if, transport->sk_mark,
++			   RT_TOS(inet->tos), RT_SCOPE_UNIVERSE, IPPROTO_UDP, 0,
++			   inet->inet_daddr, inet->inet_saddr, inet->inet_dport,
++			   inet->inet_sport, sock_net_uid(sock_net(transport), transport));
++	security_sk_classify_flow(transport, flowi4_to_flowi_common(&fl4));
++	rt = ip_route_output_flow(sock_net(transport), &fl4, transport);
++	if (IS_ERR(rt))
++		return PTR_ERR(rt);
++	ret = mtk_npu_flow_neigh(&rt->dst, fl4.daddr, path);
++	if (!ret) {
++		path->type = DEV_PATH_L2TP;
++		path->dev = ctx->dev;
++		path->tunnel.sip.ip = fl4.saddr;
++		path->tunnel.dip.ip = fl4.daddr;
++		path->tunnel.sport = inet->inet_sport;
++		path->tunnel.dport = inet->inet_dport;
++		path->tunnel.ttl = inet->uc_ttl < 0 ?
++			ip4_dst_hoplimit(&rt->dst) : inet->uc_ttl;
++		path->tunnel.tos = inet->tos;
++		path->tunnel.l2tp.dl_tid = htons(info.tunnel_id);
++		path->tunnel.l2tp.ul_tid = htons(info.peer_tunnel_id);
++		path->tunnel.l2tp.dl_sid = htons(info.session_id);
++		path->tunnel.l2tp.ul_sid = htons(info.peer_session_id);
++		ctx->dev = rt->dst.dev;
++	}
++	ip_rt_put(rt);
++	return ret;
++}
++#endif
++
+ static const struct ppp_channel_ops pppol2tp_chan_ops = {
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	.fill_forward_path = pppol2tp_fill_forward_path,
++#endif
+ 	.start_xmit =  pppol2tp_xmit,
+ #if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
+ 	.get_tunnel_info = pppol2tp_get_tunnel_info,
+@@ -239,6 +300,19 @@
+ end:
+ 	return err;
+ }
++
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++static void pppol2tp_offload_invalidate(struct l2tp_session *session)
++{
++	struct sock *sk;
++
++	rcu_read_lock();
++	sk = pppol2tp_session_get_sock(session);
++	if (sk)
++		ppp_channel_tunnel_invalidate(&pppox_sk(sk)->chan);
++	rcu_read_unlock();
++}
++#endif
+ 
+ static void pppol2tp_recv(struct l2tp_session *session, struct sk_buff *skb, int data_len)
+ {
+@@ -609,6 +683,9 @@
+ 	struct pppol2tp_session *ps;
+ 
+ 	session->recv_skb = pppol2tp_recv;
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	session->offload_invalidate = pppol2tp_offload_invalidate;
++#endif
+ 	if (IS_ENABLED(CONFIG_L2TP_DEBUGFS))
+ 		session->show = pppol2tp_show;
+ 
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -140,6 +140,9 @@
+ 		break;
+ 	}
+ 	flow_tuple->xmit_type = route->tuple[dir].xmit_type;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	flow_tuple->npu = route->tuple[dir].npu;
++#endif
+ 
+ 	return 0;
+ }
+@@ -155,6 +158,19 @@
+ void flow_offload_route_init(struct flow_offload *flow,
+ 			     struct nf_flow_route *route)
+ {
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	/* Both hardware directions depend on the tunnel, although only one
++	 * encapsulates. Preserve that owner so close/reset fences decap flows.
++	 */
++	if (route->tuple[0].npu.entry && !route->tuple[1].npu.entry) {
++		route->tuple[1].npu = route->tuple[0].npu;
++		route->tuple[1].npu.flags &= ~MTK_NPU_FLOW_F_ENCAP;
++	} else if (route->tuple[1].npu.entry && !route->tuple[0].npu.entry) {
++		route->tuple[0].npu = route->tuple[1].npu;
++		route->tuple[0].npu.flags &= ~MTK_NPU_FLOW_F_ENCAP;
++	}
++#endif
++
+ 	flow_offload_fill_route(flow, route, FLOW_OFFLOAD_DIR_ORIGINAL);
+ 	flow_offload_fill_route(flow, route, FLOW_OFFLOAD_DIR_REPLY);
+ 	flow->type = NF_FLOW_OFFLOAD_ROUTE;
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -14,6 +14,7 @@
+ #include <net/ip6_route.h>
+ #include <net/neighbour.h>
+ #include <net/netfilter/nf_flow_table.h>
++#include <net/mtk_npu_flow.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
+ /* For layer 4 checksum field offset. */
+ #include <linux/tcp.h>
+@@ -376,6 +377,8 @@
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+ 
++
++
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))
+ 		return 0;
+@@ -384,6 +387,23 @@
+ 	thoff = (iph->ihl * 4) + ctx->offset;
+ 	if (nf_flow_state_check(flow, iph->protocol, skb, thoff))
+ 		return 0;
++
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	if (flow->tuplehash[0].tuple.npu.entry || flow->tuplehash[1].tuple.npu.entry) {
++		struct mtk_npu_flow_guard guard;
++		const struct mtk_npu_flow_token *token = flow->tuplehash[0].tuple.npu.entry ?
++			&flow->tuplehash[0].tuple.npu : &flow->tuplehash[1].tuple.npu;
++
++		if (!mtk_npu_flow_lock(token, &guard)) {
++			flow_offload_teardown(flow);
++		} else {
++			mtk_npu_flow_unlock(&guard);
++			flow_offload_refresh(flow_table, flow, false);
++		}
++		/* The caller returns NF_ACCEPT, preserving the original tunnel path. */
++		return 0;
++	}
++#endif
+ 
+ 	if (!nf_flow_dst_check(&tuplehash->tuple)) {
+ 		flow_offload_teardown(flow);
+@@ -655,6 +675,8 @@
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+ 
++
++
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))
+ 		return 0;
+@@ -663,6 +685,23 @@
+ 	thoff = sizeof(*ip6h) + ctx->offset;
+ 	if (nf_flow_state_check(flow, ip6h->nexthdr, skb, thoff))
+ 		return 0;
++
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	if (flow->tuplehash[0].tuple.npu.entry || flow->tuplehash[1].tuple.npu.entry) {
++		struct mtk_npu_flow_guard guard;
++		const struct mtk_npu_flow_token *token = flow->tuplehash[0].tuple.npu.entry ?
++			&flow->tuplehash[0].tuple.npu : &flow->tuplehash[1].tuple.npu;
++
++		if (!mtk_npu_flow_lock(token, &guard)) {
++			flow_offload_teardown(flow);
++		} else {
++			mtk_npu_flow_unlock(&guard);
++			flow_offload_refresh(flow_table, flow, false);
++		}
++		/* The caller returns NF_ACCEPT, preserving the original tunnel path. */
++		return 0;
++	}
++#endif
+ 
+ 	if (!nf_flow_dst_check(&tuplehash->tuple)) {
+ 		flow_offload_teardown(flow);
+diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -700,6 +700,17 @@
+ 		return -1;
+ 
+ 	tuple = &flow->tuplehash[dir].tuple;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	if (tuple->npu.entry) {
++		struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
++
++		if (!entry)
++			return -E2BIG;
++		entry->id = FLOW_ACTION_NPU_ENCAP;
++		entry->npu = tuple->npu;
++	}
++#endif
++
+ 
+ 	for (i = 0; i < tuple->encap_num; i++) {
+ 		struct flow_action_entry *entry;
+@@ -933,7 +944,7 @@
+ 	}
+ 	up_read(&flowtable->flow_block_lock);
+ 
+-	if (cmd == FLOW_CLS_STATS)
++	if (stats)
+ 		memcpy(stats, &cls_flow.stats, sizeof(*stats));
+ 
+ 	return i;
+@@ -953,10 +964,17 @@
+ static void flow_offload_tuple_del(struct flow_offload_work *offload,
+ 				   enum flow_offload_tuple_dir dir)
+ {
++	struct flow_stats stats = {};
++
+ 	nf_flow_offload_tuple(offload->flowtable, offload->flow, NULL, dir,
+ 			      offload->flowtable->priority,
+-			      FLOW_CLS_DESTROY, NULL,
++			      FLOW_CLS_DESTROY, &stats,
+ 			      &offload->flowtable->flow_block.cb_list);
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	/* NPU destroy stops this hardware owner and returns its final delta. */
++	if (offload->flow->tuplehash[dir].tuple.npu.entry && stats.pkts)
++		nf_ct_acct_add(offload->flow->ct, dir, stats.pkts, stats.bytes);
++#endif
+ }
+ 
+ static int flow_offload_rule_add(struct flow_offload_work *offload,
+@@ -1026,7 +1044,12 @@
+ 	offload->flow->timeout = max_t(u64, offload->flow->timeout,
+ 				       lastused + flow_offload_get_timeout(offload->flow));
+ 
+-	if (offload->flowtable->flags & NF_FLOWTABLE_COUNTER) {
++	if ((offload->flowtable->flags & NF_FLOWTABLE_COUNTER)
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	    || offload->flow->tuplehash[0].tuple.npu.entry
++	    || offload->flow->tuplehash[1].tuple.npu.entry
++#endif
++	   ) {
+ 		if (stats[0].pkts)
+ 			nf_ct_acct_add(offload->flow->ct,
+ 				       FLOW_OFFLOAD_DIR_ORIGINAL,
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -166,11 +166,14 @@
+ 	u8 h_source[ETH_ALEN];
+ 	u8 h_dest[ETH_ALEN];
+ 	enum flow_offload_xmit_type xmit_type;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	struct mtk_npu_flow_token npu;
++#endif
+ };
+ 
+ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			      struct nft_forward_info *info,
+-			      unsigned char *ha, struct nf_flowtable *flowtable)
++			      unsigned char *ha, struct nf_flowtable *flowtable, u8 family)
+ {
+ 	const struct net_device_path *path;
+ 	int i;
+@@ -180,7 +183,27 @@
+ 	for (i = 0; i < stack->num_paths; i++) {
+ 		path = &stack->path[i];
+ 		info->indev = path->dev;
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++		if (info->npu.entry && path->type != DEV_PATH_ETHERNET) {
++			info->indev = NULL;
++			return;
++		}
++#endif
++
+ 		switch (path->type) {
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++		case DEV_PATH_L2TP:
++		case DEV_PATH_PPTP:
++			if (family != NFPROTO_IPV4 || !nf_flowtable_hw_offload(flowtable) ||
++			    mtk_npu_flow_prepare(path, &info->npu)) {
++				info->indev = NULL;
++				return;
++			}
++			ether_addr_copy(info->h_source, path->tunnel.h_source);
++			ether_addr_copy(info->h_dest, path->tunnel.h_dest);
++			break;
++#endif
++
+ 		case DEV_PATH_ETHERNET:
+ 		case DEV_PATH_DSA:
+ 		case DEV_PATH_VLAN:
+@@ -304,7 +327,7 @@
+ 	}
+ 
+ 	if (nft_dev_fill_forward_path(&ctx, route, dst, ct, dir, ha, &stack) >= 0)
+-		nft_dev_path_info(&stack, &info, ha, &ft->data);
++		nft_dev_path_info(&stack, &info, ha, &ft->data, nft_pf(pkt));
+ 
+ 	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
+ 		return -ENOENT;
+@@ -324,6 +347,10 @@
+ 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
+ 		route->tuple[dir].xmit_type = info.xmit_type;
+ 	}
++
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	route->tuple[dir].npu = info.npu;
++#endif
+ 
+ 	return 0;
+ }
+@@ -583,6 +610,12 @@
+ 			goto err_flow_route;
+ 	}
+ 
++	#if IS_ENABLED(CONFIG_NET_MEDIATEK_NPU_FLOW)
++	/* Nested/tunnel-to-tunnel forwarding needs two independent owners. */
++	if (route.tuple[0].npu.entry && route.tuple[1].npu.entry)
++		goto err_flow_alloc;
++#endif
++
+ 	flow = flow_offload_alloc(ct);
+ 	if (!flow)
+ 		goto err_flow_alloc;

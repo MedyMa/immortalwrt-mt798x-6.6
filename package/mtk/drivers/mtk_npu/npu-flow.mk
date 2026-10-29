@@ -17,10 +17,10 @@ define KernelPackage/npu-flow
   CATEGORY:=MTK Properties
   SUBMENU:=Drivers
   TITLE:=MediaTek Network Processor Unit with Flow Block Framework
-  FILES+=$(PKG_BUILD_DIR)/npu-flow/npu-flow.ko
-  KCONFIG:=
+  KCONFIG:= CONFIG_NET_MEDIATEK_NPU_FLOW=y CONFIG_MTK_PPP_TUNNEL_INFO=y
   DEPENDS:= \
-	@MTK_NPU_24_10_OTHER_BACKENDS \
+	@MTK_NPU_24_10_FLOW_BACKEND \
+	@!PACKAGE_kmod-mediatek_hnat \
 	kmod-npu \
 	kmod-nft-offload \
 	+@MTK_NPU_FLOW
@@ -36,7 +36,6 @@ define KernelPackage/npu-flow-autoload
   CATEGORY:=MTK Properties
   SUBMENU:=Drivers
   TITLE:= MediaTek Network Processor Unit with Flow Block Framework auto Load
-  AUTOLOAD:=$(call AutoLoad,71,npu-flow)
   KCONFIG:=
   DEPENDS:= \
 	kmod-npu-flow \

@@ -1,4 +1,5 @@
 menu "NPU Support Network Feature Configuration"
+	depends on !MTK_NPU_24_10_DPDK_BACKEND
 
 config MTK_NPU_ADPT_FWD
 	bool "MediaTek NPU Adapter Forward Support"

@@ -16,6 +16,8 @@
 #include <linux/version.h>
 
 #include "npu/debugfs.h"
+#include "npu/dpdk.h"
+#include "npu/mcast-adapter.h"
 #include "npu/firmware.h"
 #include "npu/hwspinlock.h"
 #include "npu/internal.h"
@@ -27,6 +29,7 @@
 #include "npu/netsys.h"
 #include "npu/net-core.h"
 #include "npu/nf-hnat.h"
+#include "npu/flow.h"
 #include "npu/net-event.h"
 #include "npu/npu-ocd.h"
 #include "npu/procfs.h"
@@ -43,6 +46,15 @@
 #include "npu/seq_gen.h"
 
 #define EFUSE_NPU_POWER_OFF		(0xD08)
+
+#if IS_ENABLED(CONFIG_MTK_NPU_DPDK) && \
+	(IS_ENABLED(CONFIG_MTK_NPU_HNAT) || IS_ENABLED(CONFIG_MTK_NPU_FLOW) || \
+	 IS_ENABLED(CONFIG_MTK_NPU_MCAST) || IS_ENABLED(CONFIG_MTK_NPU_GRE) || \
+	 IS_ENABLED(CONFIG_MTK_NPU_PPP) || IS_ENABLED(CONFIG_MTK_NPU_VXLAN) || \
+	 IS_ENABLED(CONFIG_MTK_NPU_ADPT_FWD) || IS_ENABLED(CONFIG_MTK_NPU_L4S) || \
+	 IS_ENABLED(CONFIG_MTK_NPU_RATE_LIMIT))
+#error "NPU DPDK MAC-filter mode cannot share the router offload firmware mode"
+#endif
 
 struct npu_init_data {
 	int (*plat_net_dev_init)(struct platform_device *pdev);
@@ -83,11 +95,15 @@ static int mtk_npu_post_init(struct platform_device *pdev)
 {
 	int ret = 0;
 
-	/* TODO */
+	/* Relay channels need their parent before firmware can notify logger. */
+	ret = mtk_npu_debugfs_init(pdev);
+	if (ret)
+		return ret;
+
 	ret = mtk_npu_logger_init(pdev);
 	if (ret) {
 		NPU_ERR("logger init failed: %d\n", ret);
-		return ret;
+		goto err_debugfs_deinit;
 	}
 
 	/* kick core */
@@ -146,15 +162,9 @@ static int mtk_npu_post_init(struct platform_device *pdev)
 		goto err_thermal_deinit;
 	}
 
-	ret = mtk_npu_debugfs_init(pdev);
-	if (ret) {
-		NPU_ERR("npu debugfs init failed: %d\n", ret);
-		goto err_procfs_deinit;
-	}
-
 	ret = mtk_npu_statistic_init(pdev);
 	if (ret)
-		goto err_debugfs_deinit;
+		goto err_procfs_deinit;
 
 	ret = mtk_npu_trm_fs_init();
 	if (ret) {
@@ -166,9 +176,6 @@ static int mtk_npu_post_init(struct platform_device *pdev)
 
 err_statistic_deinit:
 	mtk_npu_statistic_deinit(pdev);
-
-err_debugfs_deinit:
-	mtk_npu_debugfs_deinit(pdev);
 
 err_procfs_deinit:
 	mtk_npu_procfs_deinit(pdev);
@@ -197,6 +204,8 @@ err_mcu_tear_down:
 err_logger_deinit:
 	mtk_npu_logger_deinit(pdev);
 
+err_debugfs_deinit:
+	mtk_npu_debugfs_deinit(pdev);
 	return ret;
 }
 
@@ -205,8 +214,6 @@ static void mtk_npu_post_deinit(struct platform_device *pdev)
 	mtk_npu_trm_fs_deinit();
 
 	mtk_npu_statistic_deinit(pdev);
-
-	mtk_npu_debugfs_deinit(pdev);
 
 	mtk_npu_procfs_deinit(pdev);
 
@@ -225,6 +232,7 @@ static void mtk_npu_post_deinit(struct platform_device *pdev)
 	mtk_npu_mcu_tear_down(pdev);
 
 	mtk_npu_logger_deinit(pdev);
+	mtk_npu_debugfs_deinit(pdev);
 
 }
 
@@ -323,16 +331,35 @@ static int mtk_npu_probe(struct platform_device *pdev)
 		goto err_misc_deinit;
 
 	ret = mtk_npu_nf_hnat_start(pdev);
-	if (ret) {
-		mtk_npu_tnl_offload_stop_worker();
-		mtk_npu_post_deinit(pdev);
-		goto err_misc_deinit;
-	}
+	if (ret)
+		goto err_backends;
+	ret = mtk_npu_flow_start(pdev);
+	if (ret)
+		goto err_backends;
+	ret = mtk_npu_dpdk_start(pdev, npu.base, npu.size);
+	if (ret)
+		goto err_backends;
+	ret = mtk_npu_mcast_start(pdev, npu.base);
+	if (ret)
+		goto err_backends;
 
 	platform_set_drvdata(pdev, &npu);
 	smp_store_release(&npu_ready, true);
 	NPU_INFO("init done\n");
 	return ret;
+
+err_backends:
+	mtk_npu_mcast_stop();
+	mtk_npu_dpdk_stop();
+	mtk_npu_flow_quiesce();
+	mtk_npu_nf_hnat_quiesce();
+	mtk_npu_tnl_offload_stop_worker();
+	mtk_npu_post_deinit(pdev);
+	mtk_npu_misc_deinit(pdev);
+	mtk_npu_tnl_offload_deinit(pdev);
+	mtk_npu_flow_finish();
+	mtk_npu_nf_hnat_finish();
+	goto err_net_core_deinit;
 
 err_misc_deinit:
 	mtk_npu_misc_deinit(pdev);
@@ -363,10 +390,15 @@ static void mtk_npu_remove(struct platform_device *pdev)
 {
 	smp_store_release(&npu_ready, false);
 	platform_set_drvdata(pdev, NULL);
+	mtk_npu_debugfs_quiesce();
+
+	mtk_npu_mcast_stop();
+	mtk_npu_dpdk_stop();
 
 	/* Drain packet/RX/notifier callbacks before stopping their shared worker.
 	 * Protocol state stays alive until firmware, PCE and worker are stopped.
 	 */
+	mtk_npu_flow_quiesce();
 	mtk_npu_nf_hnat_quiesce();
 	mtk_npu_tnl_offload_stop_worker();
 	mtk_npu_post_deinit(pdev);
@@ -374,6 +406,7 @@ static void mtk_npu_remove(struct platform_device *pdev)
 	mtk_npu_misc_deinit(pdev);
 
 	mtk_npu_tnl_offload_deinit(pdev);
+	mtk_npu_flow_finish();
 	mtk_npu_nf_hnat_finish();
 
 	mtk_npu_net_core_deinit(pdev);

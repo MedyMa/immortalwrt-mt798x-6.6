@@ -80,7 +80,7 @@ struct npu_dpdk_mf_cfg {
 	enum npu_mf_config_type cfg_type;
 	struct {
 		u8 id;
-		bool enable;
+		u8 enable;
 	} port;
 };
 
@@ -112,5 +112,6 @@ int mtk_npu_dpdk_mac_filter_enable(bool en);
 int mtk_npu_dpdk_mac_filter_config(const struct npu_dpdk_mf_cfg *cfg);
 int mtk_npu_dpdk_mac_filter_entry_query(struct npu_dpdk_mf_query *query);
 int mtk_npu_dpdk_mac_filter_init(void);
+int mtk_npu_dpdk_mac_filter_restore(void);
 void mtk_npu_dpdk_mac_filter_deinit(void);
 #endif /* _NPU_DPDK_MAC_FILTER */

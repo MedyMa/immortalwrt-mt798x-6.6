@@ -8,6 +8,7 @@
 #include <linux/device.h>
 #include <linux/dmaengine.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
 #include <linux/lockdep.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -180,8 +181,12 @@ static inline int mtk_hpdma_start_transfer(struct hpdma_dev *hpdma,
 					   struct hpdma_vchan *hvchan,
 					   struct hpdma_vdesc *hvdesc)
 {
+	int ret;
+
 	/* occupy hpdma start permission */
-	mtk_npu_hwspin_lock(hpdma->hwspinlock_grp, hpdma->trigger_start_slot);
+	ret = mtk_npu_hwspin_lock(hpdma->hwspinlock_grp, hpdma->trigger_start_slot);
+	if (ret)
+		return ret;
 
 	/* acknowledge the terminate flow that HW is going to start */
 	hvchan->busy = true;
@@ -661,16 +666,20 @@ static void mtk_top_hpdma_tx_pending_desc(struct hpdma_dev *hpdma,
 {
 	u32 slot = hpdma->ch_base_slot;
 	enum hwspinlock_group grp = hpdma->hwspinlock_grp;
+	ktime_t deadline = ktime_add_us(ktime_get(), 1000);
 
 	hvchan->pchan_id = 0;
 
-	mtk_hpdma_prepare_transfer(hpdma);
+	if (mtk_hpdma_prepare_transfer(hpdma))
+		return;
 
 	/* occupy hpdma physical channel */
 	while (!mtk_npu_hwspin_try_lock(grp, slot)) {
 
-		if (unlikely(hvchan->terminating)) {
-			spin_unlock(&hpdma->lock);
+		if (unlikely(READ_ONCE(hvchan->terminating)) ||
+		    ktime_after(ktime_get(), deadline)) {
+			mtk_hpdma_unprepare_transfer(hpdma);
+			wake_up_interruptible(&hvchan->stop_wait);
 			return;
 		}
 
@@ -807,10 +816,15 @@ static void mtk_clust_hpdma_tx_pending_desc(struct hpdma_dev *hpdma,
 	u32 slot = hpdma->ch_base_slot + hvchan->pchan_id;
 	enum hwspinlock_group grp = hpdma->hwspinlock_grp;
 
-	mtk_hpdma_prepare_transfer(hpdma);
+	if (mtk_hpdma_prepare_transfer(hpdma))
+		return;
 
 	/* occupy hpdma physical channel */
-	mtk_npu_hwspin_lock(grp, slot);
+	if (mtk_npu_hwspin_lock(grp, slot)) {
+		mtk_hpdma_unprepare_transfer(hpdma);
+		wake_up_interruptible(&hvchan->stop_wait);
+		return;
+	}
 
 	mtk_hpdma_config_pchan(hpdma, hvchan, hvdesc);
 

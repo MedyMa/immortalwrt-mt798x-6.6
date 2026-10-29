@@ -3,7 +3,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mtk-tops-accounting
 PKG_VERSION:=0.1
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 PKG_LICENSE:=GPL-2.0-only
 PKGARCH:=all
 

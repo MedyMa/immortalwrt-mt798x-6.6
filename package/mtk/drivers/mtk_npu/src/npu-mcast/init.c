@@ -1,114 +1,175 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/*
- * Copyright (c) 2025 MediaTek Inc. All Rights Reserved.
- *
- * Author: Ren-Ting Wang <ren-ting.wang@mediatek.com>
- */
+/* Copyright (c) 2025 MediaTek Inc. All Rights Reserved. */
+#include <linux/mutex.h>
 
-#include <linux/io.h>
-#include <linux/err.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/platform_device.h>
-
+#include "npu/mcast-adapter.h"
+#include "npu/mcu.h"
 #include "npu-mcast/internal.h"
 #include "npu-mcast/mcast.h"
 #include "npu-mcast/procfs.h"
 #include "npu-mcast/sysfs.h"
 
 struct npu_mcast_dev nmcast;
+static DEFINE_MUTEX(mcast_lifecycle);
+static DEFINE_MUTEX(mcast_state_lock);
+static enum { MCAST_DOWN, MCAST_STARTING, MCAST_UP, MCAST_RECOVERING } mcast_state;
 
-static int mtk_npu_multicast_device_init(void)
+static int mcast_before_reset(struct mcu_state_notifier *notifier)
 {
-	struct platform_device *pdev;
-	struct device_node *node;
-	struct resource *res;
+	mutex_lock(&mcast_state_lock);
+	if (mcast_state != MCAST_DOWN) {
+		/* Deny new bindings and drain existing PPE entries before reset. */
+		mtk_npu_mcast_pause();
+		mcast_state = MCAST_RECOVERING;
+	}
+	mutex_unlock(&mcast_state_lock);
+	return 0;
+}
+
+static int mcast_after_reset(struct mcu_state_notifier *notifier)
+{
 	int ret = 0;
 
-	node = of_find_compatible_node(NULL, NULL, "mediatek,npu");
-	if (!node) {
-		/* for legacy NPU name, should be removed after openwrt-21.02 deprecated */
-		node = of_find_compatible_node(NULL, NULL, "mediatek,tops");
-		if (!node) {
-			pr_notice("Cannot find NPU device node\n");
-			return -ENODEV;
+	mutex_lock(&mcast_state_lock);
+	if (mcast_state == MCAST_RECOVERING) {
+		ret = mtk_npu_mcast_restore();
+		if (!ret) {
+			mcast_state = MCAST_UP;
+			mtk_npu_mcast_resume();
 		}
 	}
-
-	pdev = of_find_device_by_node(node);
-	if (!pdev) {
-		pr_notice("Cannot find NPU platform device\n");
-		ret = -ENODEV;
-		goto out;
-	}
-
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "npu-base");
-	if (!res) {
-		/* for legacy NPU name, should be removed after openwrt-21.02 deprecated */
-		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "tops-base");
-		if (!res)
-			return -ENXIO;
-	}
-
-	nmcast.base = devm_ioremap(&pdev->dev, res->start, resource_size(res));
-	if (!nmcast.base)
-		return -ENOMEM;
-
-	nmcast.dev = &pdev->dev;
-
-out:
-	of_node_put(node);
-
+	mutex_unlock(&mcast_state_lock);
 	return ret;
 }
 
-static int __init mtk_npu_multicast_init(void)
+static struct mcu_state_notifier mcast_stop_notifier = {
+	.pre_enter = mcast_before_reset,
+};
+static struct mcu_state_notifier mcast_init_notifier = {
+	.post_enter = mcast_after_reset,
+};
+static struct mcu_state_notifier mcast_freerun_notifier = {
+	/* Warm reset can return from NETSTOP without passing through INIT. */
+	.pre_enter = mcast_after_reset,
+};
+
+int mtk_npu_mcast_enable(bool en)
+{
+	int ret = -EAGAIN;
+
+	mutex_lock(&mcast_state_lock);
+	if (mcast_state == MCAST_UP && mtk_npu_mcu_alive()) {
+		/* Drain PPE before disabling firmware replication. Re-enabling
+		 * rebuilds membership before any new hardware binding is allowed.
+		 */
+		mtk_npu_mcast_pause();
+		ret = mtk_npu_mcast_set_enabled(en);
+		if (!ret)
+			mtk_npu_mcast_resume();
+	}
+	mutex_unlock(&mcast_state_lock);
+	return ret;
+}
+
+int mtk_npu_mcast_start(struct platform_device *pdev, void __iomem *base)
 {
 	int ret;
 
-	ret = mtk_npu_multicast_device_init();
-	if (ret) {
-		pr_notice("find npu device for multicast failed: %d\n", ret);
-		return ret;
+	if (!pdev || !base)
+		return -EINVAL;
+	mutex_lock(&mcast_lifecycle);
+	mutex_lock(&mcast_state_lock);
+	if (mcast_state != MCAST_DOWN) {
+		ret = -EBUSY;
+		mutex_unlock(&mcast_state_lock);
+		goto out;
 	}
-
+	nmcast.dev = &pdev->dev;
+	nmcast.base = base;
+	mcast_state = MCAST_STARTING;
 	ret = mtk_npu_mcast_init();
-	if (ret) {
-		NPU_NOTICE("multicast init failed: %d\n", ret);
-		return ret;
-	}
-
+	mutex_unlock(&mcast_state_lock);
+	if (ret)
+		goto deinit;
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_NETSTOP,
+						&mcast_stop_notifier);
+	if (ret)
+		goto deinit;
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_INIT,
+						&mcast_init_notifier);
+	if (ret)
+		goto unregister_stop;
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_FREERUN,
+						&mcast_freerun_notifier);
+	if (ret)
+		goto unregister_init;
+	/* No callback is published yet. A reset during registration may have
+	 * changed the firmware mapping; resolve it again before publishing.
+	 */
+	mutex_lock(&mcast_state_lock);
+	ret = mtk_npu_mcu_alive() ? mtk_npu_mcast_restore() : -EBUSY;
+	if (!ret)
+		mcast_state = MCAST_UP;
+	mutex_unlock(&mcast_state_lock);
+	if (ret)
+		goto unregister_freerun;
 	ret = mtk_npu_mcast_sysfs_init();
-	if (ret) {
-		NPU_NOTICE("multicast sysfs init failed: %d\n", ret);
-		return ret;
-	}
-
+	if (ret)
+		goto unregister_freerun;
 	ret = mtk_npu_mcast_procfs_init();
-	if (ret) {
-		NPU_NOTICE("multicast procfs init failed: %d\n", ret);
-		goto err_sysfs_deinit;
-	}
+	if (ret)
+		goto sysfs_deinit;
+	ret = mtk_npu_mcast_publish();
+	if (ret)
+		goto procfs_deinit;
+	mutex_unlock(&mcast_lifecycle);
+	return 0;
 
-	return ret;
-
-err_sysfs_deinit:
+procfs_deinit:
+	mtk_npu_mcast_procfs_deinit();
+sysfs_deinit:
 	mtk_npu_mcast_sysfs_deinit();
-
+unregister_freerun:
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_FREERUN, &mcast_freerun_notifier);
+unregister_init:
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_INIT, &mcast_init_notifier);
+unregister_stop:
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_NETSTOP, &mcast_stop_notifier);
+deinit:
+	mutex_lock(&mcast_state_lock);
+	mcast_state = MCAST_DOWN;
+	mtk_npu_mcast_deinit();
+	nmcast.dev = NULL;
+	nmcast.base = NULL;
+	mutex_unlock(&mcast_state_lock);
+out:
+	mutex_unlock(&mcast_lifecycle);
 	return ret;
 }
 
-static void __exit mtk_npu_multicast_exit(void)
+void mtk_npu_mcast_stop(void)
 {
+	mutex_lock(&mcast_lifecycle);
+	mutex_lock(&mcast_state_lock);
+	if (mcast_state == MCAST_DOWN) {
+		mutex_unlock(&mcast_state_lock);
+		mutex_unlock(&mcast_lifecycle);
+		return;
+	}
+	mcast_state = MCAST_DOWN;
+	mtk_npu_mcast_pause();
+	mutex_unlock(&mcast_state_lock);
+	/* Never wait for a notifier while holding its state lock. */
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_FREERUN, &mcast_freerun_notifier);
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_INIT, &mcast_init_notifier);
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_NETSTOP, &mcast_stop_notifier);
+	mtk_npu_mcast_unpublish();
 	mtk_npu_mcast_procfs_deinit();
 	mtk_npu_mcast_sysfs_deinit();
+	mutex_lock(&mcast_state_lock);
 	mtk_npu_mcast_deinit();
+	nmcast.dev = NULL;
+	nmcast.base = NULL;
+	mutex_unlock(&mcast_state_lock);
+	mutex_unlock(&mcast_lifecycle);
 }
-
-module_init(mtk_npu_multicast_init);
-module_exit(mtk_npu_multicast_exit);
-
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("MediaTek Network Processor Unit with IPv4/IPv6 Multicast");
-MODULE_AUTHOR("Ren-Ting Wang <ren-ting.wang@mediatek.com>");

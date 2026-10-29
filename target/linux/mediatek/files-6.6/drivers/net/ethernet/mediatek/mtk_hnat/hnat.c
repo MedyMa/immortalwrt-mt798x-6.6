@@ -95,7 +95,8 @@ int hnat_tunnel_register(const struct hnat_tunnel_ops *ops)
 	int ret = 0;
 
 	if (!ops || !ops->decap_offloadable || !ops->decap_offload ||
-	    !ops->encap_offload || !ops->bind_lock || !ops->bind_unlock)
+	    !ops->encap_offload || !ops->bind_lock || !ops->rx_bind_lock ||
+	    !ops->bind_unlock)
 		return -EINVAL;
 	mutex_lock(&hnat_tunnel_lock);
 	if (!hnat_external_callback_enter())
@@ -183,6 +184,21 @@ bool hnat_tunnel_bind_lock(struct net_device *dev, struct hnat_tunnel_token *tok
 	ops = rcu_dereference_bh(hnat_tunnel_ops);
 	if (ops && token->epoch == READ_ONCE(hnat_tunnel_epoch) &&
 	    ops->bind_lock(dev, token)) {
+		token->ops = ops;
+		return true;
+	}
+	rcu_read_unlock_bh();
+	return false;
+}
+
+bool hnat_tunnel_rx_bind_lock(const struct mtk_npu_rx_meta *meta,
+			       struct hnat_tunnel_token *token)
+{
+	const struct hnat_tunnel_ops *ops;
+
+	rcu_read_lock_bh();
+	ops = rcu_dereference_bh(hnat_tunnel_ops);
+	if (ops && ops->rx_bind_lock(meta, token)) {
 		token->ops = ops;
 		return true;
 	}
@@ -1305,6 +1321,7 @@ static int hnat_remove(struct platform_device *pdev)
 {
 	int i;
 
+	hnat_npu_mcast_remove(hnat_priv);
 	hnat_flow_gc_stop();
 	platform_set_drvdata(pdev, NULL);
 

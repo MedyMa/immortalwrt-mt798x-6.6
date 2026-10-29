@@ -8,6 +8,10 @@
 #ifndef _NPU_H_
 #define _NPU_H_
 
+#include <linux/types.h>
+
+bool mtk_npu_is_ready(void);
+
 #define CORE_NPU_MASK				(GENMASK(CORE_NPU_NUM - 1, 0))
 
 enum core_id {

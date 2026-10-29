@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/*
- * Copyright (c) 2026 MediaTek Inc. All Rights Reserved.
- *
- * Author: Ren-Ting Wang <ren-ting.wang@mediatek.com>
- */
+/* Copyright (c) 2026 MediaTek Inc. All Rights Reserved. */
 
 #include <linux/err.h>
-#include <linux/io.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/platform_device.h>
+#include <linux/rwsem.h>
+#include <linux/mutex.h>
 
+#include "npu/dpdk.h"
+#include "npu/mcu.h"
 #include "npu/net-core.h"
 #include "npu-dpdk/cdev.h"
 #include "npu-dpdk/internal.h"
@@ -21,53 +16,31 @@
 #include "npu-dpdk/sysfs.h"
 
 struct npu_dpdk_dev ndpdk;
+static DECLARE_RWSEM(dpdk_access);
+static DEFINE_MUTEX(dpdk_lifecycle);
+static unsigned long dpdk_generation;
+static enum {
+	DPDK_DOWN, DPDK_STARTING, DPDK_READY, DPDK_RECOVERING, DPDK_FAILED
+} dpdk_state;
 
-static int mtk_npu_dpdk_device_init(void)
+int mtk_npu_dpdk_access_begin(void)
 {
-	struct platform_device *pdev;
-	struct device_node *node;
-	struct resource *res;
-	int ret = 0;
-
-	node = of_find_compatible_node(NULL, NULL, "mediatek,npu");
-	if (!node) {
-		/* for legacy NPU name, should be removed after openwrt-21.02 deprecated */
-		node = of_find_compatible_node(NULL, NULL, "mediatek,tops");
-		if (!node) {
-			pr_notice("Cannot find NPU device node\n");
-			return -ENODEV;
-		}
+	down_read(&dpdk_access);
+	if (dpdk_state != DPDK_READY || !mtk_npu_mcu_alive()) {
+		up_read(&dpdk_access);
+		return -ENODEV;
 	}
+	return 0;
+}
 
-	pdev = of_find_device_by_node(node);
-	if (!pdev) {
-		pr_notice("Cannot find NPU platform device\n");
-		ret = -ENODEV;
-		goto out;
-	}
+void mtk_npu_dpdk_access_end(void)
+{
+	up_read(&dpdk_access);
+}
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "npu-base");
-	if (!res) {
-		/* for legacy NPU name, should be removed after openwrt-21.02 deprecated */
-		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "tops-base");
-		if (!res) {
-			ret = -ENXIO;
-			goto out;
-		}
-	}
-
-	ndpdk.base = devm_ioremap(&pdev->dev, res->start, resource_size(res));
-	if (!ndpdk.base) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	ndpdk.dev = &pdev->dev;
-
-out:
-	of_node_put(node);
-
-	return ret;
+unsigned long mtk_npu_dpdk_generation(void)
+{
+	return dpdk_generation;
 }
 
 static int mtk_npu_dpdk_enable(bool en)
@@ -78,84 +51,170 @@ static int mtk_npu_dpdk_enable(bool en)
 		.arg[0] = en,
 	};
 
-	mtk_npu_net_send_cmd_all_no_wait(&cmd);
+	return mtk_npu_net_send_cmd_all_no_wait(&cmd);
+}
 
+static int mtk_npu_dpdk_before_reset(struct mcu_state_notifier *notifier)
+{
+	down_write(&dpdk_access);
+	if (dpdk_state == DPDK_READY || dpdk_state == DPDK_FAILED)
+		dpdk_state = DPDK_RECOVERING;
+	up_write(&dpdk_access);
 	return 0;
 }
 
-static int __init mtk_npu_dpdk_init(void)
+static int mtk_npu_dpdk_after_reset(struct mcu_state_notifier *notifier)
+{
+	int ret = 0;
+
+	down_write(&dpdk_access);
+	if (dpdk_state != DPDK_RECOVERING)
+		goto out;
+	ret = mtk_npu_dpdk_enable(true);
+	if (!ret)
+		ret = mtk_npu_dpdk_mac_filter_restore();
+	if (ret) {
+		mtk_npu_dpdk_enable(false);
+		dpdk_state = DPDK_FAILED;
+		NPU_ERR("firmware state replay failed: %d\n", ret);
+	} else {
+		dpdk_state = DPDK_READY;
+	}
+out:
+	up_write(&dpdk_access);
+	return ret;
+}
+
+static struct mcu_state_notifier dpdk_stop_notifier = {
+	.pre_enter = mtk_npu_dpdk_before_reset,
+};
+static struct mcu_state_notifier dpdk_init_notifier = {
+	.post_enter = mtk_npu_dpdk_after_reset,
+};
+static struct mcu_state_notifier dpdk_freerun_notifier = {
+	/* A warm reset may return from NETSTOP without passing through INIT. */
+	.pre_enter = mtk_npu_dpdk_after_reset,
+};
+
+int mtk_npu_dpdk_start(struct platform_device *pdev, void __iomem *base,
+		       resource_size_t size)
 {
 	int ret;
 
-	ret = mtk_npu_dpdk_device_init();
-	if (ret) {
-		pr_notice("find npu device for dpdk failed: %d\n", ret);
-		return ret;
+	if (!pdev || !base || !size)
+		return -EINVAL;
+	mutex_lock(&dpdk_lifecycle);
+	down_write(&dpdk_access);
+	if (dpdk_state != DPDK_DOWN) {
+		ret = -EBUSY;
+		goto out;
 	}
-
-	ret = mtk_npu_dpdk_cdev_init();
-	if (ret) {
-		NPU_NOTICE("dpdk character device init failed: %d\n", ret);
-		return ret;
-	}
-
+	ndpdk.dev = &pdev->dev;
+	ndpdk.base = base;
+	ndpdk.size = size;
+	dpdk_state = DPDK_STARTING;
 	ret = mtk_npu_dpdk_enable(true);
-	if (ret) {
-		NPU_NOTICE("dpdk cmd set failed: %d\n", ret);
-		goto cdev_deinit;
-	}
-
+	if (ret)
+		goto disable;
 	ret = mtk_npu_dpdk_mac_filter_init();
-	if (ret) {
-		NPU_NOTICE("dpdk mac filter init failed: %d\n", ret);
-		goto dpdk_disable;
-	}
+	if (ret)
+		goto disable;
+	up_write(&dpdk_access);
 
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_NETSTOP,
+						 &dpdk_stop_notifier);
+	if (ret)
+		goto filter_deinit;
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_INIT,
+						 &dpdk_init_notifier);
+	if (ret)
+		goto unregister_stop;
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_FREERUN,
+						 &dpdk_freerun_notifier);
+	if (ret)
+		goto unregister_init;
 	ret = mtk_npu_dpdk_procfs_init();
-	if (ret) {
-		NPU_NOTICE("dpdk procfs init failed: %d\n", ret);
-		goto mac_filter_deinit;
-	}
-
+	if (ret)
+		goto unregister_freerun;
 	ret = mtk_npu_dpdk_sysfs_init();
-	if (ret) {
-		NPU_NOTICE("dpdk sysfs init failed: %d\n", ret);
-		goto dpdk_procfs_deinit;
+	if (ret)
+		goto procfs_deinit;
+	/* Publish the ioctl interface last. Opens remain blocked until READY. */
+	down_write(&dpdk_access);
+	dpdk_generation++;
+	up_write(&dpdk_access);
+	ret = mtk_npu_dpdk_cdev_init();
+	if (ret)
+		goto sysfs_deinit;
+
+	down_write(&dpdk_access);
+	/* Re-fetch the firmware address after notifier registration as a reset
+	 * may have occurred during setup. No user operation has been admitted.
+	 */
+	if (!mtk_npu_mcu_alive())
+		ret = -EBUSY;
+	else
+		ret = mtk_npu_dpdk_enable(true);
+	if (!ret)
+		ret = mtk_npu_dpdk_mac_filter_restore();
+	if (!ret)
+		dpdk_state = DPDK_READY;
+	up_write(&dpdk_access);
+	if (!ret) {
+		mutex_unlock(&dpdk_lifecycle);
+		return 0;
 	}
-
-	return ret;
-
-dpdk_procfs_deinit:
-	mtk_npu_dpdk_procfs_deinit();
-
-mac_filter_deinit:
-	mtk_npu_dpdk_mac_filter_deinit();
-
-dpdk_disable:
-	mtk_npu_dpdk_enable(false);
-
-cdev_deinit:
 	mtk_npu_dpdk_cdev_deinit();
-
-	return ret;
-}
-
-static void __exit mtk_npu_dpdk_exit(void)
-{
+sysfs_deinit:
 	mtk_npu_dpdk_sysfs_deinit();
-
+procfs_deinit:
 	mtk_npu_dpdk_procfs_deinit();
-
+unregister_freerun:
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_FREERUN, &dpdk_freerun_notifier);
+unregister_init:
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_INIT, &dpdk_init_notifier);
+unregister_stop:
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_NETSTOP, &dpdk_stop_notifier);
+filter_deinit:
+	down_write(&dpdk_access);
 	mtk_npu_dpdk_mac_filter_deinit();
-
+disable:
 	mtk_npu_dpdk_enable(false);
-
-	mtk_npu_dpdk_cdev_deinit();
+	ndpdk.dev = NULL;
+	ndpdk.base = NULL;
+	ndpdk.size = 0;
+	dpdk_state = DPDK_DOWN;
+out:
+	up_write(&dpdk_access);
+	mutex_unlock(&dpdk_lifecycle);
+	return ret;
 }
 
-module_init(mtk_npu_dpdk_init);
-module_exit(mtk_npu_dpdk_exit);
-
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("MediaTek Network Processor Unit with DPDK function");
-MODULE_AUTHOR("Ren-Ting Wang <ren-ting.wang@mediatek.com>");
+void mtk_npu_dpdk_stop(void)
+{
+	mutex_lock(&dpdk_lifecycle);
+	down_write(&dpdk_access);
+	if (dpdk_state == DPDK_DOWN) {
+		up_write(&dpdk_access);
+		mutex_unlock(&dpdk_lifecycle);
+		return;
+	}
+	/* Drain readers and deny existing fds before removing their endpoints. */
+	dpdk_state = DPDK_DOWN;
+	up_write(&dpdk_access);
+	/* Callbacks take dpdk_access: never unregister while holding it. */
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_FREERUN, &dpdk_freerun_notifier);
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_INIT, &dpdk_init_notifier);
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_NETSTOP, &dpdk_stop_notifier);
+	mtk_npu_dpdk_cdev_deinit();
+	mtk_npu_dpdk_sysfs_deinit();
+	mtk_npu_dpdk_procfs_deinit();
+	down_write(&dpdk_access);
+	mtk_npu_dpdk_mac_filter_deinit();
+	mtk_npu_dpdk_enable(false);
+	ndpdk.dev = NULL;
+	ndpdk.base = NULL;
+	ndpdk.size = 0;
+	up_write(&dpdk_access);
+	mutex_unlock(&dpdk_lifecycle);
+}

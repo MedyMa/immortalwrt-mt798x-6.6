@@ -50,6 +50,7 @@ struct npu_tnl_info;
 struct npu_tnl_type;
 struct npu_tnl_input;
 struct hnat_tunnel_token;
+struct mtk_npu_flow_token;
 struct npu_tnl_params;
 
 typedef int (*tnl_info_setup_func_t)(struct npu_tnl_input *tnl_input,
@@ -122,6 +123,7 @@ struct npu_cls_entry {
 
 struct npu_tnl_info_ops {
 	void (*flush)(struct npu_tnl_info *tnl_info);
+	void (*flush_index)(u32 index);
 	int (*cls_setup)(struct npu_tnl_info *tnl_info);
 	void (*cls_destroy)(struct npu_tnl_info *tnl_info);
 };
@@ -138,6 +140,8 @@ struct npu_tnl_info {
 	struct net_device *underlay, *egress;
 	u32 egress_flags;
 	u16 vlan_proto, vlan_tci, pppoe_sid;
+	u64 session_cookie;
+	u64 allocation_cookie;
 	struct npu_tnl_info_ops *ops;
 	bool pce_ready;
 	u64 generation;
@@ -187,6 +191,12 @@ struct npu_tnl_type {
 	bool (*tnl_param_match)(struct npu_params *p, struct npu_params *target);
 	/* recover essential parameters before updating */
 	void (*tnl_param_restore)(struct npu_params *old, struct npu_params *new);
+	/* Host-only session lifetime, outside the firmware parameter ABI. */
+	int (*tnl_session_prepare)(struct npu_tnl_input *input,
+				   struct npu_params *params);
+	int (*tnl_session_get)(struct npu_tnl_info *info, u64 cookie,
+			       struct npu_params *params);
+	void (*tnl_session_put)(struct npu_tnl_info *info);
 	bool has_inner_eth;
 	u16 max_mtu;
 
@@ -196,17 +206,24 @@ struct npu_tnl_type {
 	void (*tnl_statistic_clear)(struct npu_tnl_type *tnl_type);
 };
 
+enum npu_tnl_input_kind {
+	NPU_TNL_INPUT_HNAT,
+	NPU_TNL_INPUT_FLOW,
+};
+
 struct npu_tnl_input {
+	enum npu_tnl_input_kind kind;
+	u64 session_cookie;
 	union {
 		struct npu_tnl_hnat_input {
 			struct sk_buff *skb;
 			struct net_device *dev;
 			u64 *generation;
-			const struct hnat_tunnel_token *token;
+			struct hnat_tunnel_token *token;
 		} hnat;
 		struct npu_tnl_flow_input {
 			const struct net_device_path *path;
-			u32 *entry;
+			struct mtk_npu_flow_token *token;
 		} flow;
 	};
 };
@@ -264,12 +281,18 @@ void mtk_npu_tnl_info_delete(struct npu_tnl_info *tnl_info);
 void mtk_npu_tnl_info_hash_no_lock(struct npu_tnl_info *tnl_info);
 void mtk_npu_tnl_info_hash(struct npu_tnl_info *tnl_info);
 void mtk_npu_tnl_info_flush_ppe(struct npu_tnl_info *tnl_info);
+void mtk_npu_tnl_info_retire_session(struct npu_tnl_type *type, u64 cookie);
+int mtk_npu_tnl_info_quiesce_ppp(struct net_device *dev);
+void mtk_npu_tnl_info_invalidate_ppp(struct net_device *dev);
+void mtk_npu_tnl_info_invalidate_netdev(struct net_device *dev);
+void mtk_npu_tnl_info_invalidate_neigh(struct net_device *dev, const u8 *ha);
 void mtk_npu_tnl_info_backup_all(void);
 void mtk_npu_tnl_info_restore_all(void);
 void mtk_npu_tnl_info_match_netdev_and_down(struct net_device *ndev,
 		void (*ndev_down_handler)(struct npu_tnl_info *tnl_info));
 
 int mtk_npu_tnl_offload_init(struct platform_device *pdev);
+bool mtk_npu_tnl_offload_ready(void);
 int mtk_npu_tnl_offload_post_init(struct platform_device *pdev);
 void mtk_npu_tnl_offload_stop_worker(void);
 void mtk_npu_tnl_offload_deinit(struct platform_device *pdev);

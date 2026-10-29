@@ -10,6 +10,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/device.h>
+#include <linux/errno.h>
 #include <linux/io.h>
 
 struct npu {
@@ -20,6 +21,7 @@ struct npu {
 };
 
 extern struct npu npu;
+
 
 #define NPU_DBG(fmt, ...)		dev_dbg(npu.dev, fmt, ##__VA_ARGS__)
 #define NPU_INFO(fmt, ...)		dev_info(npu.dev, fmt, ##__VA_ARGS__)

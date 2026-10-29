@@ -181,16 +181,15 @@ int mtk_npu_net_dev_disable(void)
 		.type = NPU_NET_CMD_TYPE_CORE,
 		.sub_type = NPU_NET_CORE_CMD_STOP,
 	};
-	int ret;
+	int ret, disable_ret;
 
 	if (!net_core.ndev || !net_core.ndev->disable)
 		return -ENODEV;
 
 	ret = __mtk_npu_net_send_cmd_all_no_wait(&cmd);
-	if (ret)
-		return ret;
-
-	return net_core.ndev->disable();
+	/* A failed firmware command must not leave the host DMA enabled. */
+	disable_ret = net_core.ndev->disable();
+	return ret ? ret : disable_ret;
 }
 
 int mtk_npu_net_dev_pause(void)

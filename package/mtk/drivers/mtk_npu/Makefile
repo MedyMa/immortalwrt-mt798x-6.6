@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mtk_npu
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 PKG_BUILD_DEPENDS:=pce
 PKG_FILE_DEPENDS:=$(CURDIR)/src/
 SCAN_DEPS = *.mk Config*.in
@@ -44,6 +44,12 @@ define Build/InstallDev
 endef
 
 define Build/Compile
+	$(if $(filter y,$(CONFIG_MTK_NPU_24_10_FLOW_BACKEND)),\
+		$(if $(filter y,$(CONFIG_MTK_NPU_FLOW)),true,\
+			$(error Native NPU FLOW requires kmod-npu-flow with vendor HNAT disabled)))
+	$(if $(filter y,$(CONFIG_MTK_NPU_FLOW)),\
+		grep -q '^CONFIG_NET_MEDIATEK_NPU_FLOW=y' "$(LINUX_DIR)/.config" && \
+		! grep -q '^CONFIG_NET_MEDIATEK_HNAT=[ym]' "$(LINUX_DIR)/.config")
 	$(MAKE) -C "$(LINUX_DIR)" \
 		$(KERNEL_MAKE_FLAGS) \
 		M="$(PKG_BUILD_DIR)" \

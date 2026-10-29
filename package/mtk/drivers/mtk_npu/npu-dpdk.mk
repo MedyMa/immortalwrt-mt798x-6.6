@@ -20,10 +20,10 @@ define KernelPackage/npu-dpdk
   CATEGORY:=MTK Properties
   SUBMENU:=Drivers
   TITLE:=MediaTek Network Processor Unit with DPDK Feature
-  FILES+=$(PKG_BUILD_DIR)/npu-dpdk/npu-dpdk.ko
+  DEFAULT:=y if MTK_NPU_24_10_DPDK_BACKEND
   KCONFIG:=
   DEPENDS:= \
-	@MTK_NPU_24_10_OTHER_BACKENDS \
+	@MTK_NPU_24_10_DPDK_BACKEND \
 	kmod-npu \
 	+@MTK_NPU_DPDK
 endef
@@ -37,7 +37,6 @@ define KernelPackage/npu-dpdk-autoload
   CATEGORY:=MTK Properties
   SUBMENU:=Drivers
   TITLE:= MediaTek Network Processor Unit with DPDK Feature Auto Load
-  AUTOLOAD:=$(call AutoLoad,71,npu-dpdk)
   KCONFIG:=
   DEPENDS:= \
 	kmod-npu-dpdk \

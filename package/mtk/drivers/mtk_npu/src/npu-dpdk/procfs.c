@@ -10,10 +10,11 @@
 
 #include "npu/procfs.h"
 
+#include "npu-dpdk/internal.h"
 #include "npu-dpdk/mac-filter.h"
 #include "npu-dpdk/procfs.h"
 
-static int mac_filter_show(struct seq_file *s, void *private)
+static int mac_filter_show_active(struct seq_file *s, void *private)
 {
 	struct npu_dpdk_mac_info minfo;
 	u32 i = 0;
@@ -37,6 +38,17 @@ static int mac_filter_show(struct seq_file *s, void *private)
 	}
 
 	return 0;
+}
+
+static int mac_filter_show(struct seq_file *s, void *private)
+{
+	int ret = mtk_npu_dpdk_access_begin();
+
+	if (ret)
+		return ret;
+	ret = mac_filter_show_active(s, private);
+	mtk_npu_dpdk_access_end();
+	return ret;
 }
 
 static int mac_filter_open(struct inode *inode, struct file *file)

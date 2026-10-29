@@ -202,10 +202,19 @@ static int mtk_npu_netsys_ppe_num_init(struct platform_device *pdev)
 	u32 val = 0;
 	int ret = 0;
 
-	/* Todo: nf_hnat and flowblock has different way to get ppe_num
-	 * Maybe we could seperate ppe_num_init in npu-nf_hnat.ko and
-	 * npu-flow.ko
-	 */
+#if IS_ENABLED(CONFIG_MTK_NPU_FLOW)
+	unsigned int i;
+
+	if (!netsys.eth || !netsys.eth->soc->ppe_num ||
+	    netsys.eth->soc->ppe_num > ARRAY_SIZE(netsys.eth->ppe))
+		return -ENODEV;
+	for (i = 0; i < netsys.eth->soc->ppe_num; i++)
+		if (!netsys.eth->ppe[i] || !netsys.eth->ppe[i]->foe_table)
+			return -EPROBE_DEFER;
+	netsys.ppe_num = netsys.eth->soc->ppe_num;
+	return 0;
+#endif
+
 	netsys.ppe_num = 3;
 
 	hnat = of_parse_phandle(pdev->dev.of_node, "hnat", 0);
@@ -221,6 +230,8 @@ static int mtk_npu_netsys_ppe_num_init(struct platform_device *pdev)
 		netsys.ppe_num = val;
 
 	of_node_put(hnat);
+	if (!netsys.ppe_num || netsys.ppe_num > ARRAY_SIZE(netsys.eth->ppe))
+		return -ERANGE;
 
 	return 0;
 }
@@ -230,8 +241,8 @@ static void mtk_npu_netsys_dsa_mode_init(struct platform_device *pdev)
 	struct device_node *node;
 
 	node = of_find_node_by_name(NULL, "switch");
-	if (node)
-		netsys.dsa_mode = true;
+	netsys.dsa_mode = node && of_device_is_available(node);
+	of_node_put(node);
 }
 
 int mtk_npu_netsys_init(struct platform_device *pdev)

@@ -18,6 +18,11 @@
 static DECLARE_BITMAP(seq_gen_used, NPU_SEQ_GEN_IDX_MAX);
 static DEFINE_SPINLOCK(seq_gen_used_lock);
 
+bool mtk_npu_seq_gen_available(void)
+{
+	return npu.base && npu.size >= SEQ_GEN_H(NPU_SEQ_GEN_IDX_MAX - 1) + sizeof(u32);
+}
+
 static inline u32 seq_gen_read(u32 reg)
 {
 	return readl(npu.base + reg);
@@ -30,7 +35,7 @@ static inline void seq_gen_write(u32 reg, u32 val)
 
 static inline int seq_gen_read_16(u32 seq_gen_idx, u16 *val)
 {
-	if (seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX)
+	if (seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX || !mtk_npu_seq_gen_available())
 		return -EINVAL;
 
 	*val = (u16)seq_gen_read(SEQ_GEN_L(seq_gen_idx));
@@ -40,7 +45,7 @@ static inline int seq_gen_read_16(u32 seq_gen_idx, u16 *val)
 
 static inline void seq_gen_write_16(u32 seq_gen_idx, u16 val)
 {
-	if (seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX)
+	if (seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX || !mtk_npu_seq_gen_available())
 		return;
 
 	seq_gen_write(SEQ_GEN_L(seq_gen_idx), (u32)val);
@@ -50,7 +55,7 @@ static inline int seq_gen_read_32(u32 seq_gen_idx, u32 *val)
 {
 	u32 val_h, val_l;
 
-	if (seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX)
+	if (seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX || !mtk_npu_seq_gen_available())
 		return -EINVAL;
 
 	val_l = seq_gen_read(SEQ_GEN_L(seq_gen_idx));
@@ -66,7 +71,7 @@ static inline int seq_gen_read_32(u32 seq_gen_idx, u32 *val)
 
 static inline void seq_gen_write_32(u32 seq_gen_idx, u32 val)
 {
-	if (seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX)
+	if (seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX || !mtk_npu_seq_gen_available())
 		return;
 
 	seq_gen_write(SEQ_GEN_L(seq_gen_idx), (val & 0xFFFF));
@@ -75,23 +80,29 @@ static inline void seq_gen_write_32(u32 seq_gen_idx, u32 val)
 
 static void mtk_npu_seq_gen_set_16_no_lock(int seq_gen_idx, u16 val)
 {
-	if (unlikely(!test_bit(seq_gen_idx, seq_gen_used)))
+	if (unlikely((unsigned int)seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX ||
+		     !test_bit(seq_gen_idx, seq_gen_used)))
 		return;
 
 	seq_gen_write_16(seq_gen_idx, val);
 }
 
-static void mtk_npu_seq_gen_set_32_no_lock(int seq_gen_idx, u32 val)
+static int mtk_npu_seq_gen_set_32_no_lock(int seq_gen_idx, u32 val)
 {
-	if (unlikely(!test_bit(seq_gen_idx, seq_gen_used)))
-		return;
+	if (unlikely((unsigned int)seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX ||
+		     !test_bit(seq_gen_idx, seq_gen_used)))
+		return -EINVAL;
+	if (!mtk_npu_seq_gen_available())
+		return -ENODEV;
 
 	seq_gen_write_32(seq_gen_idx, val);
+	return 0;
 }
 
 static int mtk_npu_seq_gen_next_16_no_lock(int seq_gen_idx, u16 *val)
 {
-	if (unlikely(!val || !test_bit(seq_gen_idx, seq_gen_used)))
+	if (unlikely(!val || (unsigned int)seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX ||
+		     !test_bit(seq_gen_idx, seq_gen_used)))
 		return -EINVAL;
 
 	return seq_gen_read_16(seq_gen_idx, val);
@@ -99,7 +110,8 @@ static int mtk_npu_seq_gen_next_16_no_lock(int seq_gen_idx, u16 *val)
 
 static int mtk_npu_seq_gen_next_32_no_lock(int seq_gen_idx, u32 *val)
 {
-	if (unlikely(!val || !test_bit(seq_gen_idx, seq_gen_used)))
+	if (unlikely(!val || (unsigned int)seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX ||
+		     !test_bit(seq_gen_idx, seq_gen_used)))
 		return -EINVAL;
 
 	return seq_gen_read_32(seq_gen_idx, val);
@@ -130,15 +142,17 @@ int mtk_npu_seq_gen_next_16(int seq_gen_idx, u16 *val)
 	return ret;
 }
 
-void mtk_npu_seq_gen_set_32(int seq_gen_idx, u32 val)
+int mtk_npu_seq_gen_set_32(int seq_gen_idx, u32 val)
 {
 	unsigned long flag;
+	int ret;
 
 	spin_lock_irqsave(&seq_gen_used_lock, flag);
 
-	mtk_npu_seq_gen_set_32_no_lock(seq_gen_idx, val);
+	ret = mtk_npu_seq_gen_set_32_no_lock(seq_gen_idx, val);
 
 	spin_unlock_irqrestore(&seq_gen_used_lock, flag);
+	return ret;
 }
 
 int mtk_npu_seq_gen_next_32(int seq_gen_idx, u32 *val)
@@ -187,6 +201,9 @@ int mtk_npu_seq_gen_alloc(int *seq_gen_idx)
 
 static void mtk_npu_seq_gen_free_no_lock(int seq_gen_idx)
 {
+	if ((unsigned int)seq_gen_idx >= NPU_SEQ_GEN_IDX_MAX)
+		return;
+
 	clear_bit(seq_gen_idx, seq_gen_used);
 }
 

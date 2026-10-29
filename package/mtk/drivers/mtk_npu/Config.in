@@ -20,15 +20,46 @@ source "$(SOURCE)/Config-features.in"
 # reconciliation still require board validation. Keep an explicit opt-out.
 config MTK_NPU_24_10_TUNNEL_BACKEND
 	bool "Enable 24.10 TOPS/HNAT tunnel backend"
+	depends on !MTK_NPU_24_10_DPDK_BACKEND
+	depends on !MTK_NPU_24_10_FLOW_BACKEND
 	default y
 	help
-	  Integrated HNAT backend for basic IPv4 GRETAP, VXLAN and L2TPv2.
+	  Integrated HNAT backend for basic IPv4 GRETAP, VXLAN, L2TPv2 and PPTP.
 	  Unsupported packets keep software forwarding. Requires matching kernel,
 	  Ethernet, HNAT, PCE and PPP providers; do not mix old kernel modules.
+
+config MTK_NPU_24_10_MCAST_BACKEND
+	bool "Enable 24.10 TOPS/HNAT multicast backend"
+	depends on !MTK_NPU_24_10_DPDK_BACKEND
+	depends on !MTK_NPU_24_10_FLOW_BACKEND
+	default y
+	help
+	  Replicate IPv4/IPv6 ASM bridge groups through the NPU using kernel
+	  MDB membership. Unsupported clients, source filters and VLAN groups
+	  retain software forwarding.
+
+config MTK_NPU_24_10_FLOW_BACKEND
+	bool "Use the native Linux flowtable NPU backend"
+	depends on !MTK_NPU_24_10_DPDK_BACKEND
+	default n
+	help
+	  Optional alternative to vendor HNAT, using the native PPE driver.
+	  Supports plain IPv4 PPTP and L2TPv2 over the Ethernet GMAC2/GMAC3
+	  underlay. Select kmod-npu-flow and disable vendor HNAT and drivers
+	  which require it. HNAT remains the main router backend for GRETAP,
+	  VXLAN, VLAN/PPPoE adaptation, multicast and vendor WiFi acceleration.
 
 config MTK_NPU_24_10_OTHER_BACKENDS
 	bool
 	default n
+
+config MTK_NPU_24_10_DPDK_BACKEND
+	bool "Use the exclusive NPU DPDK MAC-filter backend"
+	default n
+	help
+	  Select the vendor's customized DPDK MAC-filter mode instead of the
+	  router tunnel/HNAT backend. This does not provide a full userspace
+	  DPDK packet-processing stack. The two firmware modes cannot coexist.
 
 config MTK_NPU_SECURE_FW
 	bool "NPU Secure Firmware Load"
@@ -58,6 +89,7 @@ config MTK_NPU_THERMAL
 
 config MTK_NPU_LOGGER
 	bool "NPU Logger"
+	depends on KERNEL_DEBUG_FS
 	default n
 	help
 	  Set y to enable logger feature which logs the firmware log to relayfs.
@@ -102,7 +134,7 @@ config MTK_NPU_FLOW
 
 config MTK_NPU_MCAST
 	bool
-	depends on PACKAGE_kmod-npu-mcast
+	depends on PACKAGE_kmod-npu-mcast && MTK_NPU_24_10_MCAST_BACKEND
 	help
 	  set y to enable NPU network offload feature with IPv4/IPv6 multicast
 	  support.

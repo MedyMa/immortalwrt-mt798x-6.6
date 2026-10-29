@@ -15,7 +15,8 @@
 
 void mtk_npu_seq_gen_set_16(int seq_gen_idx, u16 val);
 int mtk_npu_seq_gen_next_16(int seq_gen_idx, u16 *val);
-void mtk_npu_seq_gen_set_32(int seq_gen_idx, u32 val);
+bool mtk_npu_seq_gen_available(void);
+int mtk_npu_seq_gen_set_32(int seq_gen_idx, u32 val);
 int mtk_npu_seq_gen_next_32(int seq_gen_idx, u32 *val);
 int mtk_npu_seq_gen_alloc(int *seq_gen_idx);
 void mtk_npu_seq_gen_free(int seq_gen_idx);

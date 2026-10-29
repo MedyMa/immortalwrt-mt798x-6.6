@@ -10,15 +10,22 @@
 
 #include <linux/types.h>
 
-int mtk_npu_pptp_seq_get_seq_gen_idx(u16 call_id, int *seq_gen_idx);
-int mtk_npu_pptp_seq_alloc(u16 call_id, u32 start, int *seq_gen_idx);
-void mtk_npu_pptp_seq_free(u16 call_id);
-void mtk_npu_pptp_seq_init(void);
+struct npu_tnl_type;
+struct npu_tnl_input;
+struct npu_tnl_info;
+struct npu_params;
+
+int mtk_npu_pptp_seq_init(struct npu_tnl_type *type);
 void mtk_npu_pptp_seq_deinit(void);
+int mtk_npu_pptp_session_prepare(struct npu_tnl_input *input, struct npu_params *params);
+int mtk_npu_pptp_session_get(struct npu_tnl_info *info, u64 cookie, struct npu_params *params);
+void mtk_npu_pptp_session_put(struct npu_tnl_info *info);
 
 #if defined(CONFIG_MTK_NPU_PPTP)
 int mtk_npu_pptp_init(void);
 void mtk_npu_pptp_deinit(void);
+void mtk_npu_pptp_seq_suspend_stalled(void);
+void mtk_npu_pptp_seq_resume_stalled(void);
 #else /* !defined(CONFIG_MTK_NPU_PPTP) */
 static inline int mtk_npu_pptp_init(void)
 {
@@ -28,5 +35,7 @@ static inline int mtk_npu_pptp_init(void)
 static inline void mtk_npu_pptp_deinit(void)
 {
 }
+static inline void mtk_npu_pptp_seq_suspend_stalled(void) { }
+static inline void mtk_npu_pptp_seq_resume_stalled(void) { }
 #endif /* defined(CONFIG_MTK_NPU_PPTP) */
 #endif /* _NPU_PPTP_H_ */

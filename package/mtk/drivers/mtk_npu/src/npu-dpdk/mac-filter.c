@@ -18,9 +18,29 @@ struct npu_mac_filter {
 	DECLARE_BITMAP(used, NPU_DPDK_MAC_FILTER_NUM);
 	DECLARE_HASHTABLE(ht, NPU_DPDK_MAC_FILTER_MAP_BIT);
 	u32 table_ofs;
+	u16 ports_configured;
+	u16 ports_enabled;
+	bool enabled;
+	bool dirty;
 };
 
 static struct npu_mac_filter npu_mf;
+static int __mtk_npu_dpdk_mac_filter_restore(void);
+
+/* A timeout can follow a committed firmware update. Preserve host ownership
+ * and reconcile the complete desired table before the next mutation.
+ */
+static int npu_dpdk_mac_filter_result(int ret)
+{
+	if (ret)
+		npu_mf.dirty = true;
+	return ret;
+}
+
+static int npu_dpdk_mac_filter_reconcile(void)
+{
+	return npu_mf.dirty ? __mtk_npu_dpdk_mac_filter_restore() : 0;
+}
 
 static inline int npu_dpdk_mac_addr_fw_update(u32 idx)
 {
@@ -31,10 +51,10 @@ static inline int npu_dpdk_mac_addr_fw_update(u32 idx)
 		.arg[1] = idx,
 	};
 
-	return mtk_npu_net_send_cmd_mgmt(&cmd);
+	return npu_dpdk_mac_filter_result(mtk_npu_net_send_cmd_mgmt(&cmd));
 }
 
-static inline void npu_dpdk_mac_addr_fw_invalidate(u32 idx)
+static inline int npu_dpdk_mac_addr_fw_invalidate(u32 idx)
 {
 	/* idx == NPU_DPDK_MAC_FILTER_NUM is a special "clear all" signal to FW */
 	struct net_cmd cmd = {
@@ -44,7 +64,7 @@ static inline void npu_dpdk_mac_addr_fw_invalidate(u32 idx)
 		.arg[1] = idx,
 	};
 
-	mtk_npu_net_send_cmd_offload_no_wait(&cmd);
+	return npu_dpdk_mac_filter_result(mtk_npu_net_send_cmd_offload_no_wait(&cmd));
 }
 
 static inline int npu_dpdk_mac_addr_fw_delete(u32 idx)
@@ -57,7 +77,7 @@ static inline int npu_dpdk_mac_addr_fw_delete(u32 idx)
 		.arg[1] = idx,
 	};
 
-	return mtk_npu_net_send_cmd_mgmt(&cmd);
+	return npu_dpdk_mac_filter_result(mtk_npu_net_send_cmd_mgmt(&cmd));
 }
 
 static inline void npu_dpdk_mac_addr_fw_write(struct npu_dpdk_mac_addr *mac, u32 idx)
@@ -130,9 +150,7 @@ static int mtk_npu_dpdk_mac_filter_entry_update(struct npu_dpdk_mf_entry *entry,
 		return ret;
 	}
 
-	npu_dpdk_mac_addr_fw_invalidate(entry->idx);
-
-	return ret;
+	return npu_dpdk_mac_addr_fw_invalidate(entry->idx);
 }
 
 static int __mtk_npu_dpdk_mac_filter_entry_insert(struct npu_dpdk_mac_addr *mac)
@@ -157,16 +175,13 @@ static int __mtk_npu_dpdk_mac_filter_entry_insert(struct npu_dpdk_mac_addr *mac)
 		return ret;
 	}
 
-	npu_dpdk_mac_addr_fw_invalidate(i);
-
 	entry = &npu_mf.table[i];
 	entry->idx = i;
 	memcpy(&entry->mac, mac, sizeof(entry->mac));
 	INIT_HLIST_NODE(&entry->node);
 	hash_add(npu_mf.ht, &entry->node, npu_dpdk_mac_hash(&entry->mac));
 	set_bit(i, npu_mf.used);
-
-	return ret;
+	return npu_dpdk_mac_addr_fw_invalidate(i);
 }
 
 int mtk_npu_dpdk_mac_filter_entry_insert(struct npu_dpdk_mac_addr *mac)
@@ -174,12 +189,16 @@ int mtk_npu_dpdk_mac_filter_entry_insert(struct npu_dpdk_mac_addr *mac)
 	struct npu_dpdk_mf_entry *entry;
 	int ret = 0;
 
-	if (!mac || !mac->flag)
+	if (!mac || !(mac->flag & MAC_FILTER_PORT_MASK) ||
+	    (mac->flag & ~(MAC_FILTER_PORT_MASK | MAC_FILTER_FLAG_EN)))
 		return -EINVAL;
 
 	mac->flag |= MAC_FILTER_FLAG_EN;
 
 	mutex_lock(&npu_mf.lock);
+	ret = npu_dpdk_mac_filter_reconcile();
+	if (ret)
+		goto unlock;
 
 	entry = mtk_npu_dpdk_mac_filter_entry_find(mac);
 	if (!IS_ERR(entry)) {
@@ -213,7 +232,7 @@ static int __mtk_npu_dpdk_mac_filter_entry_delete(struct npu_dpdk_mf_entry *entr
 		return ret;
 	}
 
-	npu_dpdk_mac_addr_fw_invalidate(entry->idx);
+	ret = npu_dpdk_mac_addr_fw_invalidate(entry->idx);
 
 	npu_dpdk_mac_addr_fw_clear(entry->idx);
 
@@ -238,6 +257,9 @@ int mtk_npu_dpdk_mac_filter_entry_delete(struct npu_dpdk_mac_addr *mac)
 		return 0;
 
 	mutex_lock(&npu_mf.lock);
+	ret = npu_dpdk_mac_filter_reconcile();
+	if (ret)
+		goto unlock;
 
 	entry = mtk_npu_dpdk_mac_filter_entry_find(mac);
 	if (IS_ERR(entry)) {
@@ -273,11 +295,17 @@ static int mtk_npu_dpdk_mac_filter_entry_clear_mcast(const u8 port_id)
 	int ret = 0;
 	u16 port;
 
+	if (port_id > MAC_FILTER_FLAG_WIFI_BIT)
+		return -EINVAL;
+
 	port = BIT(port_id) & MAC_FILTER_PORT_MASK;
 	if (!port)
 		return 0;
 
 	mutex_lock(&npu_mf.lock);
+	ret = npu_dpdk_mac_filter_reconcile();
+	if (ret)
+		goto unlock;
 
 	for_each_set_bit(i, npu_mf.used, NPU_DPDK_MAC_FILTER_NUM) {
 		entry = &npu_mf.table[i];
@@ -296,13 +324,18 @@ static int mtk_npu_dpdk_mac_filter_entry_clear_mcast(const u8 port_id)
 		if (tmp.flag != MAC_FILTER_FLAG_EN) {
 			/* Other flags still active, just update FW */
 			ret = mtk_npu_dpdk_mac_filter_entry_update(entry, &tmp);
+			if (ret)
+				break;
 			continue;
 		}
 
 		/* No active flags remain, remove entry entirely */
 		ret = __mtk_npu_dpdk_mac_filter_entry_delete(entry);
+		if (ret)
+			break;
 	}
 
+unlock:
 	mutex_unlock(&npu_mf.lock);
 
 	return ret;
@@ -314,6 +347,9 @@ static int mtk_npu_dpdk_mac_filter_entry_clear_all(void)
 	u32 i;
 
 	mutex_lock(&npu_mf.lock);
+	ret = npu_dpdk_mac_filter_reconcile();
+	if (ret)
+		goto unlock;
 
 	ret = npu_dpdk_mac_addr_fw_delete(NPU_DPDK_MAC_FILTER_NUM);
 	if (ret) {
@@ -321,7 +357,7 @@ static int mtk_npu_dpdk_mac_filter_entry_clear_all(void)
 		goto unlock;
 	}
 
-	npu_dpdk_mac_addr_fw_invalidate(NPU_DPDK_MAC_FILTER_NUM);
+	ret = npu_dpdk_mac_addr_fw_invalidate(NPU_DPDK_MAC_FILTER_NUM);
 
 	for (i = 0; i < NPU_DPDK_MAC_FILTER_NUM; ++i)
 		npu_dpdk_mac_addr_fw_clear(i);
@@ -407,14 +443,21 @@ static int mtk_npu_dpdk_mac_filter_base_addr_init(void)
 	int ret;
 
 	ret = mtk_npu_net_send_cmd_mgmt(&cmd);
-	if (ret || cmd.return_cnt != 1)
-		return -EINVAL;
+	if (ret)
+		return ret;
+	if (cmd.return_cnt != NET_RET_CNT_1)
+		return -EIO;
+	/* The MCU reports a bus address; bound the entire table before MMIO. */
+	if (!IS_ALIGNED(cmd.ret[0], sizeof(u32)) || cmd.ret[0] < 0x09100000 ||
+	    (u64)cmd.ret[0] - 0x09100000 +
+		 sizeof(struct npu_dpdk_mac_addr) * NPU_DPDK_MAC_FILTER_NUM > ndpdk.size)
+		return -ERANGE;
 	npu_mf.table_ofs = cmd.ret[0] - 0x09100000;
 
 	return ret;
 }
 
-int mtk_npu_dpdk_mac_filter_enable(bool en)
+static int __mtk_npu_dpdk_mac_filter_enable(bool en)
 {
 	struct net_cmd cmd = {
 		.type = NPU_NET_CMD_TYPE_DPDK,
@@ -423,9 +466,21 @@ int mtk_npu_dpdk_mac_filter_enable(bool en)
 		.arg[1] = en,
 	};
 
-	mtk_npu_net_send_cmd_all_no_wait(&cmd);
+	return npu_dpdk_mac_filter_result(mtk_npu_net_send_cmd_all_no_wait(&cmd));
+}
 
-	return 0;
+int mtk_npu_dpdk_mac_filter_enable(bool en)
+{
+	int ret;
+
+	mutex_lock(&npu_mf.lock);
+	ret = npu_dpdk_mac_filter_reconcile();
+	if (!ret)
+		ret = __mtk_npu_dpdk_mac_filter_enable(en);
+	if (!ret)
+		npu_mf.enabled = en;
+	mutex_unlock(&npu_mf.lock);
+	return ret;
 }
 
 static int mtk_npu_dpdk_mac_filter_port_en(u8 port, bool en)
@@ -441,19 +496,33 @@ static int mtk_npu_dpdk_mac_filter_port_en(u8 port, bool en)
 	if (port > MAC_FILTER_LAN_PORT_NUM)
 		return -EINVAL;
 
-	mtk_npu_net_send_cmd_all_no_wait(&cmd);
-
-	return 0;
+	return npu_dpdk_mac_filter_result(mtk_npu_net_send_cmd_all_no_wait(&cmd));
 }
 
 int mtk_npu_dpdk_mac_filter_config(const struct npu_dpdk_mf_cfg *cfg)
 {
+	int ret;
+
 	if (!cfg)
 		return -EINVAL;
 
 	switch (cfg->cfg_type) {
 	case NPU_MF_CONFIG_PORT:
-		return mtk_npu_dpdk_mac_filter_port_en(cfg->port.id, cfg->port.enable);
+		if (cfg->port.enable > 1 || cfg->port.id > MAC_FILTER_LAN_PORT_NUM)
+			return -EINVAL;
+		mutex_lock(&npu_mf.lock);
+		ret = npu_dpdk_mac_filter_reconcile();
+		if (!ret)
+			ret = mtk_npu_dpdk_mac_filter_port_en(cfg->port.id, cfg->port.enable);
+		if (!ret) {
+			npu_mf.ports_configured |= BIT(cfg->port.id);
+			if (cfg->port.enable)
+				npu_mf.ports_enabled |= BIT(cfg->port.id);
+			else
+				npu_mf.ports_enabled &= ~BIT(cfg->port.id);
+		}
+		mutex_unlock(&npu_mf.lock);
+		return ret;
 	default:
 		return -EINVAL;
 	}
@@ -493,6 +562,13 @@ int mtk_npu_dpdk_mac_filter_init(void)
 	int ret;
 
 	mutex_init(&npu_mf.lock);
+	bitmap_zero(npu_mf.used, NPU_DPDK_MAC_FILTER_NUM);
+	hash_init(npu_mf.ht);
+	memset(npu_mf.table, 0, sizeof(npu_mf.table));
+	npu_mf.ports_configured = 0;
+	npu_mf.ports_enabled = 0;
+	npu_mf.enabled = false;
+	npu_mf.dirty = false;
 
 	ret = mtk_npu_dpdk_mac_filter_base_addr_init();
 	if (ret) {
@@ -506,6 +582,55 @@ int mtk_npu_dpdk_mac_filter_init(void)
 		return ret;
 	}
 
+	return ret;
+}
+
+static int __mtk_npu_dpdk_mac_filter_restore(void)
+{
+	unsigned long i;
+	int ret;
+
+	npu_mf.dirty = true;
+	ret = mtk_npu_dpdk_mac_filter_base_addr_init();
+	if (ret)
+		goto out;
+	ret = __mtk_npu_dpdk_mac_filter_enable(false);
+	if (ret)
+		goto out;
+	ret = npu_dpdk_mac_addr_fw_delete(NPU_DPDK_MAC_FILTER_NUM);
+	if (ret)
+		goto out;
+	for_each_set_bit(i, npu_mf.used, NPU_DPDK_MAC_FILTER_NUM) {
+		npu_dpdk_mac_addr_fw_write(&npu_mf.table[i].mac, i);
+		ret = npu_dpdk_mac_addr_fw_update(i);
+		if (ret)
+			goto out;
+	}
+	for (i = 0; i <= MAC_FILTER_LAN_PORT_NUM; i++) {
+		if (!(npu_mf.ports_configured & BIT(i)))
+			continue;
+		ret = mtk_npu_dpdk_mac_filter_port_en(i, npu_mf.ports_enabled & BIT(i));
+		if (ret)
+			goto out;
+	}
+	/* Flush per-core caches after replay, then restore the saved enable bit. */
+	ret = npu_dpdk_mac_addr_fw_invalidate(NPU_DPDK_MAC_FILTER_NUM);
+	if (!ret)
+		ret = __mtk_npu_dpdk_mac_filter_enable(npu_mf.enabled);
+	if (!ret)
+		npu_mf.dirty = false;
+out:
+	return ret;
+}
+
+/* Called with the adapter write gate held before data forwarding resumes. */
+int mtk_npu_dpdk_mac_filter_restore(void)
+{
+	int ret;
+
+	mutex_lock(&npu_mf.lock);
+	ret = __mtk_npu_dpdk_mac_filter_restore();
+	mutex_unlock(&npu_mf.lock);
 	return ret;
 }
 

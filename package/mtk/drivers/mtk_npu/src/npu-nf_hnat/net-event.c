@@ -49,17 +49,13 @@ static void mtk_npu_nf_hnat_netdev_ser(struct net_device *dev)
 		.ser_callback = mtk_npu_nf_hnat_netdev_ser_callback,
 	};
 
+	/* Each FE reset must wait for its own completion, not a previous cycle. */
+	reinit_completion(&wait_fe_reset_done);
 	mtk_npu_ser(&ser_params);
 }
 
-static void mtk_npu_nf_hnat_netdev_down(struct npu_tnl_info *tnl_info)
-{
-	mtk_npu_tnl_info_flush_one_ppe_tnl_no_lock(tnl_info);
 
-	mtk_npu_tnl_info_delete_no_lock(tnl_info);
-}
-
-/* TODO: update tunnel status when user change tunnel parameters */
+/* Device topology, address and MTU changes invalidate cached templates. */
 static int mtk_npu_nf_hnat_netdev_callback(struct notifier_block *nb,
 					   unsigned long event,
 					   void *data)
@@ -74,7 +70,7 @@ static int mtk_npu_nf_hnat_netdev_callback(struct notifier_block *nb,
 	case NETDEV_CHANGEADDR:
 	case NETDEV_CHANGEMTU:
 	case NETDEV_CHANGEUPPER:
-		mtk_npu_tnl_info_match_netdev_and_down(dev, mtk_npu_nf_hnat_netdev_down);
+		mtk_npu_tnl_info_invalidate_netdev(dev);
 		break;
 	case MTK_FE_START_RESET:
 	case MTK_FE_STOP_TRAFFIC:
@@ -112,4 +108,6 @@ int mtk_npu_nf_hnat_net_event_init(void)
 void mtk_npu_nf_hnat_net_event_deinit(void)
 {
 	unregister_netdevice_notifier(&mtk_npu_netdev_notifier);
+	/* A queued SER callback must not wait for an unregistered notifier. */
+	complete_all(&wait_fe_reset_done);
 }

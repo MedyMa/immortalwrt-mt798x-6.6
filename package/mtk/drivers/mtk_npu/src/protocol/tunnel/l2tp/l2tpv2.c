@@ -131,7 +131,7 @@ static int l2tpv2_param_obtain_from_netdev(struct net_device *dev,
 	ret = ppp_netdev_get_tunnel_info(dev, &info);
 	if (ret)
 		return ret;
-	if (info.version != 2)
+	if (info.kind != PPP_TUNNEL_L2TP || info.version != 2)
 		return -EOPNOTSUPP;
 	l2tpp = &params->tunnel.l2tp;
 	l2tpp->dl_tid = htons(info.tunnel_id);
@@ -173,7 +173,7 @@ static inline bool l2tpv2_hdr_valid(struct sk_buff *skb, u16 hdrflags)
 		!(hdrflags & L2TP_HDRFLAG_O));
 }
 
-#if KERNEL_VERSION(6, 12, 0) <= LINUX_VERSION_CODE
+#if IS_ENABLED(CONFIG_MTK_NPU_FLOW)
 static void l2tpv2_tnl_flow_param_setup(const struct net_device_path *path,
 					struct npu_params *params)
 {
@@ -191,6 +191,8 @@ static void l2tpv2_tnl_flow_param_setup(const struct net_device_path *path,
 	ipp->sip = path->tunnel.sip.ip;
 	ipp->dip = path->tunnel.dip.ip;
 	ipp->proto = IPPROTO_UDP;
+	ipp->ttl = path->tunnel.ttl;
+	ipp->tos = path->tunnel.tos;
 
 	params->transport.type = NPU_TRANSPORT_UDP;
 	udpp->sport = path->tunnel.sport;
@@ -474,7 +476,7 @@ static void l2tpv2_tnl_statistic_clear(struct npu_tnl_type *tnl_type)
 static struct npu_tnl_type l2tpv2_type = {
 	.type_name = TYPE_NAME_L2TPV2,
 	.cls_entry_setup = l2tpv2_cls_entry_setup,
-#if KERNEL_VERSION(6, 12, 0) <= LINUX_VERSION_CODE
+#if IS_ENABLED(CONFIG_MTK_NPU_FLOW)
 	.ndev_path_type = DEV_PATH_L2TP,
 	.tnl_flow_param_setup = l2tpv2_tnl_flow_param_setup,
 #endif

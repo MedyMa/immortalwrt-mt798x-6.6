@@ -1,106 +1,101 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/*
- * Copyright (c) 2025 MediaTek Inc. All Rights Reserved.
- *
- * Author: Ren-Ting Wang <ren-ting.wang@mediatek.com>
- */
-
-#include <linux/device.h>
-#include <linux/hashtable.h>
-#include <linux/netdevice.h>
-#include <linux/netfilter.h>
-#include <linux/netfilter_ipv4.h>
+/* Keep firmware templates consistent with the host IPv4 route/ARP policy. */
+#include <linux/inetdevice.h>
 #include <linux/notifier.h>
-#include <net/arp.h>
-#include <net/flow.h>
-#include <net/ip.h>
-#include <net/ip_tunnels.h>
+#include <net/fib_notifier.h>
 #include <net/netevent.h>
-#include <net/net_namespace.h>
 #include <net/neighbour.h>
-#include <net/route.h>
+#include <net/net_namespace.h>
 
 #include "npu/internal.h"
-#include "npu/netsys.h"
+#include "npu/npu.h"
 #include "npu/net-event.h"
-#include "npu/mcu.h"
 #include "npu/tunnel.h"
 
-/* TODO: update tunnel status when user delete or change tunnel parameters */
-/*
- * eth will send out MTK_FE_START_RESET event if detected wdma abnormal, or
- * send out MTK_FE_STOP_TRAFFIC event if detected qdma or adma or tdma abnormal,
- * then do FE reset, so we use the same mcu event to represent it.
- *
- * after FE reset done, eth will send out MTK_FE_START_TRAFFIC event if this is
- * wdma abnormal induced FE reset, or send out MTK_FE_RESET_DONE event for qdma
- * or adma or tdma abnormal induced FE reset.
- */
-static int mtk_npu_netdev_callback(struct notifier_block *nb,
-				   unsigned long event,
-				   void *data)
+static int mtk_npu_netevent_callback(struct notifier_block *nb,
+				     unsigned long event, void *data)
 {
-	int ret = 0;
+	struct neighbour *neigh = data;
+	u8 ha[ETH_ALEN];
 
-	switch (event) {
-	case NETDEV_UP:
-		break;
-	case NETDEV_DOWN:
-		break;
-	default:
-		break;
-	}
-
-	return ret;
+	if (event != NETEVENT_NEIGH_UPDATE || !mtk_npu_is_ready() ||
+	    !neigh || !neigh->dev || dev_net(neigh->dev) != &init_net ||
+	    neigh->tbl->family != AF_INET)
+		return NOTIFY_DONE;
+	neigh_ha_snapshot(ha, neigh, neigh->dev);
+	mtk_npu_tnl_info_invalidate_neigh(neigh->dev,
+		READ_ONCE(neigh->nud_state) & NUD_VALID ? ha : NULL);
+	return NOTIFY_DONE;
 }
 
-static struct notifier_block mtk_npu_netdev_notifier = {
-	.notifier_call = mtk_npu_netdev_callback,
-};
-
-static int mtk_npu_netevent_callback(struct notifier_block *nb,
-				     unsigned long event,
-				     void *data)
+static int mtk_npu_inetaddr_callback(struct notifier_block *nb,
+				    unsigned long event, void *data)
 {
-	int ret = 0;
+	struct in_ifaddr *ifa = data;
 
+	if (mtk_npu_is_ready() && (event == NETDEV_UP || event == NETDEV_DOWN) &&
+	    ifa && ifa->ifa_dev && dev_net(ifa->ifa_dev->dev) == &init_net)
+		mtk_npu_tnl_info_invalidate_netdev(ifa->ifa_dev->dev);
+	return NOTIFY_DONE;
+}
+
+static int mtk_npu_fib_callback(struct notifier_block *nb,
+			       unsigned long event, void *data)
+{
+	struct fib_notifier_info *info = data;
+
+	if (!mtk_npu_is_ready() || !info || info->family != AF_INET)
+		return NOTIFY_DONE;
 	switch (event) {
-	case NETEVENT_NEIGH_UPDATE:
+	case FIB_EVENT_ENTRY_REPLACE:
+	case FIB_EVENT_ENTRY_APPEND:
+	case FIB_EVENT_ENTRY_ADD:
+	case FIB_EVENT_ENTRY_DEL:
+	case FIB_EVENT_RULE_ADD:
+	case FIB_EVENT_RULE_DEL:
+	case FIB_EVENT_NH_ADD:
+	case FIB_EVENT_NH_DEL:
+		/* Route/rule changes may affect any cached tunnel on init_net. */
+		mtk_npu_tnl_info_invalidate_netdev(NULL);
 		break;
 	default:
 		break;
 	}
-
-	return ret;
+	return NOTIFY_DONE;
 }
 
 static struct notifier_block mtk_npu_netevent_notifier = {
 	.notifier_call = mtk_npu_netevent_callback,
 };
+static struct notifier_block mtk_npu_inetaddr_notifier = {
+	.notifier_call = mtk_npu_inetaddr_callback,
+};
+static struct notifier_block mtk_npu_fib_notifier = {
+	.notifier_call = mtk_npu_fib_callback,
+};
 
 int mtk_npu_netevent_register(struct platform_device *pdev)
 {
-	int ret = 0;
-
-	ret = register_netdevice_notifier(&mtk_npu_netdev_notifier);
-	if (ret) {
-		NPU_ERR("NPU register netdev notifier failed: %d\n", ret);
-		return ret;
-	}
+	int ret;
 
 	ret = register_netevent_notifier(&mtk_npu_netevent_notifier);
-	if (ret) {
-		unregister_netdevice_notifier(&mtk_npu_netdev_notifier);
-		NPU_ERR("NPU register net event notifier failed: %d\n", ret);
+	if (ret)
 		return ret;
-	}
-
+	ret = register_inetaddr_notifier(&mtk_npu_inetaddr_notifier);
+	if (ret)
+		goto netevent_remove;
+	ret = register_fib_notifier(&init_net, &mtk_npu_fib_notifier, NULL, NULL);
+	if (!ret)
+		return 0;
+	unregister_inetaddr_notifier(&mtk_npu_inetaddr_notifier);
+netevent_remove:
+	unregister_netevent_notifier(&mtk_npu_netevent_notifier);
 	return ret;
 }
 
 void mtk_npu_netevent_unregister(struct platform_device *pdev)
 {
+	unregister_fib_notifier(&init_net, &mtk_npu_fib_notifier);
+	unregister_inetaddr_notifier(&mtk_npu_inetaddr_notifier);
 	unregister_netevent_notifier(&mtk_npu_netevent_notifier);
-
-	unregister_netdevice_notifier(&mtk_npu_netdev_notifier);
 }

@@ -48,7 +48,7 @@ static void fw_statistic_show_core_offload_fw_tnl(struct seq_file *s,
 			   read16_statistic(&tunnel->tnl_decap_done[i]));
 		seq_printf(s, "tunnel encap fail: %u|tunnel decap fail: %u|\n",
 			   read16_statistic(&tunnel->tnl_encap_fail[i]),
-			   read16_statistic(&tunnel->tnl_encap_fail[i]));
+			   read16_statistic(&tunnel->tnl_decap_fail[i]));
 	}
 }
 

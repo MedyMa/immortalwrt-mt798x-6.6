@@ -158,6 +158,8 @@ int mbox_send_msg(struct mailbox_dev *mdev, struct mailbox_msg *msg, void *priv,
 int register_mbox_dev(enum mbox_act act, struct mailbox_dev *mdev);
 int unregister_mbox_dev(enum mbox_act act, struct mailbox_dev *mdev);
 void mtk_npu_mbox_clear_all_cmd(void);
+void mtk_npu_mbox_irq_enable(void);
+void mtk_npu_mbox_irq_disable(void);
 int mtk_npu_mbox_init(struct platform_device *pdev);
 void mtk_npu_mbox_exit(void);
 #endif /* _NPU_MBOX_H_ */

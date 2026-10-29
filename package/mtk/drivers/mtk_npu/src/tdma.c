@@ -9,6 +9,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -22,6 +23,7 @@
 
 /* TDMA dump length */
 #define TDMA_BASE_LEN				(0x400)
+#define TDMA_IDLE_TIMEOUT_US			(100000)
 
 static int tdma_trm_hw_dump(void *dst, u32 start_addr, u32 len);
 
@@ -86,39 +88,49 @@ static int tdma_trm_hw_dump(void *dst, u32 start_addr, u32 len)
 	return 0;
 }
 
-static inline void tdma_prefetch_enable(bool en)
+static int tdma_wait_idle(u32 reg, u32 busy)
 {
+	u32 val;
+
+	if (mtk_npu_mcu_netsys_fe_rst())
+		return 0;
+
+	return read_poll_timeout(tdma_read, val, !(val & busy), 10,
+				 TDMA_IDLE_TIMEOUT_US, false, reg);
+}
+
+static inline int tdma_prefetch_enable(bool en)
+{
+	int ret, rx_ret;
+
 	if (en) {
 		tdma_set(TDMA_PREF_TX_CFG, PREF_EN);
 		tdma_set(TDMA_PREF_RX_CFG, PREF_EN);
+		return 0;
 	} else {
-		/* wait for prefetch idle */
-		while ((tdma_read(TDMA_PREF_TX_CFG) & PREF_BUSY)
-		       || (tdma_read(TDMA_PREF_RX_CFG) & PREF_BUSY))
-			;
-
-		tdma_write(TDMA_PREF_TX_CFG,
-			   tdma_read(TDMA_PREF_TX_CFG) & (~PREF_EN));
-		tdma_write(TDMA_PREF_RX_CFG,
-			   tdma_read(TDMA_PREF_RX_CFG) & (~PREF_EN));
+		/* Stop new prefetches before waiting for outstanding work. */
+		tdma_clr(TDMA_PREF_TX_CFG, PREF_EN);
+		tdma_clr(TDMA_PREF_RX_CFG, PREF_EN);
+		ret = tdma_wait_idle(TDMA_PREF_TX_CFG, PREF_BUSY);
+		rx_ret = tdma_wait_idle(TDMA_PREF_RX_CFG, PREF_BUSY);
+		return ret ? ret : rx_ret;
 	}
 }
 
-static inline void tdma_writeback_enable(bool en)
+static inline int tdma_writeback_enable(bool en)
 {
+	int ret, rx_ret;
+
 	if (en) {
 		tdma_set(TDMA_WRBK_TX_CFG, WRBK_EN);
 		tdma_set(TDMA_WRBK_RX_CFG, WRBK_EN);
+		return 0;
 	} else {
-		/* wait for write back idle */
-		while ((tdma_read(TDMA_WRBK_TX_CFG) & WRBK_BUSY)
-		       || (tdma_read(TDMA_WRBK_RX_CFG) & WRBK_BUSY))
-			;
-
-		tdma_write(TDMA_WRBK_TX_CFG,
-			   tdma_read(TDMA_WRBK_TX_CFG) & (~WRBK_EN));
-		tdma_write(TDMA_WRBK_RX_CFG,
-			   tdma_read(TDMA_WRBK_RX_CFG) & (~WRBK_EN));
+		tdma_clr(TDMA_WRBK_TX_CFG, WRBK_EN);
+		tdma_clr(TDMA_WRBK_RX_CFG, WRBK_EN);
+		ret = tdma_wait_idle(TDMA_WRBK_TX_CFG, WRBK_BUSY);
+		rx_ret = tdma_wait_idle(TDMA_WRBK_RX_CFG, WRBK_BUSY);
+		return ret ? ret : rx_ret;
 	}
 }
 
@@ -322,22 +334,14 @@ static int mtk_npu_tdma_dev_enable(void)
 
 static int mtk_npu_tdma_dev_disable(void)
 {
-	tdma_prefetch_enable(false);
+	int ret, dma_ret, wb_ret;
 
-	/* There is no need to wait for Tx/Rx idle before we stop Tx/Rx */
-	if (!mtk_npu_mcu_netsys_fe_rst())
-		while (tdma_read(TDMA_GLO_CFG0) & RX_DMA_BUSY)
-			;
-	tdma_write(TDMA_GLO_CFG0, tdma_read(TDMA_GLO_CFG0) & (~RX_DMA_EN));
-
-	if (!mtk_npu_mcu_netsys_fe_rst())
-		while (tdma_read(TDMA_GLO_CFG0) & TX_DMA_BUSY)
-			;
-	tdma_write(TDMA_GLO_CFG0, tdma_read(TDMA_GLO_CFG0) & (~TX_DMA_EN));
-
-	tdma_writeback_enable(false);
-
-	return 0;
+	ret = tdma_prefetch_enable(false);
+	/* Disable both directions even when prefetch or firmware is stuck. */
+	tdma_clr(TDMA_GLO_CFG0, RX_DMA_EN | TX_DMA_EN);
+	dma_ret = tdma_wait_idle(TDMA_GLO_CFG0, RX_DMA_BUSY | TX_DMA_BUSY);
+	wb_ret = tdma_writeback_enable(false);
+	return ret ? ret : dma_ret ? dma_ret : wb_ret;
 }
 
 static int mtk_npu_tdma_dts_init(void)

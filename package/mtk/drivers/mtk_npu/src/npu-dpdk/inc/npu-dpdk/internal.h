@@ -9,13 +9,20 @@
 #define _NPU_DPDK_INTERNAL_H_
 
 #include <linux/device.h>
+#include <linux/ioport.h>
 
 struct npu_dpdk_dev {
 	struct device *dev;
 	void __iomem *base;
+	resource_size_t size;
 };
 
 extern struct npu_dpdk_dev ndpdk;
+
+int mtk_npu_dpdk_access_begin(void);
+void mtk_npu_dpdk_access_end(void);
+/* Caller holds dpdk_access through mtk_npu_dpdk_access_begin(). */
+unsigned long mtk_npu_dpdk_generation(void);
 
 #define NPU_DBG(fmt, ...)		dev_dbg(ndpdk.dev, "dpdk: " fmt, ##__VA_ARGS__)
 #define NPU_INFO(fmt, ...)		dev_info(ndpdk.dev, "dpdk: " fmt, ##__VA_ARGS__)

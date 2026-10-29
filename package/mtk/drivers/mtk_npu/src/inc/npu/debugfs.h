@@ -15,11 +15,14 @@ extern struct dentry *npu_debugfs_root;
 
 int mtk_npu_debugfs_init(struct platform_device *pdev);
 void mtk_npu_debugfs_deinit(struct platform_device *pdev);
+void mtk_npu_debugfs_quiesce(void);
 #else /* !defined(CONFIG_DEBUG_FS) */
-static inline mtk_npu_debugfs_init(struct platform_device *pdev)
+static inline int mtk_npu_debugfs_init(struct platform_device *pdev)
 {
 	return 0;
 }
+
+static inline void mtk_npu_debugfs_quiesce(void) { }
 
 static inline void mtk_npu_debugfs_deinit(struct platform_device *pdev)
 {

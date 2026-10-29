@@ -64,8 +64,9 @@ define KernelPackage/npu
 	+MTK_NPU_GRETAP:kmod-gre \
 	+MTK_NPU_VXLAN:kmod-vxlan \
 	+MTK_NPU_L2TP_V2:kmod-pppol2tp \
-	+kmod-mediatek_hnat \
-	+MTK_NPU_HNAT:mtk-tops-accounting \
+	+MTK_NPU_24_10_TUNNEL_BACKEND:kmod-mediatek_hnat \
+	+MTK_NPU_24_10_MCAST_BACKEND:kmod-mediatek_hnat \
+	+mtk-tops-accounting \
 	+MTK_NPU_PPTP:kmod-pptp
 endef
 

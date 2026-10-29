@@ -1,0 +1,236 @@
+From: MedyMa <MedyMa@users.noreply.github.com>
+Subject: [PATCH] net: mediatek: retain TOPS decapsulation instance identity
+
+Carry scalar generation and allocation identity through skb clones. HNAT
+can then validate the live tunnel instance before publishing downstream
+flows and retire both directions when a firmware slot is recycled. Keep
+the native Ethernet reset coordinator available without vendor HNAT.
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -36,8 +36,9 @@
+ #include "mtk_eth_dbg.h"
+ #include "mtk_wed.h"
+ 
++#include "mtk_eth_reset.h"
++
+ #if defined(CONFIG_NET_MEDIATEK_HNAT) || defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
+-#include "mtk_eth_reset.h"
+ #include "mtk_hnat/nf_hnat_mtk.h"
+ #endif
+ struct net_device *ppd_dev;
+@@ -58,6 +59,7 @@
+  */
+ static DEFINE_MUTEX(mtk_tnl_rx_lock);
+ static const struct mtk_tnl_rx_ops __rcu *mtk_tnl_rx_ops;
++static u64 mtk_tnl_rx_epoch;
+ 
+ int mtk_tnl_rx_register(const struct mtk_tnl_rx_ops *ops)
+ {
+@@ -68,8 +70,11 @@
+ 	mutex_lock(&mtk_tnl_rx_lock);
+ 	if (rcu_access_pointer(mtk_tnl_rx_ops))
+ 		ret = -EBUSY;
+-	else
++	else {
++		if (!++mtk_tnl_rx_epoch)
++			mtk_tnl_rx_epoch++;
+ 		rcu_assign_pointer(mtk_tnl_rx_ops, ops);
++	}
+ 	mutex_unlock(&mtk_tnl_rx_lock);
+ 	return ret;
+ }
+@@ -86,15 +91,32 @@
+ }
+ EXPORT_SYMBOL_GPL(mtk_tnl_rx_unregister);
+ 
+-static struct net_device *mtk_tnl_rx_dev_get(u8 reason)
++bool mtk_tnl_rx_meta_current(const struct mtk_npu_rx_meta *meta)
++{
++	bool valid;
++
++	rcu_read_lock_bh();
++	valid = meta && meta->provider &&
++		  rcu_dereference_bh(mtk_tnl_rx_ops) &&
++		  meta->provider == READ_ONCE(mtk_tnl_rx_epoch);
++	rcu_read_unlock_bh();
++	return valid;
++}
++EXPORT_SYMBOL_GPL(mtk_tnl_rx_meta_current);
++
++static struct net_device *mtk_tnl_rx_dev_get(u8 reason,
++					  struct mtk_npu_rx_meta *meta)
+ {
+ 	const struct mtk_tnl_rx_ops *ops;
+ 	struct net_device *dev = NULL;
+ 
+ 	rcu_read_lock_bh();
+ 	ops = rcu_dereference_bh(mtk_tnl_rx_ops);
+-	if (ops)
+-		dev = ops->get_dev(reason);
++	if (ops) {
++		dev = ops->get_dev(reason, meta);
++		if (dev)
++			meta->provider = READ_ONCE(mtk_tnl_rx_epoch);
++	}
+ 	rcu_read_unlock_bh();
+ 	return dev;
+ }
+@@ -1883,7 +1905,9 @@
+ 		.vlan_tci = skb_vlan_tag_get(skb),
+ 		.first = true,
+ 		.last = !skb_is_nonlinear(skb),
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_HNAT)
+ 		.ext_ppe = HNAT_SKB_CB2(skb)->magic == 0x78681415,
++#endif
+ 	};
+ 	struct netdev_queue *txq;
+ 	struct mtk_mac *mac = netdev_priv(dev);
+@@ -2517,6 +2541,7 @@
+ 		int mac = 0;
+ 		bool sent_ppd = false;
+ 		struct net_device *tnl_dev = NULL;
++		struct mtk_npu_rx_meta tnl_meta = {};
+ 		u8 tops_reason;
+ 
+ 		idx = NEXT_DESP_IDX(ring->calc_idx, ring->dma_size);
+@@ -2547,7 +2572,8 @@
+ 			mac = RX_DMA_GET_SPORT(trxd.rxd4) - 1;
+ 		}
+ 
+-		if ( (mac == 4) || ((FIELD_GET(MTK_RXD5_PPE_CPU_REASON, trxd.rxd5)) == HIT_BIND_FORCE_TO_CPU)) 
++		if ( (mac == 4) || ((FIELD_GET(MTK_RXD5_PPE_CPU_REASON, trxd.rxd5)) ==
++		     MTK_PPE_CPU_REASON_HIT_BIND_FORCE_CPU)) 
+ 			{
+ 			sent_ppd = 1;
+ 			mac =0;
+@@ -2652,7 +2678,7 @@
+ 		tops_reason = mtk_is_netsys_v3_or_greater(eth) ? trxd.rxd6 >> 24 : 0;
+ 		if (tops_reason >= MTK_TOPS_RX_TUNNEL_FIRST &&
+ 		    tops_reason <= MTK_TOPS_RX_TUNNEL_LAST) {
+-			tnl_dev = mtk_tnl_rx_dev_get(tops_reason);
++			tnl_dev = mtk_tnl_rx_dev_get(tops_reason, &tnl_meta);
+ 			if (!tnl_dev || !netif_running(tnl_dev)) {
+ 				if (tnl_dev)
+ 					dev_put(tnl_dev);
+@@ -2713,6 +2739,9 @@
+ 		 */
+ 		skb_hnat_tops(skb) = 0;
+ 		skb_hnat_is_decap(skb) = !!tnl_dev;
++		/* Allocation failure keeps software forwarding, never an ownerless BIND. */
++		if (tnl_dev && !mtk_npu_rx_meta_add(skb, &tnl_meta))
++			skb_hnat_alg(skb) = 1;
+ 		skb_hnat_cdrt(skb) = 0;
+ 		skb_hnat_is_decrypt(skb) = 0;
+ 		skb_hnat_is_pppoe(skb) = 0;
+@@ -5692,7 +5721,7 @@
+ 			call_netdevice_notifiers(MTK_FE_RESET_DONE,
+ 						 eth->netdev[i]);
+ 
+-			if (mtk_is_netsys_v3_or_greater(eth)) {
++			if (mtk_is_netsys_v3_or_greater(eth) && mtk_wifi_num > 0) {
+ 				pr_info("waiting done ack from wifi\n");
+ 				rtnl_unlock();
+ 				wait_for_completion(&wait_ack_done);
+@@ -7138,7 +7167,6 @@
+ 	mtketh_debugfs_init(eth);
+ 	debug_proc_init(eth);
+ 
+-#if IS_ENABLED(CONFIG_NET_MEDIATEK_HNAT)
+ 	err = mtk_eth_netdevice_event_init(eth);
+ 	if (err) {
+ 		debug_proc_exit();
+@@ -7146,7 +7174,6 @@
+ 		mtk_eth_netdevice_event_deinit(eth);
+ 		goto err_unreg_netdev;
+ 	}
+-#endif
+ 	platform_set_drvdata(pdev, eth);
+ 	schedule_delayed_work(&eth->reset.monitor_work,
+ 			      MTK_DMA_MONITOR_TIMEOUT);
+diff --git a/drivers/net/ppp/Kconfig b/drivers/net/ppp/Kconfig
+--- a/drivers/net/ppp/Kconfig
++++ b/drivers/net/ppp/Kconfig
+@@ -214,6 +214,7 @@
+ config MTK_PPP_TUNNEL_INFO
+ 	bool "PPP scalar tunnel metadata for MT7988 TOPS"
+ 	depends on PPP
++	select SKB_EXTENSIONS
+ 	default n
+ 	help
+ 	  Copy tunnel IDs under the existing PPP/channel locks without exporting
+diff --git a/include/linux/mtk_npu_rx.h b/include/linux/mtk_npu_rx.h
+--- /dev/null
++++ b/include/linux/mtk_npu_rx.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_MTK_NPU_RX_H
++#define _LINUX_MTK_NPU_RX_H
++
++#include <linux/skbuff.h>
++
++/* Scalars only: clones retain identity without borrowing module/device memory. */
++struct mtk_npu_rx_meta {
++	u64 provider, generation, allocation;
++	u32 entry, tunnel_ifindex;
++};
++
++static inline const struct mtk_npu_rx_meta *
++mtk_npu_rx_meta_find(const struct sk_buff *skb)
++{
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	return skb_ext_find(skb, SKB_EXT_MTK_NPU);
++#else
++	return NULL;
++#endif
++}
++
++static inline bool mtk_npu_rx_meta_add(struct sk_buff *skb,
++				     const struct mtk_npu_rx_meta *meta)
++{
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	struct mtk_npu_rx_meta *ext = skb_ext_add(skb, SKB_EXT_MTK_NPU);
++
++	if (ext) {
++		*ext = *meta;
++		return true;
++	}
++#endif
++	return false;
++}
++#endif
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -4780,6 +4780,9 @@
+ #ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
+ 	SKB_EXT_HNAT_ACCOUNTING,
+ #endif
++#ifdef CONFIG_MTK_PPP_TUNNEL_INFO
++	SKB_EXT_MTK_NPU,
++#endif
+ 	SKB_EXT_NUM, /* must be last */
+ };
+ 
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -51,6 +51,7 @@
+ #endif
+ #include <linux/string.h>
+ #include <linux/skbuff.h>
++#include <linux/mtk_npu_rx.h>
+ #include <linux/splice.h>
+ #include <linux/cache.h>
+ #include <linux/rtnetlink.h>
+@@ -4827,6 +4828,9 @@
+ #define SKB_EXT_CHUNKSIZEOF(x)	(ALIGN((sizeof(x)), SKB_EXT_ALIGN_VALUE) / SKB_EXT_ALIGN_VALUE)
+ 
+ static const u8 skb_ext_type_len[] = {
++#ifdef CONFIG_MTK_PPP_TUNNEL_INFO
++	[SKB_EXT_MTK_NPU] = SKB_EXT_CHUNKSIZEOF(struct mtk_npu_rx_meta),
++#endif
+ #ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
+ 	[SKB_EXT_HNAT_ACCOUNTING] = SKB_EXT_CHUNKSIZEOF(struct nf_hnat_packet_accounting),
+ #endif

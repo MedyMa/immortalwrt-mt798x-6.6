@@ -28,6 +28,7 @@
 #include "npu/logger.h"
 #include "npu/mbox.h"
 #include "npu/mcu.h"
+#include "npu/protocol/tunnel/pptp/pptp.h"
 #include "npu/mem-test.h"
 #include "npu/misc.h"
 #include "npu/netsys.h"
@@ -39,6 +40,7 @@
 #define TDMA_TIMEOUT_DELAY			(100) /* 100ms */
 
 #define MCU_STATE_TRANS_TIMEOUT			(5000) /* 5000ms */
+#define MCU_RECOVERY_RETRIES			(3)
 #define MCU_CTRL_DONE_BIT			(31)
 #define MCU_CTRL_DONE				(CORE_NPU_MASK | \
 						BIT(MCU_CTRL_DONE_BIT))
@@ -112,7 +114,9 @@ struct mcu_ctrl {
 	bool in_recover;
 	bool netsys_fe_ser;
 	bool shuting_down;
+	bool stopping;
 	bool mem_verified;
+	bool powered;
 
 	struct mailbox_msg ctrl_msg;
 	struct mailbox_dev recv_mgmt_mbox_dev;
@@ -321,6 +325,9 @@ static int mcu_power_on(void)
 {
 	int ret = 0;
 
+	if (mcu.powered)
+		return 0;
+
 	ret = clk_prepare_enable(mcu.bus_clk);
 	if (ret) {
 		NPU_ERR("bus clk enable failed: %d\n", ret);
@@ -351,13 +358,16 @@ static int mcu_power_on(void)
 		goto err_disable_offload_clk;
 	}
 
-	ret = pm_runtime_get_sync(npu.dev);
+	ret = pm_runtime_resume_and_get(npu.dev);
 	if (ret < 0) {
 		NPU_ERR("power on failed: %d\n", ret);
 		goto err_disable_mgmt_clk;
 	}
 
-	return ret;
+	mcu.powered = true;
+	mtk_npu_mbox_irq_enable();
+	mtk_npu_pptp_seq_resume_stalled();
+	return 0;
 
 err_disable_mgmt_clk:
 	clk_disable_unprepare(mcu.mgmt_clk);
@@ -379,6 +389,13 @@ err_disable_bus_clk:
 
 static void mcu_power_off(void)
 {
+	if (!mcu.powered)
+		return;
+
+	/* Fence all five cores before removing their clocks or firmware state. */
+	mtk_npu_fw_stop_default_cores();
+	mtk_npu_pptp_seq_suspend_stalled();
+	mtk_npu_mbox_irq_disable();
 	pm_runtime_put_sync(npu.dev);
 
 	clk_disable_unprepare(mcu.mgmt_clk);
@@ -390,6 +407,7 @@ static void mcu_power_off(void)
 	clk_disable_unprepare(mcu.sram_clk);
 
 	clk_disable_unprepare(mcu.bus_clk);
+	mcu.powered = false;
 }
 
 static inline int mcu_state_send_cmd(struct mcu_state *state)
@@ -397,7 +415,7 @@ static inline int mcu_state_send_cmd(struct mcu_state *state)
 	unsigned long flag;
 	enum core_id core;
 	u32 ctrl_cpu;
-	int ret;
+	int ret = 0;
 
 	spin_lock_irqsave(&mcu.ctrl_done_lock, flag);
 	ctrl_cpu = (~mcu.ctrl_done) & CORE_NPU_MASK;
@@ -444,9 +462,14 @@ static inline int mcu_state_wait_complete(void (*state_complete_cb)(void))
 	unsigned long flag;
 	int ret = 0;
 
-	wait_event_interruptible(mcu.mcu_state_wait_done,
+	ret = wait_event_interruptible(mcu.mcu_state_wait_done,
 				 (mcu.ctrl_done == CORE_NPU_MASK) ||
-				 (mcu.state_trans_fail));
+				 (mcu.state_trans_fail) || kthread_should_stop());
+
+	if (kthread_should_stop())
+		return -ESHUTDOWN;
+	if (ret < 0)
+		return ret;
 
 	if (mcu.state_trans_fail)
 		return -EINVAL;
@@ -489,9 +512,8 @@ static struct mcu_state *mtk_npu_mcu_state_shutdown_trans(u32 mcu_act,
 
 static int mtk_npu_mcu_state_shutdown_enter(struct mcu_state *state)
 {
-	mcu_power_off();
-
 	mtk_npu_net_dev_save_last_state();
+	mcu_power_off();
 
 	mtk_npu_fw_clean_up();
 
@@ -554,7 +576,9 @@ static int mtk_npu_mcu_state_init_enter(struct mcu_state *state)
 	mtk_npu_mbox_clear_all_cmd();
 
 	/* reset npu net device first */
-	mtk_npu_net_dev_reset();
+	ret = mtk_npu_net_dev_reset();
+	if (ret)
+		return ret;
 
 	/* synchronize the logger whether running */
 	mtk_npu_logger_running_sync();
@@ -694,9 +718,13 @@ static struct mcu_state *mtk_npu_mcu_state_netstop_trans(u32 mcu_act,
 
 static int mtk_npu_mcu_state_netstop_enter(struct mcu_state *state)
 {
+	int ret;
+
 	mtk_pce_disable();
 
-	mtk_npu_net_dev_disable();
+	ret = mtk_npu_net_dev_disable();
+	if (ret)
+		return ret;
 
 	if (mcu.in_recover)
 		mcu_ctrl_issue_pending_act(MCU_ACT_ABNORMAL);
@@ -1040,6 +1068,11 @@ static inline enum mcu_act mcu_ctrl_pop_pending_act(void)
 
 	spin_lock_irqsave(&mcu.pending_act_lock, flag);
 
+	if (!mcu.pending_act) {
+		spin_unlock_irqrestore(&mcu.pending_act_lock, flag);
+		return __MCU_ACT_MAX;
+	}
+
 	act = ffs(mcu.pending_act) - 1;
 	mcu.pending_act &= ~BIT(act);
 
@@ -1109,7 +1142,8 @@ static int mcu_ctrl_task(void *data)
 
 bool mtk_npu_mcu_alive(void)
 {
-	return mcu.mcu_bring_up_done && !mcu.in_reset && !mcu.state_trans_fail;
+	return !READ_ONCE(mcu.stopping) && mcu.mcu_bring_up_done &&
+	       !mcu.in_reset && !mcu.state_trans_fail;
 }
 EXPORT_SYMBOL(mtk_npu_mcu_alive);
 
@@ -1128,11 +1162,17 @@ static int mtk_npu_mcu_wait_done(enum mcu_cmd_type done_cmd)
 	int ret;
 
 	ret = wait_event_interruptible_timeout(mcu.mcu_ctrl_wait_done,
-		mcu_ctrl_is_complete(done_cmd) || mcu.state_trans_fail,
+		mcu_ctrl_is_complete(done_cmd) || mcu.state_trans_fail || READ_ONCE(mcu.stopping),
 		msecs_to_jiffies(MCU_STATE_TRANS_TIMEOUT));
+
+	if (READ_ONCE(mcu.stopping))
+		return -ESHUTDOWN;
 
 	if (mcu.state_trans_fail)
 		return -EINVAL;
+
+	if (ret < 0)
+		return ret;
 
 	if (ret == 0)
 		return -ETIME;
@@ -1152,6 +1192,11 @@ int mtk_npu_mcu_stall(struct mcu_ctrl_cmd *mcmd,
 		return -EINVAL;
 
 	mutex_lock(&mcu.mcu_ctrl_lock);
+
+	if (READ_ONCE(mcu.stopping)) {
+		ret = -ESHUTDOWN;
+		goto unlock;
+	}
 
 	/* go to stall state */
 	ret = mcu_ctrl_cmd_prepare(MCU_CMD_TYPE_STALL, mcmd);
@@ -1185,7 +1230,8 @@ int mtk_npu_mcu_stall(struct mcu_ctrl_cmd *mcmd,
 	goto unlock;
 
 recover_mcu:
-	schedule_work(&mcu.recover_work);
+	if (!READ_ONCE(mcu.stopping))
+		schedule_work(&mcu.recover_work);
 
 unlock:
 	mutex_unlock(&mcu.mcu_ctrl_lock);
@@ -1206,6 +1252,11 @@ int mtk_npu_mcu_reset(struct mcu_ctrl_cmd *mcmd,
 		return -EINVAL;
 
 	mutex_lock(&mcu.mcu_ctrl_lock);
+
+	if (READ_ONCE(mcu.stopping)) {
+		ret = -ESHUTDOWN;
+		goto unlock;
+	}
 
 	mcu.in_reset = true;
 	if (mcmd->e == MCU_EVENT_TYPE_FE_RESET)
@@ -1252,7 +1303,8 @@ int mtk_npu_mcu_reset(struct mcu_ctrl_cmd *mcmd,
 	goto unlock;
 
 recover_mcu:
-	schedule_work(&mcu.recover_work);
+	if (!READ_ONCE(mcu.stopping))
+		schedule_work(&mcu.recover_work);
 
 unlock:
 	mutex_unlock(&mcu.mcu_ctrl_lock);
@@ -1262,9 +1314,13 @@ unlock:
 
 static void mtk_npu_mcu_recover_work(struct work_struct *work)
 {
+	unsigned int attempt;
 	int ret;
 
 	mutex_lock(&mcu.mcu_ctrl_lock);
+
+	if (READ_ONCE(mcu.stopping))
+		goto unlock;
 
 	if (!mcu.mcu_bring_up_done && !mcu.in_reset && !mcu.state_trans_fail)
 		mcu_ctrl_issue_pending_act(MCU_ACT_INIT);
@@ -1274,13 +1330,22 @@ static void mtk_npu_mcu_recover_work(struct work_struct *work)
 	mcu.state_trans_fail = false;
 	mcu.in_recover = true;
 
-	while ((ret = mtk_npu_mcu_wait_done(MCU_CMD_TYPE_INIT_DONE))) {
-		if (mcu.shuting_down)
+	for (attempt = 0; attempt < MCU_RECOVERY_RETRIES; attempt++) {
+		ret = mtk_npu_mcu_wait_done(MCU_CMD_TYPE_INIT_DONE);
+		if (!ret)
+			break;
+		if (mcu.shuting_down || READ_ONCE(mcu.stopping))
 			goto unlock;
 
 		mcu.mcu_bring_up_done = false;
-		mcu.state_trans_fail = false;
 		NPU_ERR("bring up failed: %d\n", ret);
+		if (attempt + 1 == MCU_RECOVERY_RETRIES) {
+			mcu.in_recover = false;
+			mcu.state_trans_fail = true;
+			NPU_ERR("MCU recovery budget exhausted\n");
+			break;
+		}
+		mcu.state_trans_fail = false;
 
 		msleep(1000);
 
@@ -1354,18 +1419,40 @@ static void mtk_npu_mcu_unregister_mbox(void)
 	}
 }
 
-static void mtk_npu_mcu_shutdown(void)
+static void mtk_npu_mcu_stop_recovery(void)
 {
+	WRITE_ONCE(mcu.stopping, true);
+	wake_up_interruptible(&mcu.mcu_ctrl_wait_done);
+	/* Scheduling sites hold this mutex. Drain a caller that passed the
+	 * old stopping value before cancelling, without cancelling under it.
+	 */
+	mutex_lock(&mcu.mcu_ctrl_lock);
+	mutex_unlock(&mcu.mcu_ctrl_lock);
+	cancel_work_sync(&mcu.recover_work);
+}
+
+static int mtk_npu_mcu_shutdown(void)
+{
+	long ret;
+
+	mtk_npu_mcu_stop_recovery();
 	mcu.shuting_down = true;
 
 	mutex_lock(&mcu.mcu_ctrl_lock);
+	mcu.in_reset = false;
+	mcu.in_recover = false;
 
 	mcu_ctrl_issue_pending_act(MCU_ACT_NETSTOP);
 
-	wait_event_interruptible(mcu.mcu_ctrl_wait_done,
-				 !mcu.mcu_bring_up_done && !mcu.shuting_down);
+	ret = wait_event_interruptible_timeout(mcu.mcu_ctrl_wait_done,
+		(!mcu.mcu_bring_up_done && !mcu.shuting_down) ||
+		mcu.state_trans_fail,
+		msecs_to_jiffies(3 * MCU_STATE_TRANS_TIMEOUT));
 
 	mutex_unlock(&mcu.mcu_ctrl_lock);
+	if (mcu.state_trans_fail)
+		return -EIO;
+	return ret > 0 ? 0 : ret < 0 ? ret : -ETIMEDOUT;
 }
 
 /* TODO: should be implemented to not block other module's init tasks */
@@ -1380,13 +1467,13 @@ static int mtk_npu_mcu_cold_boot(void)
 	mcu_ctrl_issue_pending_act(MCU_ACT_INIT);
 	ret = mtk_npu_mcu_wait_done(MCU_CMD_TYPE_INIT_DONE);
 
+	if (ret && !READ_ONCE(mcu.stopping))
+		schedule_work(&mcu.recover_work);
 	mutex_unlock(&mcu.mcu_ctrl_lock);
 	if (!ret)
 		return ret;
 
 	NPU_ERR("cold boot failed: %d\n", ret);
-
-	schedule_work(&mcu.recover_work);
 
 	return ret;
 }
@@ -1395,6 +1482,7 @@ int mtk_npu_mcu_bring_up(struct platform_device *pdev)
 {
 	int ret = 0;
 
+	WRITE_ONCE(mcu.stopping, false);
 	pm_runtime_enable(&pdev->dev);
 
 	ret = mtk_npu_mcu_register_mbox();
@@ -1419,7 +1507,11 @@ int mtk_npu_mcu_bring_up(struct platform_device *pdev)
 	return ret;
 
 err_stop_mcu_ctrl_thread:
+	mtk_npu_mcu_stop_recovery();
 	kthread_stop(mcu.mcu_ctrl_thread);
+	del_timer_sync(&mcu.mcu_ctrl_timer);
+	mcu_power_off();
+	mtk_npu_fw_clean_up();
 
 err_unregister_mbox:
 	mtk_npu_mcu_unregister_mbox();
@@ -1432,11 +1524,25 @@ runtime_disable:
 
 void mtk_npu_mcu_tear_down(struct platform_device *pdev)
 {
-	mtk_npu_mcu_shutdown();
+	int ret;
+
+	ret = mtk_npu_mcu_shutdown();
+	if (ret)
+		NPU_WARN("MCU shutdown failed: %d; stopping host engines\n", ret);
 
 	kthread_stop(mcu.mcu_ctrl_thread);
+	del_timer_sync(&mcu.mcu_ctrl_timer);
 
-	/* TODO: stop mcu? */
+	if (mcu.powered) {
+		mtk_pce_disable();
+		ret = mtk_npu_net_dev_disable();
+		if (ret)
+			NPU_WARN("network stop failed: %d\n", ret);
+		mcu_power_off();
+		mtk_npu_fw_clean_up();
+	}
+	mcu.mcu_bring_up_done = false;
+	mcu.shuting_down = false;
 
 	mtk_npu_mcu_unregister_mbox();
 
@@ -1550,6 +1656,24 @@ pm_attach_fail:
 	return ret;
 }
 
+static void mtk_npu_mcu_reset_state(void)
+{
+	/* No controller thread or recovery work is live at this point. */
+	mcu.stopping = true;
+	mcu.mcu_bring_up_done = false;
+	mcu.state_trans_fail = false;
+	mcu.in_reset = false;
+	mcu.in_recover = false;
+	mcu.netsys_fe_ser = false;
+	mcu.shuting_down = false;
+	mcu.mem_verified = false;
+	mcu.powered = false;
+	mcu.pending_act = 0;
+	mcu.ctrl_done = 0;
+	mcu.ctrl_done_cmd = MCU_CMD_TYPE_NULL;
+	memset(&mcu.ctrl_msg, 0, sizeof(mcu.ctrl_msg));
+}
+
 int mtk_npu_mcu_init(struct platform_device *pdev)
 {
 	int ret = 0;
@@ -1574,6 +1698,7 @@ int mtk_npu_mcu_init(struct platform_device *pdev)
 	spin_lock_init(&mcu.pending_act_lock);
 	spin_lock_init(&mcu.ctrl_done_lock);
 	mutex_init(&mcu.mcu_ctrl_lock);
+	mtk_npu_mcu_reset_state();
 	timer_setup(&mcu.mcu_ctrl_timer, mtk_npu_mcu_state_trans_timeout, 0);
 
 	for (i = 0; i < __MCU_STATE_TYPE_MAX; i++) {

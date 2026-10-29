@@ -26,6 +26,9 @@ const char *mtk_npu_fw_attr_get_value(enum npu_role_type rtype,
 				       const char *property);
 
 int mtk_npu_fw_bring_up_default_cores(void);
+void mtk_npu_fw_stop_default_cores(void);
 void mtk_npu_fw_clean_up(void);
 int mtk_npu_fw_init(struct platform_device *pdev);
+int mtk_npu_fw_offset(u32 addr, size_t len, u32 *offset);
+
 #endif /* _NPU_FW_H_ */

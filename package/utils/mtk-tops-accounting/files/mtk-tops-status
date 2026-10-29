@@ -182,6 +182,7 @@ while read -r ti tg tif tt tp ts tsp td tdp te tde tsy extra; do
 	case "$te:$tde:$tsy" in [01]:[01]:[01]) ;; *) valid=0 ;; esac
 	case "$tt:$tp" in
 		1:47) tname=gretap; [ "$tsp:$tdp" = 0:0 ] || valid=0 ;;
+		2:47) tname=pptp; [ "$tsp:$tdp" = 0:0 ] || valid=0 ;;
 		3:17) tname=l2tpv2 ;;
 		5:17) tname=vxlan ;;
 		*) valid=0 ;;

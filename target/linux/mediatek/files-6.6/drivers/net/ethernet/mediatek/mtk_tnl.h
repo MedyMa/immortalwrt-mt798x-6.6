@@ -7,6 +7,7 @@
 #define MTK_TNL_H
 
 #include <linux/skbuff.h>
+#include <linux/mtk_npu_rx.h>
 
 struct mtk_tnl_desc {
 	u32 entry : 15;
@@ -52,8 +53,9 @@ struct mtk_tnl_desc {
 #define MTK_TOPS_RX_TUNNEL_LAST  0x2f
 struct net_device;
 struct mtk_tnl_rx_ops {
-	struct net_device *(*get_dev)(u8 reason);
+	struct net_device *(*get_dev)(u8 reason, struct mtk_npu_rx_meta *meta);
 };
+bool mtk_tnl_rx_meta_current(const struct mtk_npu_rx_meta *meta);
 int mtk_tnl_rx_register(const struct mtk_tnl_rx_ops *ops);
 void mtk_tnl_rx_unregister(const struct mtk_tnl_rx_ops *ops);
 

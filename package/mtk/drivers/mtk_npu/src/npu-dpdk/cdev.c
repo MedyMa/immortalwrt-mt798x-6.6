@@ -5,6 +5,7 @@
  */
 
 #include <linux/cdev.h>
+#include <linux/capability.h>
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/module.h>
@@ -20,7 +21,7 @@ static dev_t npu_dpdk_dev_id;
 static struct cdev npu_dpdk_cdev;
 static struct class *npu_dpdk_class;
 
-static int npu_dpdk_show(struct seq_file *s, void *private)
+static int npu_dpdk_show_active(struct seq_file *s, void *private)
 {
 	struct npu_dpdk_mac_info minfo;
 	u32 i = 0;
@@ -40,9 +41,29 @@ static int npu_dpdk_show(struct seq_file *s, void *private)
 	return 0;
 }
 
+static int npu_dpdk_show(struct seq_file *s, void *private)
+{
+	int ret = mtk_npu_dpdk_access_begin();
+
+	if (ret)
+		return ret;
+	if ((unsigned long)s->private != mtk_npu_dpdk_generation())
+		ret = -ENODEV;
+	else
+		ret = npu_dpdk_show_active(s, private);
+	mtk_npu_dpdk_access_end();
+	return ret;
+}
+
 static int npu_dpdk_open(struct inode *inode, struct file *f)
 {
-	return single_open(f, npu_dpdk_show, f->private_data);
+	int ret = mtk_npu_dpdk_access_begin();
+
+	if (ret)
+		return ret;
+	ret = single_open(f, npu_dpdk_show, (void *)mtk_npu_dpdk_generation());
+	mtk_npu_dpdk_access_end();
+	return ret;
 }
 
 static long npu_dpdk_ioctl_insert(struct npu_dpdk_cmd *ncmd)
@@ -102,7 +123,7 @@ static long npu_dpdk_ioctl_query(struct npu_dpdk_cmd *ncmd, void __user *p)
 	}
 }
 
-static long npu_dpdk_unlocked_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+static long npu_dpdk_ioctl_active(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	void __user *argp = (void __user *)arg;
 	struct npu_dpdk_cmd ncmd;
@@ -124,6 +145,24 @@ static long npu_dpdk_unlocked_ioctl(struct file *f, unsigned int cmd, unsigned l
 	default:
 		return -EINVAL;
 	}
+}
+
+static long npu_dpdk_unlocked_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct seq_file *s = f->private_data;
+	long ret;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+	ret = mtk_npu_dpdk_access_begin();
+	if (ret)
+		return ret;
+	if ((unsigned long)s->private != mtk_npu_dpdk_generation())
+		ret = -ENODEV;
+	else
+		ret = npu_dpdk_ioctl_active(f, cmd, arg);
+	mtk_npu_dpdk_access_end();
+	return ret;
 }
 
 static const struct file_operations npu_dpdk_fops = {

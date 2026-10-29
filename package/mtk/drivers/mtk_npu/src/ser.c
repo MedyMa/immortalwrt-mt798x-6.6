@@ -20,25 +20,32 @@ struct npu_ser {
 	struct work_struct work;
 	struct npu_ser_params ser_params;
 	spinlock_t params_lock;
+	u64 generation;
+	bool stopping;
 };
 
-struct npu_ser npu_ser;
+static struct npu_ser npu_ser = {
+	.params_lock = __SPIN_LOCK_UNLOCKED(npu_ser.params_lock),
+	.stopping = true,
+};
+
+static void mtk_npu_ser_params_get(struct npu_ser_params *params)
+{
+	if (params->type == NPU_SER_NETSYS_FE_RST)
+		dev_hold(params->data.net.ndev);
+}
+
+static void mtk_npu_ser_params_put(struct npu_ser_params *params)
+{
+	if (params->type == NPU_SER_NETSYS_FE_RST)
+		dev_put(params->data.net.ndev);
+}
 
 static inline void __mtk_npu_ser_cmd_clear(void)
 {
+	mtk_npu_ser_params_put(&npu_ser.ser_params);
 	memset(&npu_ser.ser_params, 0, sizeof(struct npu_ser_params));
 	npu_ser.ser_params.type = __NPU_SER_TYPE_MAX;
-}
-
-static inline void mtk_npu_ser_cmd_clear(void)
-{
-	unsigned long flag;
-
-	spin_lock_irqsave(&npu_ser.params_lock, flag);
-
-	__mtk_npu_ser_cmd_clear();
-
-	spin_unlock_irqrestore(&npu_ser.params_lock, flag);
 }
 
 static void mtk_npu_ser_setup_mcmd(struct npu_ser_params *ser_params,
@@ -75,43 +82,38 @@ static void mtk_npu_ser_work(struct work_struct *work)
 	struct npu_ser_params ser_params;
 	struct mcu_ctrl_cmd mcmd;
 	unsigned long flag = 0;
+	u64 generation;
+	int ret;
 
 	spin_lock_irqsave(&npu_ser.params_lock, flag);
 
-	while (npu_ser.ser_params.type != __NPU_SER_TYPE_MAX) {
+	while (!npu_ser.stopping &&
+	       npu_ser.ser_params.type != __NPU_SER_TYPE_MAX) {
 		memcpy(&ser_params,
 		       &npu_ser.ser_params,
 		       sizeof(struct npu_ser_params));
+		generation = npu_ser.generation;
+		/* A replacement request owns a separate reference from this one. */
+		mtk_npu_ser_params_get(&ser_params);
 
 		spin_unlock_irqrestore(&npu_ser.params_lock, flag);
 
 		mtk_npu_ser_setup_mcmd(&ser_params, &mcmd);
 
-		if (mtk_npu_mcu_reset(&mcmd,
-				       mtk_npu_ser_reset_callback,
-				       &ser_params)) {
+		ret = mtk_npu_mcu_reset(&mcmd, mtk_npu_ser_reset_callback,
+				    &ser_params);
+		mtk_npu_ser_params_put(&ser_params);
+		if (ret) {
 			NPU_INFO("SER type: %u failed to recover\n",
 				  ser_params.type);
-			/*
-			 * TODO: check is OK to directly return
-			 * since mcu state machine should handle
-			 * state transition failed?
-			 */
-			mtk_npu_ser_cmd_clear();
-			return;
+		} else {
+			NPU_INFO("SER type: %u successfully recovered\n",
+				  ser_params.type);
 		}
 
-		NPU_INFO("SER type: %u successfully recovered\n", ser_params.type);
-
 		spin_lock_irqsave(&npu_ser.params_lock, flag);
-		/*
-		 * If there isn't queued any other SER cmd that has higher priority
-		 * than current SER command, clear SER command and exit.
-		 * Otherwise let the work perform reset again for high priority SER.
-		 */
-		if (npu_ser.ser_params.type > ser_params.type
-		    || !memcmp(&npu_ser.ser_params, &ser_params,
-			       sizeof(struct npu_ser_params)))
+		/* Do not discard a newer request, including an identical FE reset. */
+		if (npu_ser.generation == generation)
 			__mtk_npu_ser_cmd_clear();
 	}
 
@@ -121,25 +123,35 @@ static void mtk_npu_ser_work(struct work_struct *work)
 int mtk_npu_ser(struct npu_ser_params *ser_params)
 {
 	unsigned long flag;
+	int ret = 0;
 
-	if (!ser_params)
+	if (!ser_params || (unsigned int)ser_params->type >= __NPU_SER_TYPE_MAX ||
+	    (ser_params->type == NPU_SER_NETSYS_FE_RST && !ser_params->data.net.ndev))
 		return -EINVAL;
 
 	spin_lock_irqsave(&npu_ser.params_lock, flag);
+
+	if (npu_ser.stopping) {
+		ret = -ESHUTDOWN;
+		goto unlock;
+	}
 
 	/* higher SER type should not override lower SER type */
 	if (npu_ser.ser_params.type != __NPU_SER_TYPE_MAX
 	    && npu_ser.ser_params.type < ser_params->type)
 		goto unlock;
 
+	mtk_npu_ser_params_get(ser_params);
+	__mtk_npu_ser_cmd_clear();
 	memcpy(&npu_ser.ser_params, ser_params, sizeof(*ser_params));
+	npu_ser.generation++;
 
 	schedule_work(&npu_ser.work);
 
 unlock:
 	spin_unlock_irqrestore(&npu_ser.params_lock, flag);
 
-	return 0;
+	return ret;
 }
 EXPORT_SYMBOL(mtk_npu_ser);
 
@@ -150,11 +162,22 @@ int mtk_npu_ser_init(struct platform_device *pdev)
 	spin_lock_init(&npu_ser.params_lock);
 
 	npu_ser.ser_params.type = __NPU_SER_TYPE_MAX;
+	npu_ser.generation = 0;
+	npu_ser.stopping = false;
 
 	return 0;
 }
 
 int mtk_npu_ser_deinit(struct platform_device *pdev)
 {
+	unsigned long flag;
+
+	spin_lock_irqsave(&npu_ser.params_lock, flag);
+	npu_ser.stopping = true;
+	__mtk_npu_ser_cmd_clear();
+	spin_unlock_irqrestore(&npu_ser.params_lock, flag);
+
+	cancel_work_sync(&npu_ser.work);
+
 	return 0;
 }

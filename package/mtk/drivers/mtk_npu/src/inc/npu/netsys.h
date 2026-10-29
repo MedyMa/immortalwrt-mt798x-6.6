@@ -50,11 +50,16 @@
 #define TDMA_PORT_SHIFT				(0)
 #define TDMA_PORT_MASK				GENMASK(15, 0)
 
-#if KERNEL_VERSION(6, 2, 0) > LINUX_VERSION_CODE
-#define MTK_NPU_QDMA_QUEUE_MAX			(MTK_QDMA_TX_NUM)
-#else /* KERNEL_VERSION(6, 2, 0) <= LINUX_VERSION_CODE */
-#define MTK_NPU_QDMA_QUEUE_MAX			(eth->soc->num_tx_queues)
-#endif /* KERNEL_VERSION(6, 2, 0) > LINUX_VERSION_CODE */
+/* The vendor 6.6 Ethernet ABI keeps a fixed queue count instead of
+ * mtk_soc_data::num_tx_queues. Feature-detect the provider, not its version.
+ */
+#if defined(MTK_QDMA_NUM_QUEUES)
+#define MTK_NPU_QDMA_QUEUE_MAX MTK_QDMA_NUM_QUEUES
+#elif defined(MTK_QDMA_TX_NUM)
+#define MTK_NPU_QDMA_QUEUE_MAX MTK_QDMA_TX_NUM
+#else
+#define MTK_NPU_QDMA_QUEUE_MAX (eth->soc->num_tx_queues)
+#endif
 
 struct mtk_eth *mtk_npu_netsys_get_eth(void);
 u32 mtk_npu_netsys_ppe_get_num(void);

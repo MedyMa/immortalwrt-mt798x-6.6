@@ -1780,7 +1780,7 @@ int hnat_tunnel_flush(u32 tops_entry)
 	struct hnat_flow_entry *flow;
 	struct hlist_node *next;
 	struct foe_entry *entry;
-	u32 ppe, slot, code, tport, count = 0;
+	u32 ppe, slot, code, count = 0;
 
 	if (tops_entry && (tops_entry < 32 || tops_entry >= 64))
 		return -EINVAL;
@@ -1798,13 +1798,10 @@ int hnat_tunnel_flush(u32 tops_entry)
 				goto next;
 			if (IS_IPV4_GRP(entry)) {
 				code = entry->ipv4_hnapt.tops_entry;
-				tport = entry->ipv4_hnapt.tport_id;
 			} else {
 				code = entry->ipv6_5t_route.tops_entry;
-				tport = entry->ipv6_5t_route.tport_id;
 			}
-			if (code < 32 || (tops_entry && code != tops_entry) ||
-			    (tport != 4 && tport != 5))
+			if (code < 32 || (tops_entry && code != tops_entry))
 				goto next;
 			if (!hnat_account_tunnel_invalidate(hnat_priv, ppe, slot)) {
 				u32 info1 = READ_ONCE(entry->ipv4_hnapt.info_blk1);
@@ -2219,7 +2216,8 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 		eth = eth_hdr(skb);
 
 	/*do not bind multicast if PPE mcast not enable*/
-	if (!hnat_priv->data->mcast && is_multicast_ether_addr(eth->h_dest))
+	if (!hnat_priv->data->mcast && !hnat_npu_mcast_active() &&
+	    is_multicast_ether_addr(eth->h_dest))
 		return 0;
 
 	if (whnat && is_hnat_info_filled(skb))
@@ -2817,6 +2815,23 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 		}
 	}
 
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	{
+		const struct mtk_npu_rx_meta *rx = mtk_npu_rx_meta_find(skb);
+
+		if (rx) {
+			if (tunnel_prefill || is_multicast_ether_addr(eth->h_dest))
+				return 0;
+			if (IS_IPV4_HNAPT(&entry) || IS_IPV4_HNAT(&entry))
+				entry.ipv4_hnapt.tops_entry = rx->entry;
+			else if (entry.bfib1.pkt_type == IPV6_5T_ROUTE)
+				entry.ipv6_5t_route.tops_entry = rx->entry;
+			else
+				return 0;
+		}
+	}
+#endif
+
 	/* WHNAT keeps the complete prepared entry in software.  The hardware slot
 	 * remains UNBIND until TX confirms this skb's flow identity.
 	 */
@@ -2829,6 +2844,25 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	    !skb->encapsulation &&
 	    !hnat_flow_ipv4_ct_match(skb, &entry, ct, ctinfo))
 		return 0;
+
+	/* NETSYSv3 replication is owned by the NPU MDB provider. Cache
+	 * validation and descriptor publication share entry_lock, so leave
+	 * and reset cannot race a fresh BIND. No MCU call runs in this path.
+	 */
+	if (!hnat_priv->data->mcast && is_multicast_ether_addr(eth->h_dest)) {
+		if (whnat || tunnel_prefill)
+			return 0;
+		lockdep_assert_held(&hnat_priv->entry_lock);
+		if (!hnat_npu_mcast_prepare(skb, dev, &entry, skb_hnat_ppe(skb),
+					    skb_hnat_entry(skb))) {
+			entry.bfib1.ttl = 1;
+			entry.bfib1.state = BIND;
+			hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
+					    skb_hnat_entry(skb), skb, &entry,
+					    false, false, 0, &accepted);
+		}
+		return 0;
+	}
 
 	if (whnat || tunnel_prefill) {
 		if (!hnat_flow_entry_unbind_match(&entry, foe) ||
@@ -2892,6 +2926,8 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 	u64 account_generation = 0, shadow_sequence;
 	bool account_handled, accepted = false;
 	struct ethhdr *eth;
+	struct hnat_tunnel_token rx_token = {};
+	const struct mtk_npu_rx_meta *rx = mtk_npu_rx_meta_find(skb);
 
 	if (skb_hnat_alg(skb) || !is_hnat_info_filled(skb) ||
 	    !is_magic_tag_valid(skb) || !IS_SPACE_AVAILABLE_HEAD(skb))
@@ -3170,20 +3206,34 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 	else
 		entry.ipv6_5t_route.act_dp &= ~UDF_HNAT_PRE_FILLED;
 
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	if (rx) {
+		if ((IS_IPV4_GRP(&entry) ? entry.ipv4_hnapt.tops_entry :
+			 entry.ipv6_5t_route.tops_entry) != rx->entry ||
+		    !hnat_tunnel_rx_bind_lock(rx, &rx_token))
+			return NF_ACCEPT;
+	} else if ((IS_IPV4_GRP(&entry) ? entry.ipv4_hnapt.tops_entry :
+		    entry.ipv6_5t_route.tops_entry) >= 32) {
+		return NF_ACCEPT;
+	}
+#else
+	if (rx)
+		return NF_ACCEPT;
+#endif
 	spin_lock_bh(&hnat_priv->entry_lock);
 	if (!hnat_flow_entry_lock_current(&entry, skb_hnat_ppe(skb),
 					  skb_hnat_entry(skb),
 					  account_generation, shadow_sequence,
 					  &flow)) {
 		spin_unlock_bh(&hnat_priv->entry_lock);
-		return NF_ACCEPT;
+		goto rx_unlock;
 	}
 	if (!hnat_flow_entry_unbind_match(&flow->data, hw_entry) ||
 	    !hnat_flow_entry_unbind_match(&entry, hw_entry)) {
 		hnat_flow_entry_delete(flow);
 		spin_unlock_bh(&hnat_priv->flow_entry_lock);
 		spin_unlock_bh(&hnat_priv->entry_lock);
-		return NF_ACCEPT;
+		goto rx_unlock;
 	}
 
 	account_handled = hnat_account_commit(hnat_priv, skb_hnat_ppe(skb),
@@ -3194,7 +3244,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 		hnat_flow_entry_delete(flow);
 		spin_unlock_bh(&hnat_priv->flow_entry_lock);
 		spin_unlock_bh(&hnat_priv->entry_lock);
-		return NF_ACCEPT;
+		goto rx_unlock;
 	}
 	if (!account_handled) {
 		/* Missing accounting is a legal path only when accounting is
@@ -3205,7 +3255,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 			hnat_flow_entry_delete(flow);
 			spin_unlock_bh(&hnat_priv->flow_entry_lock);
 			spin_unlock_bh(&hnat_priv->entry_lock);
-			return NF_ACCEPT;
+			goto rx_unlock;
 		}
 		hnat_copy_foe_info(hw_entry, &entry);
 		wmb();
@@ -3270,6 +3320,9 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 	}
 #endif
 	spin_unlock_bh(&hnat_priv->entry_lock);
+rx_unlock:
+	if (rx)
+		hnat_tunnel_bind_unlock(&rx_token);
 	return NF_ACCEPT;
 }
 
@@ -3879,6 +3932,7 @@ static bool hnat_tunnel_pending_outer(struct sk_buff *skb)
 		return false;
 	type = skb_hnat_tops(skb);
 	if (type != FLOW_OFFLOAD_TNL_GRETAP + 1 &&
+	    type != FLOW_OFFLOAD_TNL_PPTP + 1 &&
 	    type != FLOW_OFFLOAD_TNL_VXLAN + 1 &&
 	    type != FLOW_OFFLOAD_TNL_L2TP_V2 + 1)
 		return false;
@@ -4100,6 +4154,20 @@ reject:
 #endif
 }
 
+static int hnat_mcast_unshare(struct sk_buff *skb)
+{
+	/* Bridge multicast replicates cloned skbs. The ordinary HNAT parser
+	 * needs a private header before modifying its metadata. Zero extra
+	 * headroom preserves the descriptor stored at skb->head.
+	 */
+	if (skb_header_cloned(skb) && hnat_npu_mcast_active() &&
+	    IS_SPACE_AVAILABLE_HEAD(skb) && is_magic_tag_valid(skb) &&
+	    skb_mac_header_was_set(skb) &&
+	    is_multicast_ether_addr(eth_hdr(skb)->h_dest))
+		return skb_cow_head(skb, 0);
+	return 0;
+}
+
 static unsigned int mtk_hnat_nf_post_routing(
 	struct sk_buff *skb, const struct net_device *out,
 	unsigned int (*fn)(struct sk_buff *, const struct net_device *,
@@ -4115,6 +4183,8 @@ static unsigned int mtk_hnat_nf_post_routing(
 	int path_err = 0;
 
 #if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	if (hnat_mcast_unshare(skb))
+		return 0;
 	if (skb_header_cloned(skb) &&
 	    (hnat_tunnel_available() ||
 	     (IS_SPACE_AVAILABLE_HEAD(skb) && is_magic_tag_valid(skb) && skb_hnat_tops(skb))))
@@ -4160,6 +4230,10 @@ static unsigned int mtk_hnat_nf_post_routing(
 	}
 
 #if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	if ((hw_path.flags & BIT(DEV_PATH_TNL)) && mtk_npu_rx_meta_find(skb)) {
+		skb_hnat_alg(skb) = 1;
+		return 0;
+	}
 	if ((hw_path.flags & BIT(DEV_PATH_TNL)) && hnat_tunnel_available()) {
 		struct iphdr copy;
 		const struct iphdr *ip = skb_header_pointer(skb, skb_network_offset(skb),
@@ -4169,6 +4243,7 @@ static unsigned int mtk_hnat_nf_post_routing(
 		    !hnat_tunnel_ipv4_payload_valid(skb, skb_network_offset(skb), ip) ||
 		    dev_net(out) != &init_net ||
 		    (hw_path.tnl_type != FLOW_OFFLOAD_TNL_GRETAP &&
+		     hw_path.tnl_type != FLOW_OFFLOAD_TNL_PPTP &&
 		     hw_path.tnl_type != FLOW_OFFLOAD_TNL_VXLAN &&
 		     hw_path.tnl_type != FLOW_OFFLOAD_TNL_L2TP_V2)) {
 			skb_hnat_alg(skb) = 1;
@@ -4209,9 +4284,18 @@ static unsigned int mtk_hnat_nf_post_routing(
 		if (fn && !(hw_path.flags & BIT(DEV_PATH_TNL)) && fn(skb, arp_dev, &hw_path))
 			break;
 
-		spin_lock_bh(&hnat_priv->entry_lock);
-		skb_to_hnat_info(skb, out, entry, &hw_path);
-		spin_unlock_bh(&hnat_priv->entry_lock);
+		{
+			struct hnat_tunnel_token rx_token = {};
+			const struct mtk_npu_rx_meta *rx = mtk_npu_rx_meta_find(skb);
+
+			if (rx && !hnat_tunnel_rx_bind_lock(rx, &rx_token))
+				break;
+			spin_lock_bh(&hnat_priv->entry_lock);
+			skb_to_hnat_info(skb, out, entry, &hw_path);
+			spin_unlock_bh(&hnat_priv->entry_lock);
+			if (rx)
+				hnat_tunnel_bind_unlock(&rx_token);
+		}
 		break;
 	case HIT_BIND_KEEPALIVE_DUP_OLD_HDR:
 		/* update hnat count to nf_conntrack by keepalive */
@@ -4513,7 +4597,30 @@ static unsigned int mtk_hnat_br_nf_forward(void *priv,
 	return NF_ACCEPT;
 }
 
+/* Learn bridge multicast even when the optional WiFi driver has not adjusted
+ * the ordinary HNAT bridge hooks. Only UNBIND rate notifications enter this
+ * path; replicated traffic and keepalive handling retain their normal hooks.
+ */
+static unsigned int
+mtk_hnat_br_mcast_post_routing(void *priv, struct sk_buff *skb,
+			       const struct nf_hook_state *state)
+{
+	if (state->out && hnat_npu_mcast_active() &&
+	    IS_SPACE_AVAILABLE_HEAD(skb) && is_magic_tag_valid(skb) &&
+	    skb_mac_header_was_set(skb) &&
+	    is_multicast_ether_addr(eth_hdr(skb)->h_dest) &&
+	    skb_hnat_reason(skb) == HIT_UNBIND_RATE_REACH)
+		mtk_hnat_nf_post_routing(skb, state->out, NULL, __func__);
+	return NF_ACCEPT;
+}
+
 static struct nf_hook_ops mtk_hnat_nf_ops[] __read_mostly = {
+	{
+		.hook = mtk_hnat_br_mcast_post_routing,
+		.pf = NFPROTO_BRIDGE,
+		.hooknum = NF_BR_POST_ROUTING,
+		.priority = NF_BR_PRI_LAST,
+	},
 	{
 		.hook = mtk_hnat_nf_conntrack,
 		.pf = NFPROTO_IPV4,

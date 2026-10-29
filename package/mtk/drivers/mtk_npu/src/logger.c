@@ -8,12 +8,15 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/interrupt.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/relay.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
-#include "npu/debugfs/debugfs.h"
+#include "npu/debugfs.h"
+#include "npu/firmware.h"
 #include "npu/hwspinlock.h"
 #include "npu/internal.h"
 #include "npu/logger.h"
@@ -63,7 +66,11 @@ struct npu_logger {
 	struct npu_logger_offload offload;
 	void __iomem *base;
 	u8 state;
+	bool accepting;
+	int irq;
 };
+
+static DEFINE_MUTEX(logger_control_lock);
 
 static struct npu_logger logger = {
 #if defined(CONFIG_MTK_NPU_LOGGER_FW_DEFAULT_RUNNING)
@@ -159,7 +166,11 @@ static int mtk_npu_logger_pool_read(struct npu_logger_info *info,
 				    char *buffer,
 				    size_t buffer_len)
 {
-	memcpy(buffer, npu.base + info->log_pool_addr, buffer_len);
+	if (!smp_load_acquire(&info->log_pool_phy_addr) ||
+	    buffer_len > sizeof(struct log_pool) ||
+	    info->log_pool_addr > npu.size || buffer_len > npu.size - info->log_pool_addr)
+		return -ERANGE;
+	memcpy_fromio(buffer, npu.base + info->log_pool_addr, buffer_len);
 
 	return 0;
 }
@@ -168,7 +179,11 @@ static int mtk_npu_logger_pool_write(struct npu_logger_info *info,
 				     char *buffer,
 				     size_t buffer_len)
 {
-	memcpy(npu.base + info->log_pool_addr, buffer, buffer_len);
+	if (!smp_load_acquire(&info->log_pool_phy_addr) ||
+	    buffer_len > sizeof(struct log_pool) ||
+	    info->log_pool_addr > npu.size || buffer_len > npu.size - info->log_pool_addr)
+		return -ERANGE;
+	memcpy_toio(npu.base + info->log_pool_addr, buffer, buffer_len);
 
 	return 0;
 }
@@ -181,7 +196,9 @@ static int mtk_npu_logger_pool_data_pointer_forward(struct npu_logger_info *info
 	int ret;
 
 	/* take hw lock of log pool before writing */
-	mtk_npu_hwspin_lock(info->hwspin_grp, info->hwspin_slot);
+	ret = mtk_npu_hwspin_lock(info->hwspin_grp, info->hwspin_slot);
+	if (ret)
+		return ret;
 
 	ret = mtk_npu_logger_pool_read(info,
 					(char *)lp_info,
@@ -228,7 +245,9 @@ static int mtk_npu_logger_pool_data_pointer_reset(struct npu_logger_info *info)
 	memset(lp_info, 0, sizeof(struct log_pool_info));
 
 	/* take hw lock of log pool before writing */
-	mtk_npu_hwspin_lock(info->hwspin_grp, info->hwspin_slot);
+	ret = mtk_npu_hwspin_lock(info->hwspin_grp, info->hwspin_slot);
+	if (ret)
+		return ret;
 
 	ret = mtk_npu_logger_pool_write(info,
 					 (char *)lp_info,
@@ -258,20 +277,24 @@ static int mtk_npu_logger_pool_addr_get(void)
 {
 	struct mailbox_msg msg;
 	int ret;
+	u32 mgmt_addr = 0, offload_addr = 0, mgmt_offset, offload_offset;
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg1 = LOGGER_CMD_TYPE_LOG_POOL_ADDR_GET;
 
 	ret = mbox_send_msg(&logger.mgmt.send_mbox_dev,
 			    &msg,
-			    &logger.mgmt.info.log_pool_phy_addr,
+			    &mgmt_addr,
 			    log_pool_addr_get_ret_handler);
 	if (ret) {
 		NPU_ERR("send LOG_POOL_ADDR_GET cmd to coreM failed(%d)\n", ret);
 		return ret;
 	}
 
-	logger.mgmt.info.log_pool_addr = logger.mgmt.info.log_pool_phy_addr - (MGMT_PERI_BASE);
+	ret = mtk_npu_fw_offset(mgmt_addr,
+				sizeof(struct log_pool), &mgmt_offset);
+	if (ret)
+		return ret;
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg1 = LOGGER_CMD_TYPE_LOG_POOL_ADDR_GET;
@@ -282,16 +305,23 @@ static int mtk_npu_logger_pool_addr_get(void)
 	 */
 	ret = mbox_send_msg(&logger.offload.send_mbox_dev[CORE_OFFLOAD_0],
 			    &msg,
-			    &logger.offload.info.log_pool_phy_addr,
+			    &offload_addr,
 			    log_pool_addr_get_ret_handler);
 	if (ret) {
 		NPU_ERR("send LOG_POOL_ADDR_GET cmd to core%d failed(%d)\n", CORE_OFFLOAD_0, ret);
 		return ret;
 	}
 
-	logger.offload.info.log_pool_addr = (logger.offload.info.log_pool_phy_addr
-					     - (MGMT_PERI_BASE));
+	ret = mtk_npu_fw_offset(offload_addr,
+				sizeof(struct log_pool), &offload_offset);
+	if (ret)
+		return ret;
 
+	/* Never publish a nonzero address until both mappings were checked. */
+	WRITE_ONCE(logger.mgmt.info.log_pool_addr, mgmt_offset);
+	WRITE_ONCE(logger.offload.info.log_pool_addr, offload_offset);
+	smp_store_release(&logger.mgmt.info.log_pool_phy_addr, mgmt_addr);
+	smp_store_release(&logger.offload.info.log_pool_phy_addr, offload_addr);
 	NPU_INFO("mgmt log pool(0x%08X), offload log pool(0x%08X)",
 		  logger.mgmt.info.log_pool_phy_addr,
 		  logger.offload.info.log_pool_phy_addr);
@@ -322,7 +352,7 @@ static void mtk_npu_logger_work(struct work_struct *work)
 	 */
 	if (!mtk_npu_mcu_alive()) {
 		if (info->work_retry_count++ < LOGGER_WORK_RETRY_COUNT_MAX) {
-			schedule_delayed_work(&info->dwork, LOGGER_WORK_DELAY_MS);
+			schedule_delayed_work(&info->dwork, msecs_to_jiffies(LOGGER_WORK_DELAY_MS));
 		} else {
 			NPU_ERR("logger work retry %u times, mcu is still not alive\n",
 				 info->work_retry_count);
@@ -333,7 +363,7 @@ static void mtk_npu_logger_work(struct work_struct *work)
 	}
 	info->work_retry_count = 0;
 
-	if (info->log_pool_phy_addr == 0) {
+	if (!smp_load_acquire(&info->log_pool_phy_addr)) {
 		ret = mtk_npu_logger_pool_addr_get();
 		if (ret) {
 			NPU_ERR("get log pool address failed(%d)\n", ret);
@@ -387,7 +417,8 @@ static enum mbox_msg_cnt mtk_npu_ap_recv_mgmt_mbox_msg(struct mailbox_dev *mdev,
 {
 	switch (msg->msg1) {
 	case LOGGER_CMD_TYPE_NEW_DATA_NOTIFY:
-		schedule_delayed_work(&logger.mgmt.info.dwork, 0);
+		if (READ_ONCE(logger.accepting))
+			schedule_delayed_work(&logger.mgmt.info.dwork, 0);
 		break;
 	default:
 		break;
@@ -401,7 +432,8 @@ static enum mbox_msg_cnt mtk_npu_ap_recv_offload_mbox_msg(struct mailbox_dev *md
 {
 	switch (msg->msg1) {
 	case LOGGER_CMD_TYPE_NEW_DATA_NOTIFY:
-		schedule_delayed_work(&logger.offload.info.dwork, 0);
+		if (READ_ONCE(logger.accepting))
+			schedule_delayed_work(&logger.offload.info.dwork, 0);
 		break;
 	default:
 		break;
@@ -442,12 +474,12 @@ static int mtk_npu_logger_fs_init(void)
 	};
 	int ret = 0;
 
-	if (!debugfs_npu_root)
+	if (!npu_debugfs_root)
 		return -ENOMEM;
 
 	if (!logger.mgmt.info.relay && !logger.offload.info.relay) {
 		logger.mgmt.info.relay =
-			relay_open("log-mgmt", debugfs_npu_root,
+			relay_open("log-mgmt", npu_debugfs_root,
 				   LOG_RLY_SUBBUF_SZ,
 				   LOG_RLY_SUBBUF_NUM,
 				   &relay_cb, NULL);
@@ -455,7 +487,7 @@ static int mtk_npu_logger_fs_init(void)
 			return -EINVAL;
 
 		logger.offload.info.relay =
-			relay_open("log-offload", debugfs_npu_root,
+			relay_open("log-offload", npu_debugfs_root,
 				   LOG_RLY_SUBBUF_SZ,
 				   LOG_RLY_SUBBUF_NUM,
 				   &relay_cb, NULL);
@@ -482,6 +514,8 @@ static void mtk_npu_logger_fs_deinit(void)
 {
 	relay_close(logger.mgmt.info.relay);
 	relay_close(logger.offload.info.relay);
+	logger.mgmt.info.relay = NULL;
+	logger.offload.info.relay = NULL;
 }
 
 static int mtk_npu_logger_mbox_register(void)
@@ -567,15 +601,22 @@ static inline void mtk_npu_logger_delay_work_deinit(void)
 	cancel_delayed_work_sync(&logger.offload.info.dwork);
 }
 
-static void mtk_npu_logger_start(void)
+static int mtk_npu_logger_start(void)
 {
 	struct mailbox_dev *send_mdev;
 	struct mailbox_msg msg;
 	enum core_id core;
 	int ret;
 
-	mtk_npu_logger_pool_data_pointer_reset(&logger.mgmt.info);
-	mtk_npu_logger_pool_data_pointer_reset(&logger.offload.info);
+	ret = mtk_npu_logger_pool_addr_get();
+	if (ret)
+		return ret;
+	ret = mtk_npu_logger_pool_data_pointer_reset(&logger.mgmt.info);
+	if (ret)
+		return ret;
+	ret = mtk_npu_logger_pool_data_pointer_reset(&logger.offload.info);
+	if (ret)
+		return ret;
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg1 = LOGGER_CMD_TYPE_LOGGER_START;
@@ -593,9 +634,10 @@ static void mtk_npu_logger_start(void)
 			else
 				NPU_ERR("send LOGGER_START cmd to core%d failed(%d)\n", core, ret);
 
-			return;
+			return ret;
 		}
 	}
+	return 0;
 }
 
 static void mtk_npu_logger_stop(void)
@@ -632,31 +674,43 @@ static void mtk_npu_logger_stop(void)
 	}
 }
 
+static void mtk_npu_logger_pause_work(void)
+{
+	WRITE_ONCE(logger.accepting, false);
+	/* A callback which sampled true may still be about to queue work. */
+	synchronize_irq(logger.irq);
+	mtk_npu_logger_delay_work_deinit();
+	logger.mgmt.info.log_pool_phy_addr = 0;
+	logger.offload.info.log_pool_phy_addr = 0;
+}
+
 void mtk_npu_logger_enable(void)
 {
+	mutex_lock(&logger_control_lock);
 	if (logger.state == LOGGER_STATE_RUNNING)
-		return;
-	else if (logger.state == LOGGER_STATE_FW_DEFAULT_RUNNING)
-		/*
-		 * there's no need to send the LOGGER_START command to NPU,
-		 * because the logger of the firmware part already running
-		 */
 		goto out;
-
-	mtk_npu_logger_start();
-
+	if (!mtk_npu_mcu_alive())
+		goto out;
+	if (logger.state != LOGGER_STATE_FW_DEFAULT_RUNNING && mtk_npu_logger_start())
+		goto out;
+	WRITE_ONCE(logger.state, LOGGER_STATE_RUNNING);
+	WRITE_ONCE(logger.accepting, true);
+	schedule_delayed_work(&logger.mgmt.info.dwork, 0);
+	schedule_delayed_work(&logger.offload.info.dwork, 0);
 out:
-	logger.state = LOGGER_STATE_RUNNING;
+	mutex_unlock(&logger_control_lock);
 }
 
 void mtk_npu_logger_disable(void)
 {
-	if (logger.state != LOGGER_STATE_RUNNING)
-		return;
-
-	mtk_npu_logger_stop();
-
-	logger.state = LOGGER_STATE_NOT_RUNNING;
+	mutex_lock(&logger_control_lock);
+	if (logger.state >= LOGGER_STATE_FW_DEFAULT_RUNNING) {
+		mtk_npu_logger_pause_work();
+		if (mtk_npu_mcu_alive())
+			mtk_npu_logger_stop();
+		WRITE_ONCE(logger.state, LOGGER_STATE_NOT_RUNNING);
+	}
+	mutex_unlock(&logger_control_lock);
 }
 
 bool mtk_npu_logger_is_running(void)
@@ -666,8 +720,9 @@ bool mtk_npu_logger_is_running(void)
 
 void mtk_npu_logger_running_sync(void)
 {
-	if (logger.state >= LOGGER_STATE_FW_DEFAULT_RUNNING) {
-		logger_write(LOGGER_RUNNING_SYNC_REG, 1);
+	logger_write(LOGGER_RUNNING_SYNC_REG,
+		     READ_ONCE(logger.state) >= LOGGER_STATE_FW_DEFAULT_RUNNING);
+	if (READ_ONCE(logger.state) >= LOGGER_STATE_FW_DEFAULT_RUNNING) {
 
 		NPU_INFO("sync logger running done\n");
 	}
@@ -734,48 +789,102 @@ static inline void mtk_npu_logger_pool_mem_free(void)
 	devm_kfree(npu.dev, logger.offload.info.lp_info);
 }
 
+static int logger_before_reset(struct mcu_state_notifier *notifier)
+{
+	mutex_lock(&logger_control_lock);
+	mtk_npu_logger_pause_work();
+	mutex_unlock(&logger_control_lock);
+	return 0;
+}
+
+static int logger_after_reset(struct mcu_state_notifier *notifier)
+{
+	mutex_lock(&logger_control_lock);
+	logger.mgmt.info.log_pool_phy_addr = 0;
+	logger.offload.info.log_pool_phy_addr = 0;
+	if (logger.state >= LOGGER_STATE_FW_DEFAULT_RUNNING) {
+		WRITE_ONCE(logger.accepting, true);
+		schedule_delayed_work(&logger.mgmt.info.dwork, 0);
+		schedule_delayed_work(&logger.offload.info.dwork, 0);
+	}
+	mutex_unlock(&logger_control_lock);
+	return 0;
+}
+
+static struct mcu_state_notifier logger_stop_notifier = {
+	.pre_enter = logger_before_reset,
+};
+static struct mcu_state_notifier logger_init_notifier = {
+	.post_enter = logger_after_reset,
+};
+static struct mcu_state_notifier logger_freerun_notifier = {
+	.pre_enter = logger_after_reset,
+};
+
 int mtk_npu_logger_init(struct platform_device *pdev)
 {
 	int ret;
 
-	ret = mtk_npu_logger_mbox_register();
-	if (ret) {
-		NPU_ERR("register mbox failed(%d)\n", ret);
-		return ret;
-	}
-
+	logger.irq = platform_get_irq_byname(pdev, "mbox");
+	if (logger.irq < 0)
+		return logger.irq;
+	WRITE_ONCE(logger.accepting, false);
+	logger.state = IS_ENABLED(CONFIG_MTK_NPU_LOGGER_FW_DEFAULT_RUNNING) ?
+		LOGGER_STATE_FW_DEFAULT_RUNNING : LOGGER_STATE_NOT_RUNNING;
+	logger.mgmt.info.log_pool_phy_addr = 0;
+	logger.offload.info.log_pool_phy_addr = 0;
+	logger.mgmt.info.work_retry_count = 0;
+	logger.offload.info.work_retry_count = 0;
 	ret = mtk_npu_logger_fs_init();
-	if (ret) {
-		NPU_ERR("init relayfs failed(%d)\n", ret);
-		goto mbox_unregister;
-	}
-
+	if (ret)
+		return ret;
 	ret = mtk_npu_logger_pool_mem_alloc();
-	if (ret) {
-		NPU_ERR("alloc pool mem failed(%d)\n", ret);
+	if (ret)
 		goto fs_deinit;
-	}
-
 	mtk_npu_logger_delay_work_init();
+	/* Publish IRQ callbacks only after their buffers and workers exist. */
+	ret = mtk_npu_logger_mbox_register();
+	if (ret)
+		goto pool_deinit;
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_NETSTOP, &logger_stop_notifier);
+	if (ret)
+		goto mbox_deinit;
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_INIT, &logger_init_notifier);
+	if (ret)
+		goto unregister_stop;
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_FREERUN, &logger_freerun_notifier);
+	if (ret)
+		goto unregister_init;
+	return 0;
 
-	return ret;
-
+unregister_init:
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_INIT, &logger_init_notifier);
+unregister_stop:
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_NETSTOP, &logger_stop_notifier);
+mbox_deinit:
+	WRITE_ONCE(logger.accepting, false);
+	mtk_npu_logger_mbox_unregister();
+pool_deinit:
+	mtk_npu_logger_delay_work_deinit();
+	mtk_npu_logger_pool_mem_free();
 fs_deinit:
 	mtk_npu_logger_fs_deinit();
-
-mbox_unregister:
-	mtk_npu_logger_mbox_unregister();
-
 	return ret;
 }
 
 void mtk_npu_logger_deinit(struct platform_device *pdev)
 {
+	/* No logger state lock while waiting for a state notifier to complete. */
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_FREERUN, &logger_freerun_notifier);
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_INIT, &logger_init_notifier);
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_NETSTOP, &logger_stop_notifier);
+	/* Stop mailbox producers before draining work and freeing its buffers. */
+	WRITE_ONCE(logger.accepting, false);
+	mtk_npu_logger_mbox_unregister();
 	mtk_npu_logger_delay_work_deinit();
 
 	mtk_npu_logger_pool_mem_free();
 
 	mtk_npu_logger_fs_deinit();
-
-	mtk_npu_logger_mbox_unregister();
+	logger.state = LOGGER_STATE_NOT_RUNNING;
 }

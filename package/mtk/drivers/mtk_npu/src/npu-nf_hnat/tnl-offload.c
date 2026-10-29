@@ -7,6 +7,8 @@
 
 #include <linux/err.h>
 #include <linux/module.h>
+#include <linux/if_arp.h>
+#include <linux/ppp_channel.h>
 
 #include <net/flow_offload.h>
 #include <net/ip.h>
@@ -35,8 +37,14 @@
 static int mtk_npu_nf_hnat_tnl_info_cls_setup(struct npu_tnl_info *tnl_info);
 static void mtk_npu_nf_hnat_tnl_info_cls_destroy(struct npu_tnl_info *tnl_info);
 
+static void hnat_flush_index(u32 index)
+{
+	hnat_tunnel_flush(index + __NPU_TUNNEL_TYPE_MAX);
+}
+
 static struct npu_tnl_info_ops hnat_tnl_info_ops = {
 	.flush = mtk_npu_tnl_info_flush_one_ppe_tnl,
+	.flush_index = hnat_flush_index,
 	.cls_setup = mtk_npu_nf_hnat_tnl_info_cls_setup,
 	.cls_destroy = mtk_npu_nf_hnat_tnl_info_cls_destroy,
 };
@@ -302,6 +310,10 @@ static int mtk_npu_nf_hnat_tnl_info_setup(struct npu_tnl_input *tnl_input,
 		return -EPERM;
 
 	spin_lock(&tnl_info->lock);
+	if (dev->type == ARPHRD_PPP && !ppp_netdev_tunnel_offload_allowed(dev)) {
+		spin_unlock(&tnl_info->lock);
+		return -EOPNOTSUPP;
+	}
 	if ((tnl_info->status & (TNL_STA_DELETING | TNL_STA_DELETING_SKIP_PCE)) ||
 	    (tnl_info->dev && tnl_info->dev != dev)) {
 		spin_unlock(&tnl_info->lock);
@@ -362,8 +374,11 @@ static int mtk_npu_nf_hnat_tnl_info_setup(struct npu_tnl_input *tnl_input,
 	    (tnl_info->status & (TNL_STA_UPDATING | TNL_STA_QUEUED)) ||
 	    memcmp(&tnl_info->cache, &tnl_info->tnl_params, sizeof(tnl_info->cache)))
 		ret = -EAGAIN;
-	else if (tnl_input->hnat.generation)
+	else if (tnl_input->hnat.generation) {
 		*tnl_input->hnat.generation = tnl_info->generation;
+		if (tnl_input->hnat.token)
+			tnl_input->hnat.token->allocation = tnl_info->allocation_cookie;
+	}
 	spin_unlock(&tnl_info->lock);
 	return ret;
 }
@@ -631,7 +646,7 @@ static bool mtk_npu_nf_hnat_tnl_is_encrypted_offloadable(struct sk_buff *skb)
 	return skb && !skb_hnat_cdrt(skb) && skb_dst(skb) && dst_xfrm(skb_dst(skb));
 }
 
-static struct net_device *mtk_npu_get_tnl_dev(u8 reason)
+static struct net_device *mtk_npu_get_tnl_dev(u8 reason, struct mtk_npu_rx_meta *meta)
 {
 	struct npu_tnl_info *info;
 	struct net_device *dev = NULL;
@@ -644,9 +659,19 @@ static struct net_device *mtk_npu_get_tnl_dev(u8 reason)
 	if (IS_ERR(info))
 		return NULL;
 	spin_lock_irqsave(&info->lock, flags);
-	if (info->dev && (info->status & TNL_STA_UPDATED) &&
+	if (mtk_npu_tnl_offload_ready() &&
+	    info->dev && (info->status & TNL_STA_UPDATED) &&
+	    !(info->status & (TNL_STA_UPDATING | TNL_STA_QUEUED |
+			      TNL_STA_DELETING | TNL_STA_DELETING_SKIP_PCE)) &&
+	    info->synced_generation == info->generation &&
+	    (info->dev->type != ARPHRD_PPP ||
+	     ppp_netdev_tunnel_offload_allowed(info->dev)) &&
 	    tnl_info_decap_is_enable(info) && netif_running(info->dev)) {
 		dev = info->dev;
+		meta->entry = info->tnl_idx + __NPU_TUNNEL_TYPE_MAX;
+		meta->tunnel_ifindex = dev->ifindex;
+		meta->generation = info->generation;
+		meta->allocation = info->allocation_cookie;
 		dev_hold(dev);
 	}
 	spin_unlock_irqrestore(&info->lock, flags);
@@ -655,19 +680,34 @@ static struct net_device *mtk_npu_get_tnl_dev(u8 reason)
 
 static int mcu_netstop_pre_enter(struct mcu_state_notifier *notifier)
 {
-	mtk_npu_tnl_info_flush_all_ppe_tnl();
-
 	mtk_npu_tnl_info_backup_all();
+	mtk_npu_tnl_info_flush_all_ppe_tnl();
 
 	return 0;
 }
 
 static int mcu_init_pre_leave(struct mcu_state_notifier *notifier)
 {
-	mtk_npu_misc_set_ppe_num();
+	int ret;
+
+	ret = mtk_npu_misc_set_ppe_num();
+	if (ret)
+		return ret;
+	/* Firmware may relocate the table on every boot/recovery. */
+	ret = mtk_npu_tnl_offload_post_init(NULL);
+	if (ret)
+		return ret;
 
 	mtk_npu_tnl_info_restore_all();
 
+	return 0;
+}
+
+static int mcu_freerun_pre_enter(struct mcu_state_notifier *notifier)
+{
+	/* Some reset events return from NETSTOP without a cold INIT. */
+	if (!mtk_npu_tnl_offload_ready())
+		return mcu_init_pre_leave(notifier);
 	return 0;
 }
 
@@ -677,6 +717,10 @@ static struct mcu_state_notifier mcu_netstop_notifier = {
 
 static struct mcu_state_notifier mcu_init_notifier = {
 	.pre_leave = mcu_init_pre_leave,
+};
+
+static struct mcu_state_notifier mcu_freerun_notifier = {
+	.pre_enter = mcu_freerun_pre_enter,
 };
 
 static struct npu_tnl_offload_ops nf_hnat_tnl_ops = {
@@ -693,10 +737,14 @@ static bool mtk_npu_bind_lock(struct net_device *dev, struct hnat_tunnel_token *
 	if (IS_ERR(info))
 		return false;
 	spin_lock_bh(&info->lock);
-	if (info->dev != dev || !netif_running(dev) ||
+	if (!mtk_npu_tnl_offload_ready() ||
+	    info->dev != dev || !netif_running(dev) ||
+	    (dev->type == ARPHRD_PPP && !ppp_netdev_tunnel_offload_allowed(dev)) ||
 	    !mtk_npu_egress_matches(info, token) ||
 	    !netif_running(token->underlay) || !netif_running(token->egress) ||
 	    info->generation != token->generation ||
+	    info->allocation_cookie != token->allocation ||
+	    info->synced_generation != info->generation ||
 	    !(info->status & TNL_STA_UPDATED) ||
 	    (info->status & (TNL_STA_UPDATING | TNL_STA_QUEUED |
 			    TNL_STA_DELETING | TNL_STA_DELETING_SKIP_PCE)) ||
@@ -705,6 +753,37 @@ static bool mtk_npu_bind_lock(struct net_device *dev, struct hnat_tunnel_token *
 		spin_unlock_bh(&info->lock);
 		return false;
 	}
+	token->private = info;
+	return true;
+}
+
+static bool mtk_npu_rx_bind_lock(const struct mtk_npu_rx_meta *meta,
+				 struct hnat_tunnel_token *token)
+{
+	struct npu_tnl_info *info;
+
+	if (!mtk_tnl_rx_meta_current(meta) || meta->entry < 32 || meta->entry >= 64 ||
+	    !mtk_npu_is_ready() || !mtk_npu_mcu_alive())
+		return false;
+	info = mtk_npu_tnl_info_get_by_idx(meta->entry - 32);
+	if (IS_ERR(info))
+		return false;
+	spin_lock_bh(&info->lock);
+	if (!mtk_npu_tnl_offload_ready() || !info->dev ||
+	    (u32)info->dev->ifindex != meta->tunnel_ifindex || !netif_running(info->dev) ||
+	    info->generation != meta->generation ||
+	    info->allocation_cookie != meta->allocation ||
+	    info->synced_generation != info->generation ||
+	    !(info->status & TNL_STA_UPDATED) ||
+	    (info->status & (TNL_STA_UPDATING | TNL_STA_QUEUED |
+			    TNL_STA_DELETING | TNL_STA_DELETING_SKIP_PCE)) ||
+	    !tnl_info_decap_is_enable(info) ||
+	    (info->dev->type == ARPHRD_PPP &&
+	     !ppp_netdev_tunnel_offload_allowed(info->dev))) {
+		spin_unlock_bh(&info->lock);
+		return false;
+	}
+	token->index = meta->entry - 32;
 	token->private = info;
 	return true;
 }
@@ -721,25 +800,38 @@ static const struct hnat_tunnel_ops packet_ops = {
 	.decap_offload = mtk_npu_tnl_decap_offload,
 	.encap_offload = mtk_npu_tnl_encap_offload,
 	.bind_lock = mtk_npu_bind_lock,
+	.rx_bind_lock = mtk_npu_rx_bind_lock,
 	.bind_unlock = mtk_npu_bind_unlock,
 };
 static const struct mtk_tnl_rx_ops rx_ops = { .get_dev = mtk_npu_get_tnl_dev };
+static const struct ppp_tunnel_offload_ops ppp_ops = {
+	.quiesce = mtk_npu_tnl_info_quiesce_ppp,
+	.invalidate = mtk_npu_tnl_info_invalidate_ppp,
+};
 
 int mtk_npu_nf_hnat_tnl_offload_start(void)
 {
 	int ret;
 
-	ret = mtk_tnl_rx_register(&rx_ops);
+	ret = ppp_tunnel_offload_register(&ppp_ops);
 	if (ret)
 		return ret;
+	ret = mtk_tnl_rx_register(&rx_ops);
+	if (ret)
+		goto ppp_remove;
 	ret = hnat_tunnel_register(&packet_ops);
 	if (ret)
 		mtk_tnl_rx_unregister(&rx_ops);
+	if (!ret)
+		return 0;
+ppp_remove:
+	ppp_tunnel_offload_unregister(&ppp_ops);
 	return ret;
 }
 
 void mtk_npu_nf_hnat_tnl_offload_stop(void)
 {
+	ppp_tunnel_offload_unregister(&ppp_ops);
 	hnat_tunnel_unregister(&packet_ops);
 	mtk_tnl_rx_unregister(&rx_ops);
 	mtk_npu_tnl_info_flush_all_ppe_tnl();
@@ -758,23 +850,34 @@ int mtk_npu_nf_hnat_tnl_offload_init(void)
 	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_INIT, &mcu_init_notifier);
 	if (ret)
 		goto netstop_remove;
-	ret = mtk_npu_gretap_init();
+	ret = mtk_npu_mcu_state_notifier_register(MCU_STATE_TYPE_FREERUN,
+						&mcu_freerun_notifier);
 	if (ret)
 		goto init_remove;
+	ret = mtk_npu_gretap_init();
+	if (ret)
+		goto freerun_remove;
 	ret = mtk_npu_l2tpv2_init();
 	if (ret)
 		goto gre_remove;
 	ret = mtk_npu_vxlan_init();
 	if (ret)
 		goto l2tp_remove;
+	ret = mtk_npu_pptp_init();
+	if (ret)
+		goto vxlan_remove;
 	ret = mtk_npu_misc_set_ppe_num();
 	if (!ret)
 		return 0;
+	mtk_npu_pptp_deinit();
+vxlan_remove:
 	mtk_npu_vxlan_deinit();
 l2tp_remove:
 	mtk_npu_l2tpv2_deinit();
 gre_remove:
 	mtk_npu_gretap_deinit();
+freerun_remove:
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_FREERUN, &mcu_freerun_notifier);
 init_remove:
 	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_INIT, &mcu_init_notifier);
 netstop_remove:
@@ -786,6 +889,8 @@ ops_remove:
 
 void mtk_npu_nf_hnat_tnl_offload_deinit(void)
 {
+	mtk_npu_mcu_state_notifier_unregister(MCU_STATE_TYPE_FREERUN, &mcu_freerun_notifier);
+	mtk_npu_pptp_deinit();
 	mtk_npu_vxlan_deinit();
 	mtk_npu_l2tpv2_deinit();
 	mtk_npu_gretap_deinit();

@@ -87,6 +87,7 @@ struct npu_mcast_grp {
 	struct npu_mcast_grp_params params;
 	struct list_head excess_clients;
 	u32 id;
+	bool hnat_owner;
 };
 
 enum npu_mcast_dest {
@@ -190,12 +191,18 @@ void mtk_npu_mcast_qos_enable(bool en);
 bool mtk_npu_mcast_tid_is_enabled(void);
 void mtk_npu_mcast_tid_enable(bool en);
 bool mtk_npu_mcast_is_enabled(void);
-void mtk_npu_mcast_enable(bool en);
+int mtk_npu_mcast_enable(bool en);
+int mtk_npu_mcast_set_enabled(bool en);
 int mtk_npu_mcast_mac_saddr_get(u8 *mac);
 void mtk_npu_mcast_mac_saddr_set(u8 *mac);
 
 int mtk_npu_mcast_init(void);
 void mtk_npu_mcast_deinit(void);
+int mtk_npu_mcast_restore(void);
+void mtk_npu_mcast_pause(void);
+void mtk_npu_mcast_resume(void);
+int mtk_npu_mcast_publish(void);
+void mtk_npu_mcast_unpublish(void);
 #else /* !defined(CONFIG_MTK_NPU_MCAST) */
 static inline void mtk_npu_mcast_grp_show(struct seq_file *s, u8 idx)
 {

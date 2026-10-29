@@ -35,6 +35,8 @@ config MTK_NPU_GRE
 
 config MTK_NPU_GRETAP
 	bool "Mediatek NPU L2oGRE HW Offload"
+	depends on !MTK_NPU_24_10_DPDK_BACKEND
+	depends on !MTK_NPU_24_10_FLOW_BACKEND
 	default y
 	select MTK_NPU_GRE
 	select PACKAGE_kmod-gre
@@ -44,19 +46,18 @@ config MTK_NPU_GRETAP
 config MTK_NPU_PPP
 	bool
 
-# PPTP still lacks the required lifetime-safe state/sequence interface.
-# L2TPv2 uses the separate scalar snapshot API ported in this tree.
 config MTK_NPU_PPP_SOCKET
 	bool
-	default n
+	default y if MTK_NPU_24_10_TUNNEL_BACKEND || MTK_NPU_24_10_FLOW_BACKEND
 
 config MTK_NPU_PPTP
 	bool "Mediatek NPU PPTP HW Offload"
+	depends on !MTK_NPU_24_10_DPDK_BACKEND
 	depends on MTK_NPU_PPP_SOCKET
-	default n
+	default y
 	select MTK_NPU_PPP
 	select PACKAGE_ppp-mod-pptp
-	select PACKAGE_pptpd
+	select PACKAGE_kmod-pptp
 	help
 	  select y for PPTP HW offload by tunnel offload processing system
 
@@ -66,7 +67,7 @@ config MTK_NPU_L2TP
 
 config MTK_NPU_L2TP_V2
 	bool "Mediatek NPU L2TPv2 HW Offload"
-	depends on MTK_NPU_24_10_TUNNEL_BACKEND
+	depends on MTK_NPU_24_10_TUNNEL_BACKEND || MTK_NPU_24_10_FLOW_BACKEND
 	default y
 	select MTK_NPU_L2TP
 	select MTK_NPU_PPP
@@ -78,6 +79,8 @@ config MTK_NPU_L2TP_V2
 
 config MTK_NPU_VXLAN
 	bool "Mediatek NPU VXLAN HW Offload"
+	depends on !MTK_NPU_24_10_DPDK_BACKEND
+	depends on !MTK_NPU_24_10_FLOW_BACKEND
 	default y
 	select PACKAGE_kmod-vxlan
 	help

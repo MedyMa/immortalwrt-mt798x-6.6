@@ -1142,8 +1142,9 @@ int hnat_tunnel_flush(u32 tops_entry);
 /* Callbacks execute in packet context before entry_lock acquisition.  A
  * backend unregisters and drains callbacks before freeing protocol state.
  */
+struct mtk_npu_rx_meta;
 struct hnat_tunnel_token {
-	u64 epoch, generation;
+	u64 epoch, generation, allocation;
 	u32 index;
 	unsigned long irq_flags;
 	void *private;
@@ -1159,6 +1160,8 @@ struct hnat_tunnel_ops {
 	int (*encap_offload)(struct sk_buff *skb, struct ethhdr *eth, struct net_device *dev,
 			     struct hnat_tunnel_token *token);
 	bool (*bind_lock)(struct net_device *dev, struct hnat_tunnel_token *token);
+	bool (*rx_bind_lock)(const struct mtk_npu_rx_meta *meta,
+			     struct hnat_tunnel_token *token);
 	void (*bind_unlock)(struct hnat_tunnel_token *token);
 };
 int hnat_tunnel_register(const struct hnat_tunnel_ops *ops);
@@ -1169,6 +1172,8 @@ int hnat_tunnel_decap_offload(struct sk_buff *skb);
 int hnat_tunnel_encap_offload(struct sk_buff *skb, struct ethhdr *eth, struct net_device *dev,
 			      struct hnat_tunnel_token *token);
 bool hnat_tunnel_bind_lock(struct net_device *dev, struct hnat_tunnel_token *token);
+bool hnat_tunnel_rx_bind_lock(const struct mtk_npu_rx_meta *meta,
+			       struct hnat_tunnel_token *token);
 void hnat_tunnel_bind_unlock(struct hnat_tunnel_token *token);
 
 #if defined(CONFIG_MEDIATEK_NETSYS_V2) || defined(CONFIG_MEDIATEK_NETSYS_V3)

@@ -66,6 +66,6 @@ enum hwspinlock_clust_slot {
 };
 
 int mtk_npu_hwspin_try_lock(enum hwspinlock_group grp, u32 slot);
-void mtk_npu_hwspin_lock(enum hwspinlock_group grp, u32 slot);
+int __must_check mtk_npu_hwspin_lock(enum hwspinlock_group grp, u32 slot);
 void mtk_npu_hwspin_unlock(enum hwspinlock_group grp, u32 slot);
 #endif /* _NPU_HWSPIN_LOCK_H_ */

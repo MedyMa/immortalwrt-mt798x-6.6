@@ -5,6 +5,7 @@
  */
 
 #include <linux/completion.h>
+#include <asm/unaligned.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/etherdevice.h>
@@ -12,10 +13,18 @@
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
 #include <net/ipv6.h>
+#include <net/ip.h>
+#include <net/dsa.h>
+#include <linux/mutex.h>
+#include <linux/rcupdate.h>
+#include <linux/if_bridge.h>
+#include <linux/rtnetlink.h>
 
 #include <mtk_hnat/hnat_mcast.h>
 
 #include "npu/netsys.h"
+#include "npu/firmware.h"
+#include "npu/npu.h"
 #include "npu/mbox.h"
 #include "npu/net-core.h"
 
@@ -34,6 +43,8 @@
 #define NPU_MCAST_CLIENT_STATISTIC_OFS(cidx)	((cidx) * sizeof(struct npu_mcast_client_statistic))
 
 struct npu_mcast {
+	bool online;
+	bool enabled;
 	struct {
 		struct npu_mcast_grp tbls[NPU_MCAST_TBL_IDX_MAX];
 		DECLARE_BITMAP(used, NPU_MCAST_TBL_IDX_MAX);
@@ -51,7 +62,16 @@ struct npu_mcast {
 	u32 statistic_ofs;
 };
 
-static struct npu_mcast mcast;
+static struct npu_mcast mcast = {
+	.grp.lock = __SPIN_LOCK_UNLOCKED(mcast.grp.lock),
+	.bss.lock = __SPIN_LOCK_UNLOCKED(mcast.bss.lock),
+};
+
+static bool mtk_npu_mcast_live(void)
+{
+	return READ_ONCE(mcast.online) && READ_ONCE(mcast.enabled) &&
+		mtk_npu_is_ready() && mtk_npu_mcu_alive();
+}
 static struct npu_mcast_statistic mcast_statistic;
 
 static const char * const mcast_dest_name[] = {
@@ -69,47 +89,58 @@ static const char * const vlan_policy_name[] = {
 	[NPU_MCAST_VLAN_ALLOW] = "Allow",
 };
 
-static struct npu_wifi_mcast_ops *wifi_mcast_ops;
+static struct npu_wifi_mcast_ops __rcu *wifi_mcast_ops;
+static DEFINE_MUTEX(wifi_mcast_admin);
 
 int mtk_npu_wifi_mcast_ops_register(struct npu_wifi_mcast_ops *ops)
 {
-	if (wifi_mcast_ops) {
-		NPU_NOTICE("wi-fi ops already registered\n");
-		return -EBUSY;
-	}
-	wifi_mcast_ops = ops;
-
-	NPU_DBG("wi-fi ops registered successfully\n");
-	return 0;
+	int ret = 0;
+	if (!ops || !ops->notify_mcast_sw_path || !ops->notify_mcast_hw_path)
+		return -EINVAL;
+	mutex_lock(&wifi_mcast_admin);
+	if (rcu_access_pointer(wifi_mcast_ops))
+		ret = -EBUSY;
+	else
+		rcu_assign_pointer(wifi_mcast_ops, ops);
+	mutex_unlock(&wifi_mcast_admin);
+	return ret;
 }
 EXPORT_SYMBOL(mtk_npu_wifi_mcast_ops_register);
 
 int mtk_npu_wifi_mcast_ops_unregister(struct npu_wifi_mcast_ops *ops)
 {
-	if (wifi_mcast_ops != ops) {
-		NPU_NOTICE("wi-fi ops not expected\n");
-		return -EINVAL;
+	int ret = 0;
+	mutex_lock(&wifi_mcast_admin);
+	if (rcu_access_pointer(wifi_mcast_ops) != ops)
+		ret = -EINVAL;
+	else {
+		rcu_assign_pointer(wifi_mcast_ops, NULL);
+		synchronize_rcu();
 	}
-	wifi_mcast_ops = NULL;
-
-	NPU_DBG("wi-fi ops unregistered\n");
-	return 0;
+	mutex_unlock(&wifi_mcast_admin);
+	return ret;
 }
 EXPORT_SYMBOL(mtk_npu_wifi_mcast_ops_unregister);
 
 static void mtk_npu_mcast_notify_sw_path(int group_idx)
 {
-	if (wifi_mcast_ops && wifi_mcast_ops->notify_mcast_sw_path)
-		wifi_mcast_ops->notify_mcast_sw_path(group_idx);
-
+	struct npu_wifi_mcast_ops *ops;
+	rcu_read_lock();
+	ops = rcu_dereference(wifi_mcast_ops);
+	if (ops && ops->notify_mcast_sw_path)
+		ops->notify_mcast_sw_path(group_idx);
+	rcu_read_unlock();
 	hnat_notify_mcast_sw_path(group_idx);
 }
 
 static void mtk_npu_mcast_notify_hw_path(int group_idx)
 {
-	if (wifi_mcast_ops && wifi_mcast_ops->notify_mcast_hw_path)
-		wifi_mcast_ops->notify_mcast_hw_path(group_idx);
-
+	struct npu_wifi_mcast_ops *ops;
+	rcu_read_lock();
+	ops = rcu_dereference(wifi_mcast_ops);
+	if (ops && ops->notify_mcast_hw_path)
+		ops->notify_mcast_hw_path(group_idx);
+	rcu_read_unlock();
 	hnat_notify_mcast_hw_path(group_idx);
 }
 
@@ -215,6 +246,9 @@ static bool mtk_npu_mcast_network_params_is_valid(struct npu_mcast_addr *src,
 						  struct npu_mcast_addr *dst,
 						  enum npu_mcast_addr_type type)
 {
+	if (!src || !dst)
+		return false;
+
 	if (type == NPU_MCAST_ADDR_TYPE_IP)
 		return mtk_npu_mcast_ip_params_is_valid(src, dst);
 	else if (type == NPU_MCAST_ADDR_TYPE_IPV6)
@@ -352,6 +386,7 @@ static void mtk_npu_mcast_grp_free(struct npu_mcast_grp *grp)
 		return;
 
 	clear_bit(grp->id, mcast.grp.used);
+	grp->hnat_owner = false;
 }
 
 static void mtk_npu_mcast_client_show(struct seq_file *s,
@@ -433,6 +468,10 @@ int mtk_npu_mcast_grp_insert(struct npu_mcast_addr *src,
 		return -EPERM;
 
 	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	grp = mtk_npu_mcast_grp_alloc();
 	if (IS_ERR(grp)) {
@@ -467,43 +506,49 @@ static int mtk_npu_mcast_grp_fw_write(struct npu_mcast_grp *grp)
 	struct npu_mcast_grp_params *p = &grp->params;
 	u32 i;
 
+	if (!mcast.online)
+		return -EAGAIN;
+
 	for (i = 0; i < sizeof(struct npu_mcast_grp_params); i += 4) {
-		writel(*(u32 *)((uintptr_t)p + i),
+		writel(get_unaligned((u32 *)((u8 *)p + i)),
 		       nmcast.base + mcast.grp.tbl_ofs + NPU_MCAST_GRP_PARAMS_OFS(grp) + i);
 	}
 
+	wmb();
 	cmd.arg[1] = grp->id;
 
 	return mtk_npu_net_send_cmd_all_no_wait(&cmd);
 }
 
-static void mtk_npu_mcast_grp_clear(struct npu_mcast_grp *grp)
+static int mtk_npu_mcast_grp_clear(struct npu_mcast_grp *grp)
 {
-	struct npu_mcast_client *client;
-	struct npu_mcast_client *tmp;
-
-	if (unlikely(!grp))
-		return;
-
+	struct npu_mcast_client *client, *tmp;
+	struct npu_mcast_grp_params backup;
+	int ret;
+	if (!grp)
+		return -EINVAL;
+	backup = grp->params;
+	memset(&grp->params, 0, sizeof(grp->params));
+	ret = mtk_npu_mcast_grp_fw_write(grp);
+	if (ret) {
+		grp->params = backup;
+		return ret;
+	}
 	list_for_each_entry_safe(client, tmp, &grp->excess_clients, node) {
 		list_del(&client->node);
 		kfree(client->params);
 		kfree(client);
 	}
-
-	memset(&grp->params, 0, sizeof(struct npu_mcast_grp_params));
-	mtk_npu_mcast_grp_fw_write(grp);
+	return 0;
 }
 
 static int mtk_npu_mcast_grp_delete_by_idx_no_lock(u8 idx)
 {
-	struct npu_mcast_grp *grp;
-
-	grp = &mcast.grp.tbls[idx];
-	mtk_npu_mcast_grp_clear(grp);
-	mtk_npu_mcast_grp_free(grp);
-
-	return 0;
+	struct npu_mcast_grp *grp = &mcast.grp.tbls[idx];
+	int ret = mtk_npu_mcast_grp_clear(grp);
+	if (!ret)
+		mtk_npu_mcast_grp_free(grp);
+	return ret;
 }
 
 int mtk_npu_mcast_grp_delete_by_idx(u8 idx)
@@ -521,6 +566,10 @@ int mtk_npu_mcast_grp_delete_by_idx(u8 idx)
 		goto unlock;
 	}
 
+	if (mcast.grp.tbls[idx].hnat_owner) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 	ret = mtk_npu_mcast_grp_delete_by_idx_no_lock(idx);
 
 unlock:
@@ -532,16 +581,18 @@ unlock:
 int mtk_npu_mcast_grp_delete_all(void)
 {
 	unsigned long flags;
-	int ret;
+	int ret = 0, err;
 	u32 i;
-
 	spin_lock_irqsave(&mcast.grp.lock, flags);
-
-	for_each_set_bit(i, mcast.grp.used, NPU_MCAST_TBL_IDX_MAX)
-		ret = mtk_npu_mcast_grp_delete_by_idx_no_lock(i);
-
+	for_each_set_bit(i, mcast.grp.used, NPU_MCAST_TBL_IDX_MAX) {
+		if (mcast.grp.tbls[i].hnat_owner)
+			err = -EBUSY;
+		else
+			err = mtk_npu_mcast_grp_delete_by_idx_no_lock(i);
+		if (!ret)
+			ret = err;
+	}
 	spin_unlock_irqrestore(&mcast.grp.lock, flags);
-
 	return ret;
 }
 
@@ -574,6 +625,10 @@ int mtk_npu_mcast_grp_update_by_idx(u32 idx,
 		return -EPERM;
 
 	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	if (!test_bit(idx, mcast.grp.used)) {
 		ret = -ENOENT;
@@ -581,6 +636,10 @@ int mtk_npu_mcast_grp_update_by_idx(u32 idx,
 	}
 
 	grp = &mcast.grp.tbls[idx];
+	if (grp->hnat_owner) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 	memcpy(&backup, &grp->params, sizeof(backup));
 
 	mtk_npu_mcast_network_params_setup(grp, src, dst, type);
@@ -732,8 +791,8 @@ static int __mtk_npu_mcast_client_insert(struct npu_mcast_grp *grp,
 	grp->params.client_num--;
 
 	if (!grp->params.client_num) {
-		mtk_npu_mcast_grp_clear(grp);
-		mtk_npu_mcast_grp_free(grp);
+		if (!mtk_npu_mcast_grp_clear(grp))
+			mtk_npu_mcast_grp_free(grp);
 	}
 
 	return ret;
@@ -751,6 +810,10 @@ int mtk_npu_mcast_client_insert_by_grp_idx(int gidx, struct npu_mcast_client_par
 		return -EINVAL;
 
 	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	if (!test_bit(gidx, mcast.grp.used)) {
 		ret = -ENOENT;
@@ -758,6 +821,10 @@ int mtk_npu_mcast_client_insert_by_grp_idx(int gidx, struct npu_mcast_client_par
 	}
 
 	grp = &mcast.grp.tbls[gidx];
+	if (grp->hnat_owner) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 
 	if (mtk_npu_mcast_client_find(grp, client)) {
 		ret = -EEXIST;
@@ -772,16 +839,16 @@ unlock:
 	return ret;
 }
 
-int mtk_npu_mcast_client_insert(struct npu_mcast_addr *src,
+static int mtk_npu_mcast_client_insert_owned(struct npu_mcast_addr *src,
 				struct npu_mcast_addr *dst,
 				enum npu_mcast_addr_type type,
-				struct npu_mcast_client_params *client)
+				struct npu_mcast_client_params *client, bool hnat)
 {
 	struct npu_mcast_grp *grp;
 	unsigned long flags;
 	int ret;
 
-	if (!client || is_zero_ether_addr(client->daddr) ||
+	if (!src || !dst || !client || is_zero_ether_addr(client->daddr) ||
 	    (client->m2u_en && is_multicast_ether_addr(client->daddr)) ||
 	    (!client->m2u_en && client->dest != NPU_MCAST_DEST_WIFI &&
 	     !mtk_npu_mcast_daddr_is_mapped_from_ip(dst, type, client)))
@@ -791,6 +858,10 @@ int mtk_npu_mcast_client_insert(struct npu_mcast_addr *src,
 		return -EPERM;
 
 	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	grp = mtk_npu_mcast_grp_find(src, dst, type);
 	if (!grp) {
@@ -799,6 +870,7 @@ int mtk_npu_mcast_client_insert(struct npu_mcast_addr *src,
 			ret = PTR_ERR(grp);
 			goto unlock;
 		}
+		grp->hnat_owner = hnat;
 		mtk_npu_mcast_network_params_setup(grp, src, dst, type);
 
 		if (mtk_npu_mcast_network_params_is_exist(grp)) {
@@ -807,6 +879,10 @@ int mtk_npu_mcast_client_insert(struct npu_mcast_addr *src,
 			ret = -EEXIST;
 			goto unlock;
 		}
+	}
+	if (grp->hnat_owner != hnat) {
+		ret = -EBUSY;
+		goto unlock;
 	}
 	client->grp_idx = grp->id;
 
@@ -821,6 +897,12 @@ unlock:
 	spin_unlock_irqrestore(&mcast.grp.lock, flags);
 
 	return ret;
+}
+int mtk_npu_mcast_client_insert(struct npu_mcast_addr *src,
+	struct npu_mcast_addr *dst, enum npu_mcast_addr_type type,
+	struct npu_mcast_client_params *client)
+{
+	return mtk_npu_mcast_client_insert_owned(src, dst, type, client, false);
 }
 EXPORT_SYMBOL(mtk_npu_mcast_client_insert);
 
@@ -913,8 +995,9 @@ static int __mtk_npu_mcast_client_delete(struct npu_mcast_grp *grp, int cidx)
 	}
 
 	if (grp->params.client_num == 0) {
-		mtk_npu_mcast_grp_clear(grp);
-		mtk_npu_mcast_grp_free(grp);
+		ret = mtk_npu_mcast_grp_clear(grp);
+		if (!ret)
+			mtk_npu_mcast_grp_free(grp);
 	}
 
 	return ret;
@@ -930,6 +1013,10 @@ int mtk_npu_mcast_client_delete_by_idx(int gidx, int cidx)
 		return -EINVAL;
 
 	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	if (!test_bit(gidx, mcast.grp.used)) {
 		NPU_NOTICE("multicast group not found\n");
@@ -938,6 +1025,10 @@ int mtk_npu_mcast_client_delete_by_idx(int gidx, int cidx)
 	}
 
 	grp = &mcast.grp.tbls[gidx];
+	if (grp->hnat_owner) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 
 	if (cidx < 0 || cidx >= grp->params.client_num) {
 		NPU_NOTICE("client index %d out of range (client_num %u)\n",
@@ -971,11 +1062,20 @@ int mtk_npu_mcast_client_delete(struct npu_mcast_addr *src,
 		return -EPERM;
 
 	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	grp = mtk_npu_mcast_grp_find(src, dst, type);
 	if (!grp) {
 		NPU_NOTICE("multicast group not found\n");
 		ret = -ENOENT;
+		goto unlock;
+	}
+
+	if (grp->hnat_owner) {
+		ret = -EBUSY;
 		goto unlock;
 	}
 
@@ -1044,6 +1144,10 @@ int mtk_npu_mcast_client_update_by_idx(int gidx, int cidx,
 		return -EINVAL;
 
 	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	if (!test_bit(gidx, mcast.grp.used)) {
 		ret = -ENOENT;
@@ -1051,6 +1155,10 @@ int mtk_npu_mcast_client_update_by_idx(int gidx, int cidx,
 	}
 
 	grp = &mcast.grp.tbls[gidx];
+	if (grp->hnat_owner) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 
 	if (cidx < 0 || cidx >= grp->params.client_num) {
 		ret = -EINVAL;
@@ -1081,7 +1189,7 @@ int mtk_npu_mcast_client_update(struct npu_mcast_addr *src,
 	unsigned long flags;
 	int ret;
 
-	if (!client || is_zero_ether_addr(client->daddr) ||
+	if (!src || !dst || !client || is_zero_ether_addr(client->daddr) ||
 	    (client->m2u_en && is_multicast_ether_addr(client->daddr)) ||
 	    (!client->m2u_en && client->dest != NPU_MCAST_DEST_WIFI &&
 	     !mtk_npu_mcast_daddr_is_mapped_from_ip(dst, type, client)))
@@ -1091,10 +1199,19 @@ int mtk_npu_mcast_client_update(struct npu_mcast_addr *src,
 		return -EPERM;
 
 	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	grp = mtk_npu_mcast_grp_find(src, dst, type);
 	if (!grp) {
 		ret = -ENOENT;
+		goto unlock;
+	}
+
+	if (grp->hnat_owner) {
+		ret = -EBUSY;
 		goto unlock;
 	}
 
@@ -1179,6 +1296,9 @@ static void mtk_npu_mcast_hnat_params_convert(struct npu_mcast_client_params *c,
 					      enum npu_mcast_addr_type *type,
 					      struct mcast_offload_info *minfo)
 {
+	memset(c, 0, sizeof(*c));
+	memset(src, 0, sizeof(*src));
+	memset(dst, 0, sizeof(*dst));
 	memcpy(c->daddr, minfo->daddr, ETH_ALEN);
 	c->dest = minfo->dest;
 	if (minfo->dest == NPU_MCAST_DEST_SWITCH)
@@ -1227,6 +1347,8 @@ static int mtk_npu_mcast_client_insert_hnat(struct mcast_offload_info *hnat_mcas
 	enum npu_mcast_addr_type type;
 	struct npu_mcast_addr src;
 	struct npu_mcast_addr dst;
+	struct npu_mcast_grp *grp;
+	unsigned long flags;
 	int ret;
 
 	if (!hnat_mcast_params)
@@ -1238,9 +1360,16 @@ static int mtk_npu_mcast_client_insert_hnat(struct mcast_offload_info *hnat_mcas
 
 	mtk_npu_mcast_hnat_params_convert(&c, &src, &dst, &type, hnat_mcast_params);
 
-	ret = mtk_npu_mcast_client_insert(&src, &dst, type, &c);
-	if (!ret)
-		hnat_mcast_params->npu_grp_idx = c.grp_idx;
+	c.grp_idx = 0x7f; /* invalid host index; the firmware field is seven bits */
+	hnat_mcast_params->npu_grp_idx = NPU_MCAST_TBL_IDX_MAX;
+	ret = mtk_npu_mcast_client_insert_owned(&src, &dst, type, &c, true);
+	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (c.grp_idx < NPU_MCAST_TBL_IDX_MAX && test_bit(c.grp_idx, mcast.grp.used)) {
+		grp = &mcast.grp.tbls[c.grp_idx];
+		if (grp->hnat_owner && grp == mtk_npu_mcast_grp_find(&src, &dst, type))
+			hnat_mcast_params->npu_grp_idx = c.grp_idx;
+	}
+	spin_unlock_irqrestore(&mcast.grp.lock, flags);
 
 	return ret;
 }
@@ -1336,11 +1465,15 @@ static int mtk_npu_mcast_bss_params_submit(struct npu_mcast_bss_params *bss)
 	if (unlikely(!bss))
 		return -EINVAL;
 
+	if (!mcast.online)
+		return -EAGAIN;
+
 	for (i = 0; i < sizeof(*bss); i += 4) {
-		writel(*(u32 *)((uintptr_t)bss + i),
+		writel(get_unaligned((u32 *)((u8 *)bss + i)),
 		       nmcast.base + mcast.bss.tbl_ofs + NPU_MCAST_BSS_PARAMS_OFS(bss) + i);
 	}
 
+	wmb();
 	cmd.arg[1] = bss->id;
 
 	return mtk_npu_net_send_cmd_all_no_wait(&cmd);
@@ -1382,7 +1515,7 @@ void mtk_npu_mcast_bss_show(struct seq_file *s)
 
 static bool mtk_npu_mcast_bss_params_is_valid(struct npu_mcast_bss_params *bss)
 {
-	if (bss->bssid > NPU_MCAST_BSSID_MAX) {
+	if (bss->bssid >= NPU_MCAST_BSSID_MAX) {
 		NPU_NOTICE("invalid bssid: %u\n", bss->bssid);
 		return false;
 	}
@@ -1443,7 +1576,12 @@ int mtk_npu_mcast_bss_params_insert(struct npu_mcast_bss_params *nbss)
 		return -EINVAL;
 
 	spin_lock_irqsave(&mcast.bss.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 	ret = __mtk_npu_mcast_bss_params_insert(nbss);
+unlock:
 	spin_unlock_irqrestore(&mcast.bss.lock, flags);
 
 	return ret;
@@ -1475,7 +1613,14 @@ int mtk_npu_mcast_bss_params_delete_by_idx(u8 idx)
 	unsigned long flags;
 	int ret;
 
+	if (idx >= NPU_MCAST_BSS_TBL_IDX_MAX)
+		return -EINVAL;
+
 	spin_lock_irqsave(&mcast.bss.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	if (!test_bit(idx, mcast.bss.used)) {
 		ret = -ENOENT;
@@ -1502,6 +1647,10 @@ int mtk_npu_mcast_bss_params_delete(struct npu_mcast_bss_params *nbss)
 		return -EINVAL;
 
 	spin_lock_irqsave(&mcast.bss.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 	bss = mtk_npu_mcast_bss_params_find_by_bssid(nbss->bssid);
 	if (!bss) {
 		NPU_NOTICE("bss id: %u not found in npu multicast table\n", nbss->bssid);
@@ -1549,7 +1698,14 @@ int mtk_npu_mcast_bss_params_update_by_idx(u8 idx,
 	if (unlikely(!new))
 		return -EINVAL;
 
+	if (idx >= NPU_MCAST_BSS_TBL_IDX_MAX)
+		return -EINVAL;
+
 	spin_lock_irqsave(&mcast.bss.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 
 	if (!test_bit(idx, mcast.bss.used)) {
 		ret = -ENOENT;
@@ -1577,6 +1733,10 @@ int mtk_npu_mcast_bss_params_update(struct npu_mcast_bss_params *new)
 		return -EINVAL;
 
 	spin_lock_irqsave(&mcast.bss.lock, flags);
+	if (!mcast.online) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
 	old = mtk_npu_mcast_bss_params_find_by_bssid(new->bssid);
 	if (!old) {
 		NPU_NOTICE("bssid[%u] not found in npu multicast table\n", new->bssid);
@@ -1665,16 +1825,10 @@ bool mtk_npu_mcast_is_enabled(void)
 	return cmd.ret[0];
 }
 
-void mtk_npu_mcast_enable(bool en)
+int mtk_npu_mcast_set_enabled(bool en)
 {
-	struct net_cmd cmd = {
-		.type = NPU_NET_CMD_TYPE_MCAST,
-		.sub_type = NPU_MCAST_NET_CMD_SET,
-		.arg[0] = NPU_MCAST_NET_CMD_SET_EN,
-		.arg[1] = en,
-	};
-
-	mtk_npu_net_send_cmd_all_no_wait(&cmd);
+	WRITE_ONCE(mcast.enabled, en);
+	return mtk_npu_mcast_restore();
 }
 
 static void mtk_npu_mcast_mac_saddr_encode(struct net_cmd *cmd, u8 *mac)
@@ -1789,14 +1943,15 @@ EXPORT_SYMBOL(mtk_npu_mcast_statistic_enable);
 struct npu_mcast_statistic *mtk_npu_mcast_statistic_read(void)
 {
 	struct npu_mcast_statistic *p = &mcast_statistic;
-	u32 i;
+	unsigned long flags;
 
-	if (mcast.statistic_ofs == 0)
+	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!mcast.online || !mcast.statistic_ofs) {
+		spin_unlock_irqrestore(&mcast.grp.lock, flags);
 		return NULL;
-
-	for (i = 0; i < sizeof(struct npu_mcast_statistic); i += 4)
-		*((u32 *)((uintptr_t)p + i)) = readl(nmcast.base + mcast.statistic_ofs + i);
-
+	}
+	memcpy_fromio(p, nmcast.base + mcast.statistic_ofs, sizeof(*p));
+	spin_unlock_irqrestore(&mcast.grp.lock, flags);
 	return p;
 }
 EXPORT_SYMBOL(mtk_npu_mcast_statistic_read);
@@ -1815,19 +1970,18 @@ u16 mtk_npu_mcast_statistic_client_read(u8 gidx, u8 cidx)
 
 	spin_lock_irqsave(&mcast.grp.lock, flags);
 
-	if (!test_bit(gidx, mcast.grp.used))
+	if (!mcast.online || !test_bit(gidx, mcast.grp.used))
 		goto unlock;
 
 	grp = &mcast.grp.tbls[gidx];
 	if (cidx >= min_t(u16, grp->params.client_num, NPU_MCAST_CLIENT_MAX))
 		goto unlock;
 
-	spin_unlock_irqrestore(&mcast.grp.lock, flags);
-
 	pkt_cnt = readw(nmcast.base + mcast.statistic_ofs +
 			NPU_MCAST_GRP_STATISTIC_OFS(gidx) +
 			NPU_MCAST_CLIENT_STATISTIC_OFS(cidx));
 
+	spin_unlock_irqrestore(&mcast.grp.lock, flags);
 	return pkt_cnt;
 
 unlock:
@@ -1861,13 +2015,21 @@ static int mtk_npu_mcast_tbl_ofs_init(void)
 	ret = mtk_npu_net_send_cmd_mgmt(&cmd);
 	if (ret || cmd.return_cnt != 1)
 		return -EINVAL;
-	mcast.grp.tbl_ofs = cmd.ret[0] - 0x09100000; /* TODO */
+	ret = mtk_npu_fw_offset(cmd.ret[0],
+			 sizeof(struct npu_mcast_grp_params) * NPU_MCAST_TBL_IDX_MAX,
+			 &mcast.grp.tbl_ofs);
+	if (ret)
+		return ret;
 
 	cmd.arg[0] = NPU_MCAST_NET_CMD_BSS_PARAMS_BASE_ADDR_GET,
 	ret = mtk_npu_net_send_cmd_mgmt(&cmd);
 	if (ret || cmd.return_cnt != 1)
 		return -EINVAL;
-	mcast.bss.tbl_ofs = cmd.ret[0] - 0x09100000; /* TODO */
+	ret = mtk_npu_fw_offset(cmd.ret[0],
+			 sizeof(struct npu_mcast_bss_params) * NPU_MCAST_BSS_TBL_IDX_MAX,
+			 &mcast.bss.tbl_ofs);
+	if (ret)
+		return ret;
 
 	return 0;
 }
@@ -1885,61 +2047,228 @@ static int mtk_npu_mcast_statistic_init(void)
 
 	if (ret || cmd.return_cnt != 1)
 		return -EINVAL;
-	mcast.statistic_ofs = cmd.ret[0] - 0x09100000; /* TODO */
+	ret = mtk_npu_fw_offset(cmd.ret[0], sizeof(struct npu_mcast_statistic),
+			 &mcast.statistic_ofs);
+	if (ret)
+		return ret;
 
 	return 0;
 }
 
-static struct npu_hnat_mcast_ops hnat_mcast_ops = {
+
+/* The HNAT worker holds a device reference and calls this in process context.
+ * Use RTNL trylock: an FE notifier may be draining that worker under RTNL.
+ */
+static int mtk_npu_mcast_resolve_client(struct net_device *dev,
+					struct mcast_offload_info *info)
+{
+	struct mtk_eth *eth = mtk_npu_netsys_get_eth();
+	struct net_device *master = dev;
+	struct dsa_port *dp;
+	int i, ret = -EOPNOTSUPP;
+
+	if (!eth || !dev || !info || dev_net(dev) != &init_net)
+		return -EINVAL;
+	if (!rtnl_trylock())
+		return -EAGAIN;
+	if (!netif_running(dev) || dev->reg_state != NETREG_REGISTERED ||
+	    !netif_carrier_ok(dev) || br_port_get_stp_state(dev) != BR_STATE_FORWARDING)
+		goto out;
+	if (dsa_slave_dev_check(dev)) {
+		dp = dsa_port_from_netdev(dev);
+		if (IS_ERR(dp) || dp->index >= NPU_MCAST_DSA_LAN_PORT_MAX)
+			goto out;
+		master = dp->cpu_dp->master;
+		if (master != eth->netdev[0] || !master->dsa_ptr ||
+		    master->dsa_ptr->tag_ops->proto != DSA_TAG_PROTO_MTK)
+			goto out;
+		info->dest = NPU_MCAST_DEST_SWITCH;
+		info->dsa_port = dp->index;
+		ret = 0;
+		goto out;
+	}
+	for (i = 1; i < MTK_MAX_DEVS; i++) {
+		if (eth->netdev[i] != dev)
+			continue;
+		/* Firmware LAN/WAN IDs refer to GDM3/GDM2 respectively. They
+		 * do not depend on the user's logical LAN/WAN bridge names.
+		 */
+		info->dest = i == 1 ? NPU_MCAST_DEST_WAN : NPU_MCAST_DEST_LAN;
+		ret = 0;
+		break;
+	}
+out:
+	rtnl_unlock();
+	return ret;
+}
+
+static int mtk_npu_mcast_group_delete_hnat(u8 idx)
+{
+	unsigned long flags;
+	int ret;
+
+	if (idx >= NPU_MCAST_TBL_IDX_MAX)
+		return -EINVAL;
+	spin_lock_irqsave(&mcast.grp.lock, flags);
+	if (!test_bit(idx, mcast.grp.used))
+		ret = -ENOENT;
+	else if (!mcast.grp.tbls[idx].hnat_owner)
+		ret = -EACCES;
+	else
+		ret = mtk_npu_mcast_grp_delete_by_idx_no_lock(idx);
+	spin_unlock_irqrestore(&mcast.grp.lock, flags);
+	return ret;
+}
+
+static const struct npu_hnat_mcast_ops hnat_mcast_ops = {
 	.npu_mcast_client_insert = mtk_npu_mcast_client_insert_hnat,
 	.npu_mcast_client_delete = mtk_npu_mcast_client_delete_hnat,
 	.npu_mcast_client_update = mtk_npu_mcast_client_update_hnat,
+	.group_delete = mtk_npu_mcast_group_delete_hnat,
+	.resolve_client = mtk_npu_mcast_resolve_client,
+	.ready = mtk_npu_mcast_live,
 };
 
-int mtk_npu_mcast_init(void)
+static void mtk_npu_mcast_host_clear(void)
 {
+	struct npu_mcast_client *client, *tmp;
+	unsigned long flags;
+	u32 i;
+
+	spin_lock_irqsave(&mcast.grp.lock, flags);
+	spin_lock(&mcast.bss.lock);
+	mcast.online = false;
+	for (i = 0; i < NPU_MCAST_TBL_IDX_MAX; i++) {
+		struct npu_mcast_grp *grp = &mcast.grp.tbls[i];
+
+		if (grp->excess_clients.next) {
+			list_for_each_entry_safe(client, tmp, &grp->excess_clients, node) {
+				list_del(&client->node);
+				kfree(client->params);
+				kfree(client);
+			}
+		}
+		memset(grp, 0, sizeof(*grp));
+		grp->id = i;
+		INIT_LIST_HEAD(&grp->excess_clients);
+	}
+	bitmap_zero(mcast.grp.used, NPU_MCAST_TBL_IDX_MAX);
+	memset(mcast.bss.tbls, 0, sizeof(mcast.bss.tbls));
+	bitmap_zero(mcast.bss.used, NPU_MCAST_BSS_TBL_IDX_MAX);
+	for (i = 0; i < NPU_MCAST_BSS_TBL_IDX_MAX; i++)
+		mcast.bss.tbls[i].id = i;
+	mcast.grp.tbl_ofs = mcast.bss.tbl_ofs = mcast.statistic_ofs = 0;
+	spin_unlock(&mcast.bss.lock);
+	spin_unlock_irqrestore(&mcast.grp.lock, flags);
+}
+
+static bool mtk_npu_mcast_ranges_overlap(u32 a, size_t alen, u32 b, size_t blen)
+{
+	return (u64)a < (u64)b + blen && (u64)b < (u64)a + alen;
+}
+
+int mtk_npu_mcast_restore(void)
+{
+	struct net_cmd cmd = {
+		.type = NPU_NET_CMD_TYPE_MCAST,
+		.sub_type = NPU_MCAST_NET_CMD_PARAMS,
+	};
+	const size_t groups = sizeof(struct npu_mcast_grp_params) * NPU_MCAST_TBL_IDX_MAX;
+	const size_t bss = sizeof(struct npu_mcast_bss_params) * NPU_MCAST_BSS_TBL_IDX_MAX;
+	const size_t statistics = sizeof(struct npu_mcast_statistic);
+	unsigned long flags;
 	int ret;
 	u32 i;
 
-	spin_lock_init(&mcast.grp.lock);
-	spin_lock_init(&mcast.bss.lock);
-
-	for (i = 0; i < NPU_MCAST_TBL_IDX_MAX; i++) {
-		mcast.grp.tbls[i].id = i;
-		INIT_LIST_HEAD(&mcast.grp.tbls[i].excess_clients);
-	}
-
-	for (i = 0; i < NPU_MCAST_BSS_TBL_IDX_MAX; i++)
-		mcast.bss.tbls[i].id = i;
-
+	mtk_npu_mcast_host_clear();
 	ret = mtk_npu_mcast_tbl_ofs_init();
-	if (ret) {
-		NPU_NOTICE("multicast table offset acquisition failed: %d\n", ret);
+	if (ret)
 		return ret;
-	}
-
-	ret = mtk_npu_hnat_mcast_ops_register(&hnat_mcast_ops);
-	if (ret) {
-		NPU_NOTICE("failed to register hnat callback: %d\n", ret);
-		return ret;
-	}
-
 	ret = mtk_npu_mcast_statistic_init();
-	if (ret) {
-		NPU_NOTICE("multicast statistic init failed: %d\n", ret);
+	if (ret)
 		return ret;
+	if (mtk_npu_mcast_ranges_overlap(mcast.grp.tbl_ofs, groups, mcast.bss.tbl_ofs, bss) ||
+	    mtk_npu_mcast_ranges_overlap(mcast.grp.tbl_ofs, groups, mcast.statistic_ofs, statistics) ||
+	    mtk_npu_mcast_ranges_overlap(mcast.bss.tbl_ofs, bss, mcast.statistic_ofs, statistics))
+		return -ERANGE;
+	memset_io(nmcast.base + mcast.grp.tbl_ofs, 0, groups);
+	memset_io(nmcast.base + mcast.bss.tbl_ofs, 0, bss);
+	wmb();
+	/* A warm NETSTOP can retain firmware-side caches. Clear those while
+	 * all PPE leases are invalid, before admitting any new binding.
+	 */
+	cmd.arg[0] = NPU_MCAST_NET_CMD_GRP_PARAMS_UPDATE;
+	for (i = 0; i < NPU_MCAST_TBL_IDX_MAX; i++) {
+		cmd.arg[1] = i;
+		ret = mtk_npu_net_send_cmd_all_no_wait(&cmd);
+		if (ret)
+			return ret;
 	}
+	cmd.arg[0] = NPU_MCAST_NET_CMD_BSS_PARAMS_UPDATE;
+	for (i = 0; i < NPU_MCAST_BSS_TBL_IDX_MAX; i++) {
+		cmd.arg[1] = i;
+		ret = mtk_npu_net_send_cmd_all_no_wait(&cmd);
+		if (ret)
+			return ret;
+	}
+	cmd.sub_type = NPU_MCAST_NET_CMD_SET;
+	cmd.arg[0] = NPU_MCAST_NET_CMD_SET_EN;
+	cmd.arg[1] = READ_ONCE(mcast.enabled);
+	ret = mtk_npu_net_send_cmd_all_no_wait(&cmd);
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&mcast.grp.lock, flags);
+	spin_lock(&mcast.bss.lock);
+	mcast.online = true;
+	spin_unlock(&mcast.bss.lock);
+	spin_unlock_irqrestore(&mcast.grp.lock, flags);
+	return 0;
+}
 
-	mtk_npu_mcast_enable(true);
+int mtk_npu_mcast_init(void)
+{
+	BUILD_BUG_ON(sizeof(struct npu_mcast_grp_params) != 176);
+	BUILD_BUG_ON(sizeof(struct npu_mcast_bss_params) != 8);
+	WRITE_ONCE(mcast.enabled, true);
+	return mtk_npu_mcast_restore();
+}
 
-	return ret;
+void mtk_npu_mcast_pause(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mcast.grp.lock, flags);
+	spin_lock(&mcast.bss.lock);
+	mcast.online = false;
+	spin_unlock(&mcast.bss.lock);
+	spin_unlock_irqrestore(&mcast.grp.lock, flags);
+	hnat_npu_mcast_pause(&hnat_mcast_ops);
+}
+
+int mtk_npu_mcast_publish(void)
+{
+	return mtk_npu_hnat_mcast_ops_register(&hnat_mcast_ops);
+}
+
+void mtk_npu_mcast_unpublish(void)
+{
+	mtk_npu_hnat_mcast_ops_unregister(&hnat_mcast_ops);
+}
+
+void mtk_npu_mcast_resume(void)
+{
+	hnat_npu_mcast_resume(&hnat_mcast_ops);
 }
 
 void mtk_npu_mcast_deinit(void)
 {
-	mtk_npu_mcast_enable(false);
+	struct net_cmd cmd = {
+		.type = NPU_NET_CMD_TYPE_MCAST,
+		.sub_type = NPU_MCAST_NET_CMD_SET,
+		.arg[0] = NPU_MCAST_NET_CMD_SET_EN,
+	};
 
-	mtk_npu_hnat_mcast_ops_unregister();
-
-	mtk_npu_mcast_grp_delete_all();
+	mtk_npu_mcast_host_clear();
+	if (mtk_npu_mcu_alive())
+		mtk_npu_net_send_cmd_all_no_wait(&cmd);
 }

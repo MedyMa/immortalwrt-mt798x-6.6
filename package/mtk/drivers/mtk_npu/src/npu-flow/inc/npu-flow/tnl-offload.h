@@ -12,6 +12,8 @@
 
 #include "npu/tunnel.h"
 
+int mtk_npu_flow_tnl_start(void);
+void mtk_npu_flow_tnl_stop(void);
 int mtk_npu_flow_tnl_offload_init(void);
 void mtk_npu_flow_tnl_offload_deinit(void);
 void mtk_npu_tnl_info_flush_all_ppe_tnl(void);

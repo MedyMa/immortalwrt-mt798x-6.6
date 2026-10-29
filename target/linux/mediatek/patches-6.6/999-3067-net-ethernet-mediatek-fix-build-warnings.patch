@@ -46,8 +46,8 @@ index 3c265f9..6d45922 100644
  #ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
  #include <net/netfilter/nf_hnat_packet_accounting.h>
  #endif
-@@ -1621,6 +1622,15 @@ static struct ethhdr *get_ipv6_ipip_ethhdr(struct sk_buff *skb,
- 	return eth;
+@@ -2178,6 +2179,15 @@ static u32 hnat_select_qid(const struct sk_buff *skb,
+ 	return qid & MTK_QDMA_TX_MASK;
  }
  
 +static void hnat_copy_foe_info(struct foe_entry *dst,

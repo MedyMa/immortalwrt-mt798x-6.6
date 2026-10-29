@@ -13,6 +13,8 @@
 #ifndef NF_HNAT_MCAST_H
 #define NF_HNAT_MCAST_H
 
+#include "hnat_npu_mcast.h"
+
 #define RTMGRP_IPV4_MROUTE 0x20
 #define RTMGRP_MDB 0x2000000
 

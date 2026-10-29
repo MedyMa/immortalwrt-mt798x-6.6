@@ -1,0 +1,757 @@
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -31,6 +31,7 @@
+ #include <linux/filter.h>
+ #include <linux/ppp-ioctl.h>
+ #include <linux/ppp_channel.h>
++#include <linux/srcu.h>
+ #include <linux/ppp-comp.h>
+ #include <linux/skbuff.h>
+ #include <linux/rculist.h>
+@@ -129,6 +130,7 @@
+ 	int		mru;		/* max receive unit 60 */
+ 	unsigned int	flags;		/* control bits 64 */
+ 	unsigned int	xstate;		/* transmit state bits 68 */
++	bool		tunnel_offload_blocked;
+ 	unsigned int	rstate;		/* receive state bits 6c */
+ 	int		debug;		/* debug flags 70 */
+ 	struct slcompress *vj;		/* state for VJ header compression */
+@@ -167,6 +169,61 @@
+ #define SC_FLAG_BITS	(SC_NO_TCP_CCID|SC_CCP_OPEN|SC_CCP_UP|SC_LOOP_TRAFFIC \
+ 			 |SC_MULTILINK|SC_MP_SHORTSEQ|SC_MP_XSHORTSEQ \
+ 			 |SC_COMP_TCP|SC_REJ_COMP_TCP|SC_MUST_COMP)
++
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++DEFINE_STATIC_SRCU(ppp_tunnel_srcu);
++static DEFINE_MUTEX(ppp_tunnel_admin);
++static const struct ppp_tunnel_offload_ops __rcu *ppp_tunnel_ops;
++
++int ppp_tunnel_offload_register(const struct ppp_tunnel_offload_ops *ops)
++{
++	int ret = 0;
++
++	if (!ops || !ops->quiesce)
++		return -EINVAL;
++	mutex_lock(&ppp_tunnel_admin);
++	if (rcu_access_pointer(ppp_tunnel_ops))
++		ret = -EBUSY;
++	else
++		rcu_assign_pointer(ppp_tunnel_ops, ops);
++	mutex_unlock(&ppp_tunnel_admin);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ppp_tunnel_offload_register);
++
++int ppp_tunnel_offload_unregister(const struct ppp_tunnel_offload_ops *ops)
++{
++	int ret = 0;
++
++	mutex_lock(&ppp_tunnel_admin);
++	if (!ops || rcu_access_pointer(ppp_tunnel_ops) != ops) {
++		ret = -ENOENT;
++	} else {
++		rcu_assign_pointer(ppp_tunnel_ops, NULL);
++		synchronize_srcu(&ppp_tunnel_srcu);
++	}
++	mutex_unlock(&ppp_tunnel_admin);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ppp_tunnel_offload_unregister);
++
++static int ppp_tunnel_quiesce(struct ppp *ppp)
++{
++	const struct ppp_tunnel_offload_ops *ops;
++	int idx, ret = 0;
++
++	/* Stop setup first, including transmitters admitted before the ioctl. */
++	WRITE_ONCE(ppp->tunnel_offload_blocked, true);
++	idx = srcu_read_lock(&ppp_tunnel_srcu);
++	ops = srcu_dereference(ppp_tunnel_ops, &ppp_tunnel_srcu);
++	if (ops)
++		ret = ops->quiesce(ppp->dev);
++	srcu_read_unlock(&ppp_tunnel_srcu, idx);
++	return ret;
++}
++#else
++static int ppp_tunnel_quiesce(struct ppp *ppp) { return 0; }
++#endif
+ 
+ /*
+  * Private data structure for each channel.
+@@ -825,6 +882,12 @@
+ 	case PPPIOCSFLAGS:
+ 		if (get_user(val, p))
+ 			break;
++		if (val & (SC_CCP_OPEN | SC_CCP_UP | SC_COMP_TCP | SC_MUST_COMP |
++			   SC_MULTILINK | SC_LOOP_TRAFFIC)) {
++			err = ppp_tunnel_quiesce(ppp);
++			if (err)
++				break;
++		}
+ 		ppp_lock(ppp);
+ 		cflags = ppp->flags & ~val;
+ #ifdef CONFIG_PPP_MULTILINK
+@@ -926,6 +989,12 @@
+ 			if (copy_to_user(argp, &npi, sizeof(npi)))
+ 				break;
+ 		} else {
++			if (i == NP_IP && READ_ONCE(ppp->npmode[i]) == NPMODE_PASS &&
++			    npi.mode != NPMODE_PASS) {
++				err = ppp_tunnel_quiesce(ppp);
++				if (err)
++					break;
++			}
+ 			WRITE_ONCE(ppp->npmode[i], npi.mode);
+ 			/* we may be able to transmit more packets now (??) */
+ 			netif_wake_queue(ppp->dev);
+@@ -942,6 +1011,11 @@
+ 
+ 		if (IS_ERR(filter)) {
+ 			err = PTR_ERR(filter);
++			break;
++		}
++		err = ppp_tunnel_quiesce(ppp);
++		if (err) {
++			bpf_prog_destroy(filter);
+ 			break;
+ 		}
+ 		if (cmd == PPPIOCSPASS)
+@@ -1008,6 +1082,11 @@
+ 
+ 			if (IS_ERR(filter)) {
+ 				err = PTR_ERR(filter);
++				break;
++			}
++			err = ppp_tunnel_quiesce(ppp);
++			if (err) {
++				bpf_prog_destroy(filter);
+ 				break;
+ 			}
+ 			if (cmd == PPPIOCSPASS32)
+@@ -1620,6 +1699,49 @@
+ }
+ 
+ #if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++bool ppp_netdev_tunnel_offload_allowed(const struct net_device *dev)
++{
++	const struct ppp *ppp;
++
++	if (!dev || dev->netdev_ops != &ppp_netdev_ops)
++		return false;
++	ppp = netdev_priv(dev);
++	if (READ_ONCE(ppp->npmode[NP_IP]) != NPMODE_PASS)
++		return false;
++#ifdef CONFIG_PPP_FILTER
++	if (READ_ONCE(ppp->pass_filter) || READ_ONCE(ppp->active_filter))
++		return false;
++#endif
++	return !READ_ONCE(ppp->tunnel_offload_blocked) &&
++	       !(READ_ONCE(ppp->flags) & (SC_CCP_OPEN | SC_CCP_UP | SC_COMP_TCP |
++					SC_MUST_COMP | SC_MULTILINK | SC_LOOP_TRAFFIC)) &&
++	       !(READ_ONCE(ppp->xstate) & SC_COMP_RUN) &&
++	       !(READ_ONCE(ppp->rstate) & SC_DECOMP_RUN);
++}
++EXPORT_SYMBOL_GPL(ppp_netdev_tunnel_offload_allowed);
++
++int ppp_channel_tunnel_quiesce(struct ppp_channel *chan)
++{
++	struct channel *pch = chan ? chan->ppp : NULL;
++	struct net_device *dev = NULL;
++	int ret = 0;
++
++	if (!pch)
++		return 0;
++	read_lock_bh(&pch->upl);
++	if (pch->ppp) {
++		dev = pch->ppp->dev;
++		dev_hold(dev);
++	}
++	read_unlock_bh(&pch->upl);
++	if (dev) {
++		ret = ppp_tunnel_quiesce(netdev_priv(dev));
++		dev_put(dev);
++	}
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ppp_channel_tunnel_quiesce);
++
+ int ppp_netdev_get_tunnel_info(struct net_device *dev, struct ppp_tunnel_info *info)
+ {
+ 	struct ppp *ppp;
+@@ -1629,6 +1751,8 @@
+ 
+ 	if (!dev || !info || dev->netdev_ops != &ppp_netdev_ops)
+ 		return -EINVAL;
++	if (!ppp_netdev_tunnel_offload_allowed(dev))
++		return -EOPNOTSUPP;
+ 	memset(info, 0, sizeof(*info));
+ 	ppp = netdev_priv(dev);
+ 	/* ppp_disconnect_channel removes the channel under this unit lock.
+@@ -1659,6 +1783,9 @@
+ 	struct ppp_channel *chan;
+ 	struct channel *pch;
+ 	int ret = -EOPNOTSUPP;
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	bool was_tunnel = path->flags & BIT(DEV_PATH_TNL);
++#endif
+ 
+ 	ppp_xmit_lock(ppp);
+ 	if ((ppp->flags & SC_MULTILINK) || ppp->n_channels != 1 ||
+@@ -1669,6 +1796,14 @@
+ 	chan = pch->chan;
+ 	if (chan && chan->ops->flow_offload_check)
+ 		ret = chan->ops->flow_offload_check(chan, path);
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	/* PPPoE keeps its existing eligibility; only NPU tunnel actions bypass
++	 * the generic PPP receive/transmit processing addressed by this API.
++	 */
++	if (!ret && !was_tunnel && (path->flags & BIT(DEV_PATH_TNL)) &&
++	    !ppp_netdev_tunnel_offload_allowed(path->dev))
++		ret = -EOPNOTSUPP;
++#endif
+ 	spin_unlock(&pch->downl);
+ unlock:
+ 	ppp_xmit_unlock(ppp);
+@@ -3153,6 +3288,9 @@
+ 	err = -EINVAL;
+ 	if (data->length < 2 || ccp_option[1] < 2 || ccp_option[1] > data->length)
+ 		goto out;
++	err = ppp_tunnel_quiesce(ppp);
++	if (err)
++		goto out;
+ 
+ 	cp = try_then_request_module(
+ 		find_compressor(ccp_option[0]),
+--- a/drivers/net/ppp/pptp.c
++++ b/drivers/net/ppp/pptp.c
+@@ -26,6 +26,8 @@
+ #include <linux/rcupdate.h>
+ #include <linux/security.h>
+ #include <linux/spinlock.h>
++#include <linux/srcu.h>
++#include <linux/mutex.h>
+ 
+ #include <net/sock.h>
+ #include <net/protocol.h>
+@@ -34,6 +36,7 @@
+ #include <net/route.h>
+ #include <net/gre.h>
+ #include <net/pptp.h>
++#include <net/netfilter/nf_flow_table.h>
+ 
+ #include <linux/uaccess.h>
+ 
+@@ -49,6 +52,232 @@
+ static struct proto pptp_sk_proto __read_mostly;
+ static const struct ppp_channel_ops pptp_chan_ops;
+ static const struct proto_ops pptp_ops;
++
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++static atomic64_t pptp_cookie = ATOMIC64_INIT(0);
++DEFINE_STATIC_SRCU(pptp_offload_srcu);
++static DEFINE_MUTEX(pptp_offload_admin);
++static const struct pptp_offload_ops __rcu *pptp_offload_ops;
++static u64 *callid_cookie;
++static DECLARE_BITMAP(callid_closing, MAX_CALLID + 1);
++
++void pptp_offload_callid_release(const struct pptp_offload_key *key)
++{
++	unsigned long flags;
++
++	if (!key || !key->cookie)
++		return;
++	spin_lock_irqsave(&chan_lock, flags);
++	if (callid_cookie[key->local_id] == key->cookie &&
++	    test_bit(key->local_id, callid_closing) &&
++	    !rcu_access_pointer(callid_sock[key->local_id])) {
++		callid_cookie[key->local_id] = 0;
++		clear_bit(key->local_id, callid_closing);
++		clear_bit(key->local_id, callid_bitmap);
++	}
++	spin_unlock_irqrestore(&chan_lock, flags);
++}
++EXPORT_SYMBOL_GPL(pptp_offload_callid_release);
++
++bool pptp_offload_session_live(const struct pptp_offload_key *key)
++{
++	struct pppox_sock *po;
++	struct pptp_opt *opt;
++	unsigned long flags;
++	bool live = false;
++
++	if (!key || !key->cookie)
++		return false;
++	spin_lock_irqsave(&chan_lock, flags);
++	po = rcu_access_pointer(callid_sock[key->local_id]);
++	if (po) {
++		opt = &po->proto.pptp;
++		live = (READ_ONCE(sk_pppox(po)->sk_state) & PPPOX_CONNECTED) &&
++		       opt->offload_cookie == key->cookie &&
++		       sock_net(sk_pppox(po))->ns.inum == key->netns &&
++		       opt->src_addr.sin_addr.s_addr == key->local_addr &&
++		       opt->dst_addr.sin_addr.s_addr == key->peer_addr &&
++		       opt->src_addr.call_id == key->local_id &&
++		       opt->dst_addr.call_id == key->peer_id;
++	}
++	spin_unlock_irqrestore(&chan_lock, flags);
++	return live;
++}
++EXPORT_SYMBOL_GPL(pptp_offload_session_live);
++
++static void pptp_offload_key(struct pppox_sock *po, struct pptp_offload_key *key)
++{
++	struct pptp_opt *opt = &po->proto.pptp;
++
++	memset(key, 0, sizeof(*key));
++	key->cookie = opt->offload_cookie;
++	key->netns = sock_net(sk_pppox(po))->ns.inum;
++	key->local_addr = opt->src_addr.sin_addr.s_addr;
++	key->peer_addr = opt->dst_addr.sin_addr.s_addr;
++	key->local_id = opt->src_addr.call_id;
++	key->peer_id = opt->dst_addr.call_id;
++}
++
++int pptp_offload_ops_register(const struct pptp_offload_ops *ops)
++{
++	int ret = 0;
++
++	if (!ops || !ops->next || !ops->snapshot || !ops->close)
++		return -EINVAL;
++	mutex_lock(&pptp_offload_admin);
++	if (rcu_access_pointer(pptp_offload_ops))
++		ret = -EBUSY;
++	else
++		rcu_assign_pointer(pptp_offload_ops, ops);
++	mutex_unlock(&pptp_offload_admin);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(pptp_offload_ops_register);
++
++/* The provider must stop hardware sequence consumers before unregistering.
++ * Keep dispatch published through handover: a software transmitter admitted
++ * after its socket was visited still updates seq_sent from the provider.
++ */
++int pptp_offload_ops_unregister(const struct pptp_offload_ops *ops)
++{
++	struct pptp_offload_key key;
++	struct pppox_sock *po;
++	unsigned long flags;
++	u32 seq;
++	unsigned int id;
++	int ret = 0;
++
++	if (!ops)
++		return -EINVAL;
++	mutex_lock(&pptp_offload_admin);
++	if (rcu_access_pointer(pptp_offload_ops) != ops) {
++		ret = -ENOENT;
++		goto out;
++	}
++	for (id = 0; id <= MAX_CALLID; id++) {
++		rcu_read_lock();
++		po = rcu_dereference(callid_sock[id]);
++		if (po) {
++			spin_lock_irqsave(&po->proto.pptp.offload_lock, flags);
++			pptp_offload_key(po, &key);
++			if (!ops->snapshot(&key, &seq))
++				po->proto.pptp.seq_sent = seq;
++			spin_unlock_irqrestore(&po->proto.pptp.offload_lock, flags);
++		}
++		rcu_read_unlock();
++		if (!(id & 127))
++			cond_resched();
++	}
++	rcu_assign_pointer(pptp_offload_ops, NULL);
++	synchronize_srcu(&pptp_offload_srcu);
++out:
++	mutex_unlock(&pptp_offload_admin);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(pptp_offload_ops_unregister);
++
++static int pptp_next_seq(struct pppox_sock *po, u32 *seq)
++{
++	const struct pptp_offload_ops *ops;
++	struct pptp_offload_key key;
++	struct pptp_opt *opt = &po->proto.pptp;
++	unsigned long flags;
++	int idx, ret = -EOPNOTSUPP;
++
++	spin_lock_irqsave(&opt->offload_lock, flags);
++	pptp_offload_key(po, &key);
++	idx = srcu_read_lock(&pptp_offload_srcu);
++	ops = srcu_dereference(pptp_offload_ops, &pptp_offload_srcu);
++	if (ops)
++		ret = ops->next(&key, opt->seq_sent, seq);
++	srcu_read_unlock(&pptp_offload_srcu, idx);
++	if (ret == -EOPNOTSUPP) {
++		*seq = opt->seq_sent + 1;
++		ret = 0;
++	}
++	/* An active hardware counter error must not reuse stale software state. */
++	if (!ret)
++		opt->seq_sent = *seq;
++	spin_unlock_irqrestore(&opt->offload_lock, flags);
++	return ret;
++}
++
++static int pptp_offload_close(struct pppox_sock *po)
++{
++	const struct pptp_offload_ops *ops;
++	struct pptp_offload_key key;
++	int idx, ret = 0;
++
++	pptp_offload_key(po, &key);
++	spin_lock_bh(&chan_lock);
++	if (callid_cookie[key.local_id] == key.cookie)
++		set_bit(key.local_id, callid_closing);
++	spin_unlock_bh(&chan_lock);
++	/* Channel unbind has drained transmitters. Close is sleepable so the
++	 * provider can invalidate PPE entries before the call ID is reused.
++	 */
++	idx = srcu_read_lock(&pptp_offload_srcu);
++	ops = srcu_dereference(pptp_offload_ops, &pptp_offload_srcu);
++	if (ops)
++		ret = ops->close(&key);
++	srcu_read_unlock(&pptp_offload_srcu, idx);
++	return ret;
++}
++
++static int pptp_get_tunnel_info(struct ppp_channel *chan,
++				struct ppp_tunnel_info *info)
++{
++	struct sock *sk = chan->private;
++	struct pppox_sock *po = pppox_sk(sk);
++	struct pptp_opt *opt = &po->proto.pptp;
++	unsigned long flags;
++
++	if (!(sk->sk_state & PPPOX_CONNECTED))
++		return -ENOTCONN;
++	if (READ_ONCE(opt->ppp_flags) & (SC_COMP_AC | SC_COMP_PROT))
++		return -EOPNOTSUPP;
++	spin_lock_irqsave(&opt->offload_lock, flags);
++	info->kind = PPP_TUNNEL_PPTP;
++	info->version = 1;
++	info->tunnel_id = opt->src_addr.call_id;
++	info->peer_tunnel_id = opt->dst_addr.call_id;
++	info->cookie = opt->offload_cookie;
++	info->local_addr = opt->src_addr.sin_addr.s_addr;
++	info->peer_addr = opt->dst_addr.sin_addr.s_addr;
++	info->sequence = opt->seq_sent;
++	info->ppp_flags = opt->ppp_flags;
++	spin_unlock_irqrestore(&opt->offload_lock, flags);
++	return 0;
++}
++#else
++static int pptp_next_seq(struct pppox_sock *po, u32 *seq)
++{
++	*seq = ++po->proto.pptp.seq_sent;
++	return 0;
++}
++static int pptp_offload_close(struct pppox_sock *po) { return 0; }
++#endif
++
++#if IS_ENABLED(CONFIG_NF_FLOW_TABLE)
++static int pptp_flow_offload_check(struct ppp_channel *chan,
++				   struct flow_offload_hw_path *path)
++{
++	struct sock *sk = chan->private;
++	struct pptp_opt *opt = &pppox_sk(sk)->proto.pptp;
++
++	if (path->flags & BIT(DEV_PATH_TNL))
++		return -EEXIST;
++	if (!(sk->sk_state & PPPOX_CONNECTED))
++		return -ENOTCONN;
++	/* Firmware consumes the full address/control and protocol fields. */
++	if (opt->ppp_flags & (SC_COMP_AC | SC_COMP_PROT))
++		return -EOPNOTSUPP;
++	path->flags |= BIT(DEV_PATH_TNL);
++	path->tnl_type = FLOW_OFFLOAD_TNL_PPTP;
++	return 0;
++}
++#endif
++
+ 
+ static struct pppox_sock *lookup_chan(u16 call_id, __be32 s_addr)
+ {
+@@ -111,6 +340,10 @@
+ 
+ 	sock->proto.pptp.src_addr = *sa;
+ 	set_bit(sa->call_id, callid_bitmap);
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	callid_cookie[sa->call_id] = sock->proto.pptp.offload_cookie;
++	clear_bit(sa->call_id, callid_closing);
++#endif
+ 	rcu_assign_pointer(callid_sock[sa->call_id], sock);
+ 	spin_unlock(&chan_lock);
+ 
+@@ -121,11 +354,30 @@
+ 	return -1;
+ }
+ 
++static void pptp_unpublish_chan(struct pppox_sock *sock)
++{
++	/* Keep the allocation bit reserved through offload/channel rundown. */
++	spin_lock(&chan_lock);
++	RCU_INIT_POINTER(callid_sock[sock->proto.pptp.src_addr.call_id], NULL);
++	spin_unlock(&chan_lock);
++}
++
+ static void del_chan(struct pppox_sock *sock)
+ {
++	unsigned int id = sock->proto.pptp.src_addr.call_id;
++
+ 	spin_lock(&chan_lock);
+-	clear_bit(sock->proto.pptp.src_addr.call_id, callid_bitmap);
+-	RCU_INIT_POINTER(callid_sock[sock->proto.pptp.src_addr.call_id], NULL);
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	if (callid_cookie[id] != sock->proto.pptp.offload_cookie)
++		goto out;
++	callid_cookie[id] = 0;
++	clear_bit(id, callid_closing);
++#endif
++	clear_bit(id, callid_bitmap);
++	RCU_INIT_POINTER(callid_sock[id], NULL);
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++out:
++#endif
+ 	spin_unlock(&chan_lock);
+ }
+ 
+@@ -157,6 +409,7 @@
+ 	struct flowi4 fl4;
+ 	int islcp;
+ 	int len;
++	u32 sequence;
+ 	unsigned char *data;
+ 	__u32 seq_recv;
+ 	struct rtable *rt;
+@@ -220,7 +473,9 @@
+ 	hdr->gre_hd.protocol = GRE_PROTO_PPP;
+ 	hdr->call_id = htons(opt->dst_addr.call_id);
+ 
+-	hdr->seq = htonl(++opt->seq_sent);
++	if (pptp_next_seq(po, &sequence))
++		goto tx_error;
++	hdr->seq = htonl(sequence);
+ 	if (opt->ack_sent != seq_recv)	{
+ 		/* send ack with this message */
+ 		hdr->gre_hd.flags |= GRE_ACK;
+@@ -527,10 +782,15 @@
+ 	}
+ 
+ 	po = pppox_sk(sk);
+-	del_chan(po);
++	pptp_unpublish_chan(po);
+ 	synchronize_rcu();
+ 
+ 	pppox_unbind_sock(sk);
++	/* A failed asynchronous hardware teardown keeps this Call ID reserved.
++	 * The provider releases it when firmware deletion or shutdown completes.
++	 */
++	if (!pptp_offload_close(po))
++		del_chan(po);
+ 	sk->sk_state = PPPOX_DEAD;
+ 
+ 	sock_orphan(sk);
+@@ -578,6 +838,12 @@
+ 	po = pppox_sk(sk);
+ 	opt = &po->proto.pptp;
+ 
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	spin_lock_init(&opt->offload_lock);
++	opt->offload_cookie = atomic64_inc_return(&pptp_cookie);
++	if (!opt->offload_cookie)
++		opt->offload_cookie = atomic64_inc_return(&pptp_cookie);
++#endif
+ 	opt->seq_sent = 0; opt->seq_recv = 0xffffffff;
+ 	opt->ack_recv = 0; opt->ack_sent = 0xffffffff;
+ 
+@@ -607,6 +873,13 @@
+ 	case PPPIOCSFLAGS:
+ 		if (get_user(val, p))
+ 			break;
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++		if (val & (SC_COMP_AC | SC_COMP_PROT)) {
++			err = ppp_channel_tunnel_quiesce(chan);
++			if (err)
++				break;
++		}
++#endif
+ 		opt->ppp_flags = val & ~SC_RCV_BITS;
+ 		err = 0;
+ 		break;
+@@ -618,7 +891,13 @@
+ }
+ 
+ static const struct ppp_channel_ops pptp_chan_ops = {
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	.get_tunnel_info = pptp_get_tunnel_info,
++#endif
+ 	.start_xmit = pptp_xmit,
++#if IS_ENABLED(CONFIG_NF_FLOW_TABLE)
++	.flow_offload_check = pptp_flow_offload_check,
++#endif
+ 	.ioctl      = pptp_ppp_ioctl,
+ };
+ 
+@@ -665,6 +944,13 @@
+ 	callid_sock = vzalloc(array_size(sizeof(void *), (MAX_CALLID + 1)));
+ 	if (!callid_sock)
+ 		return -ENOMEM;
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	callid_cookie = vzalloc(array_size(sizeof(*callid_cookie), MAX_CALLID + 1));
++	if (!callid_cookie) {
++		vfree(callid_sock);
++		return -ENOMEM;
++	}
++#endif
+ 
+ 	err = gre_add_protocol(&gre_pptp_protocol, GREPROTO_PPTP);
+ 	if (err) {
+@@ -691,6 +977,9 @@
+ out_gre_del_protocol:
+ 	gre_del_protocol(&gre_pptp_protocol, GREPROTO_PPTP);
+ out_mem_free:
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	vfree(callid_cookie);
++#endif
+ 	vfree(callid_sock);
+ 
+ 	return err;
+@@ -701,6 +990,9 @@
+ 	unregister_pppox_proto(PX_PROTO_PPTP);
+ 	proto_unregister(&pptp_sk_proto);
+ 	gre_del_protocol(&gre_pptp_protocol, GREPROTO_PPTP);
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	vfree(callid_cookie);
++#endif
+ 	vfree(callid_sock);
+ }
+ 
+--- a/include/linux/if_pppox.h
++++ b/include/linux/if_pppox.h
+@@ -35,6 +35,10 @@
+ 	struct pptp_addr dst_addr;
+ 	u32 ack_sent, ack_recv;
+ 	u32 seq_sent, seq_recv;
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++	spinlock_t offload_lock;
++	u64 offload_cookie;
++#endif
+ 	int ppp_flags;
+ };
+ #include <net/sock.h>
+--- a/include/linux/ppp_channel.h
++++ b/include/linux/ppp_channel.h
+@@ -23,15 +23,35 @@
+ struct net_device_path;
+ struct net_device_path_ctx;
+ struct ppp_channel;
++struct flow_offload_hw_path;
++
++enum ppp_tunnel_kind {
++	PPP_TUNNEL_UNKNOWN,
++	PPP_TUNNEL_L2TP,
++	PPP_TUNNEL_PPTP,
++};
+ 
+ /* Scalar snapshot only. No channel, session or socket pointer escapes. */
+ struct ppp_tunnel_info {
+-	u16 version;
++	u16 kind, version;
+ 	u16 tunnel_id, peer_tunnel_id;
+ 	u16 session_id, peer_session_id;
++	u64 cookie;
++	__be32 local_addr, peer_addr;
++	u32 sequence, ppp_flags;
+ };
+ struct net_device;
+ int ppp_netdev_get_tunnel_info(struct net_device *dev, struct ppp_tunnel_info *info);
++struct ppp_tunnel_offload_ops {
++	/* Sleepable: all hardware templates must be gone before PPP enables
++	 * compression/encryption or another software-only packet policy.
++	 */
++	int (*quiesce)(struct net_device *dev);
++};
++int ppp_tunnel_offload_register(const struct ppp_tunnel_offload_ops *ops);
++int ppp_tunnel_offload_unregister(const struct ppp_tunnel_offload_ops *ops);
++bool ppp_netdev_tunnel_offload_allowed(const struct net_device *dev);
++int ppp_channel_tunnel_quiesce(struct ppp_channel *chan);
+ 
+ struct ppp_channel_ops {
+ 	/* Send a packet (or multilink fragment) on this channel.
+--- a/include/net/pptp.h
++++ b/include/net/pptp.h
+@@ -24,4 +24,33 @@
+ } __packed;
+ 
+ 
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++struct pptp_offload_key {
++	u64 cookie;
++	u32 netns;
++	__be32 local_addr, peer_addr;
++	u16 local_id, peer_id;
++};
++
++struct pptp_offload_ops {
++	/* next/snapshot run with the socket sequence spinlock held. Returning
++	 * -EOPNOTSUPP from next permits ordinary software allocation; any other
++	 * error refuses the packet rather than reusing stale sequence state.
++	 */
++	int (*next)(const struct pptp_offload_key *, u32 software_sequence, u32 *sequence);
++	int (*snapshot)(const struct pptp_offload_key *, u32 *sequence);
++	/* Channel unbind has completed; the sleepable callback must drain
++	 * hardware before the native call ID can be allocated again.
++	 */
++	int (*close)(const struct pptp_offload_key *);
++};
++int pptp_offload_ops_register(const struct pptp_offload_ops *ops);
++int pptp_offload_ops_unregister(const struct pptp_offload_ops *ops);
++/* Release a closed socket's reserved Call ID only after hardware rundown.
++ * The generation check prevents a delayed release from freeing a new socket.
++ */
++void pptp_offload_callid_release(const struct pptp_offload_key *key);
++bool pptp_offload_session_live(const struct pptp_offload_key *key);
+ #endif
++
++#endif
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -149,6 +149,7 @@
+ 	if (tunnel->version != 2 || tunnel->encap != L2TP_ENCAPTYPE_UDP ||
+ 	    session->send_seq || session->recv_seq)
+ 		return -EOPNOTSUPP;
++	info->kind = PPP_TUNNEL_L2TP;
+ 	info->version = 2;
+ 	info->tunnel_id = tunnel->tunnel_id;
+ 	info->peer_tunnel_id = tunnel->peer_tunnel_id;
+@@ -1255,6 +1256,13 @@
+ 			err = -EINVAL;
+ 			break;
+ 		}
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++		if (val) {
++			err = ppp_channel_tunnel_quiesce(&pppox_sk(sk)->chan);
++			if (err)
++				break;
++		}
++#endif
+ 		session->recv_seq = !!val;
+ 		break;
+ 
+@@ -1263,6 +1271,13 @@
+ 			err = -EINVAL;
+ 			break;
+ 		}
++#if IS_ENABLED(CONFIG_MTK_PPP_TUNNEL_INFO)
++		if (val) {
++			err = ppp_channel_tunnel_quiesce(&pppox_sk(sk)->chan);
++			if (err)
++				break;
++		}
++#endif
+ 		session->send_seq = !!val;
+ 		{
+ 			struct pppox_sock *po = pppox_sk(sk);
