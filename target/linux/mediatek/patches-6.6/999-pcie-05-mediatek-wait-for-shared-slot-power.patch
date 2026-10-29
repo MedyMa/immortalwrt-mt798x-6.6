@@ -1,0 +1,44 @@
+From: MedyMa <MedyMa@users.noreply.github.com>
+Subject: [PATCH] PCI: mediatek-gen3: wait for the shared slot supply before startup
+
+Use an explicit regulator dependency for boards with shared WiFi slot power.
+Defer probe until the supplier has completed its boot power sequence, before
+asserting controller resets or enumerating either endpoint. Keep the enable
+reference across suspend and soft reset; devres releases it after bus removal.
+
+--- a/drivers/pci/controller/pcie-mediatek-gen3.c
++++ b/drivers/pci/controller/pcie-mediatek-gen3.c
+@@ -23,6 +23,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+ 
+ #include "../pci.h"
+@@ -1237,6 +1238,13 @@
+ 	struct pci_host_bridge *host;
+ 	int err;
+ 
++	/* Shared slot power must be stable before either controller starts. */
++	if (of_property_present(dev->of_node, "vpcie12v-supply")) {
++		err = devm_regulator_get_enable(dev, "vpcie12v");
++		if (err)
++			return dev_err_probe(dev, err, "failed to enable slot power\n");
++	}
++
+ 	host = devm_pci_alloc_host_bridge(dev, sizeof(*pcie));
+ 	if (!host)
+ 		return -ENOMEM;
+--- a/Documentation/devicetree/bindings/pci/mediatek-pcie-gen3.yaml
++++ b/Documentation/devicetree/bindings/pci/mediatek-pcie-gen3.yaml
+@@ -107,6 +107,9 @@
+ 
+   power-domains:
+     maxItems: 1
++
++  vpcie12v-supply:
++    description: Shared 12 V slot supply, enabled before controller startup.
+ 
+   '#interrupt-cells':
+     const: 1

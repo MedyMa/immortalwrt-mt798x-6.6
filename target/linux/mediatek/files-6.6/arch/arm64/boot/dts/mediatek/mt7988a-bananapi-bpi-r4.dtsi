@@ -36,6 +36,19 @@
 		reg = <0x00 0x40000000 0x00 0x10000000>;
 	};
 
+	/* Share this node path with the WiFi EEPROM overlay. */
+	wifi_12v: regulator-wifi-12v {
+		compatible = "regulator-fixed";
+		regulator-name = "wifi";
+		regulator-min-microvolt = <12000000>;
+		regulator-max-microvolt = <12000000>;
+		gpios = <&pio 4 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		boot-off-delay-us = <10000000>;
+		startup-delay-us = <1000000>;
+		regulator-always-on;
+	};
+
 	/* SFP1 cage (WAN) */
 	sfp1: sfp1 {
 		compatible = "sff,sfp";
@@ -272,6 +285,7 @@
 
 /* mPCIe SIM2 */
 &pcie0 {
+	vpcie12v-supply = <&wifi_12v>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie0_pins>;
 	status = "okay";
@@ -279,6 +293,7 @@
 
 /* mPCIe SIM3 */
 &pcie1 {
+	vpcie12v-supply = <&wifi_12v>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie1_pins>;
 	status = "okay";

@@ -1,0 +1,110 @@
+From: MedyMa <MedyMa@users.noreply.github.com>
+Subject: [PATCH] regulator: fixed: support a full initial power-off interval
+
+Some WiFi modules retain unusable MCU state across short power interruptions.
+Provide an opt-in initial off interval measured from acquiring the GPIO low,
+then let normal regulator constraints enable the rail and apply startup delay.
+Require exclusive GPIO ownership. No off/on cycle is added to suspend, WiFi driver
+reload or shutdown. Existing supplies without the property retain their timing.
+
+--- a/drivers/regulator/fixed.c
++++ b/drivers/regulator/fixed.c
+@@ -14,6 +14,7 @@
+  * systems with no controllable regulators.
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/err.h>
+ #include <linux/mutex.h>
+ #include <linux/module.h>
+@@ -179,6 +180,7 @@
+ 	const struct fixed_dev_type *drvtype = of_device_get_match_data(dev);
+ 	struct regulator_config cfg = { };
+ 	enum gpiod_flags gflags;
++	u32 boot_off_delay = 0;
+ 	int ret;
+ 
+ 	drvdata = devm_kzalloc(&pdev->dev, sizeof(struct fixed_voltage_data),
+@@ -197,6 +199,19 @@
+ 
+ 	if (!config)
+ 		return -ENOMEM;
++
++	if (of_property_present(dev->of_node, "boot-off-delay-us")) {
++		ret = of_property_read_u32(dev->of_node, "boot-off-delay-us",
++					   &boot_off_delay);
++		if (ret)
++			return dev_err_probe(dev, ret, "invalid boot-off-delay-us\n");
++		if (!boot_off_delay || boot_off_delay > 10000000)
++			return dev_err_probe(dev, -EINVAL,
++				"boot-off-delay-us must be 1..10000000 us\n");
++		if (config->enabled_at_boot)
++			return dev_err_probe(dev, -EINVAL,
++				"boot-off-delay-us conflicts with regulator-boot-on\n");
++	}
+ 
+ 	drvdata->desc.name = devm_kstrdup(&pdev->dev,
+ 					  config->supply_name,
+@@ -264,7 +279,9 @@
+ 	 *
+ 	 * FIXME: find a better way to deal with this.
+ 	 */
+-	gflags |= GPIOD_FLAGS_BIT_NONEXCLUSIVE;
++	/* A boot power cycle must have exclusive control of the enable GPIO. */
++	if (!boot_off_delay)
++		gflags |= GPIOD_FLAGS_BIT_NONEXCLUSIVE;
+ 
+ 	/*
+ 	 * Do not use devm* here: the regulator core takes over the
+@@ -275,6 +292,14 @@
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(cfg.ena_gpiod),
+ 				     "can't get GPIO\n");
+ 
++	if (boot_off_delay) {
++		if (!cfg.ena_gpiod)
++			return dev_err_probe(dev, -EINVAL,
++					     "boot-off-delay-us requires an enable GPIO\n");
++		/* Measure the full discharge time from driving the GPIO inactive. */
++		msleep(DIV_ROUND_UP(boot_off_delay, 1000));
++	}
++
+ 	cfg.dev = &pdev->dev;
+ 	cfg.init_data = config->init_data;
+ 	cfg.driver_data = drvdata;
+--- a/Documentation/devicetree/bindings/regulator/fixed-regulator.yaml
++++ b/Documentation/devicetree/bindings/regulator/fixed-regulator.yaml
+@@ -39,6 +39,15 @@
+       required:
+         - gpio
+         - gpios
++  - if:
++      required:
++        - boot-off-delay-us
++    then:
++      properties:
++        regulator-boot-on: false
++      anyOf:
++        - required: [gpio]
++        - required: [gpios]
+ 
+ properties:
+   compatible:
+@@ -84,6 +93,18 @@
+ 
+   off-on-delay-us:
+     description: off delay time in microseconds
++
++  boot-off-delay-us:
++    description: |
++      At initial probe, drive the enable GPIO inactive and hold it there for
++      this interval before registering the regulator. Unlike off-on-delay-us,
++      the full interval starts when the GPIO is driven inactive, including
++      when firmware left the supply enabled. Consumers must reference this
++      regulator and wait for it to register before accessing their hardware.
++      Incompatible with regulator-boot-on. No power cycle occurs at shutdown.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 1
++    maximum: 10000000
+ 
+   enable-active-high:
+     description:

@@ -10,7 +10,8 @@
 	fragment@0 {
 		target-path = "/";
 		__overlay__ {
-			wifi_12v: regulator-wifi-12v {
+			/* Preserve the base tree's supply phandle when merging. */
+			regulator-wifi-12v {
 				compatible = "regulator-fixed";
 				regulator-name = "wifi";
 				regulator-min-microvolt = <12000000>;

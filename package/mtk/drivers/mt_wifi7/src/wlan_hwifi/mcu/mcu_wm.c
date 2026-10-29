@@ -303,7 +303,7 @@ mcu_wm_load_patch(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
 		break;
 	default:
 		dev_err(dev->dev, "Failed to get patch semaphore %d\n", sem);
-		return -EAGAIN;
+		return sem < 0 ? sem : -EAGAIN;
 	}
 
 	if (mcu_entry->applied_method == BIN_METHOD) {
@@ -384,13 +384,11 @@ mcu_wm_load_patch(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
 
 out:
 	sem = mcu_wm_patch_sem_ctrl(dev, 0);
-	switch (sem) {
-	case PATCH_REL_SEM_SUCCESS:
-		break;
-	default:
-		ret = -EAGAIN;
-		dev_err(dev->dev, "Failed to release patch semaphore\n");
-		goto out;
+	if (sem != PATCH_REL_SEM_SUCCESS) {
+		dev_err(dev->dev, "Failed to release patch semaphore %d\n", sem);
+		/* A dead MCU cannot release the semaphore; keep the first error. */
+		if (!ret)
+			ret = sem < 0 ? sem : -EAGAIN;
 	}
 	if (mcu_entry->applied_method == BIN_METHOD)
 		release_firmware(fw);
