@@ -480,6 +480,42 @@ function mlo_add_display_option(section, state, section_id, key, title, render_v
 	return row;
 }
 
+function mlo_legacy_members(status) {
+	if (!status) return [];
+	return mlo_normalize_list(status && status.inventory).filter(function(item) {
+		return item.legacy === true && !item.managed;
+	});
+}
+
+function mlo_legacy_removal_members(state) {
+	var members = mlo_legacy_members(state.status);
+	if (!members.length || mlo_pending_action ||
+		mlo_normalize_list(state.status && state.status.groups).length)
+		throw new Error('legacy_conflict');
+	/* Validate the entire set before staging anything. */
+	members.forEach(function(item) {
+		var group = uci.get('wireless', item.section, 'mldgroup');
+		var flag = uci.get('wireless', item.section, 'mlo');
+		if (uci.get('wireless', item.section, 'device') !== item.device ||
+			uci.get('wireless', item.section, 'mode') !== 'ap' ||
+			uci.get('wireless', item.device, 'type') !== 'mtwifi' ||
+			(group != null && group !== '') || ['1', 'true', 'yes'].indexOf(String(flag)) < 0)
+			throw new Error('legacy_conflict');
+	});
+	return members;
+}
+
+function mlo_stage_legacy_removal(state) {
+	mlo_legacy_removal_members(state);
+	/* Keep this in the modal until Save. Normal LuCI Save & Apply handles
+	 * commit, reload and rollback; Cancel must leave the UCI cache alone.
+	 */
+	state.legacy_cleanup_staged = true;
+	if (state.checkbox) { state.checkbox.checked = false; state.checkbox.disabled = true; }
+	state.operation = state.payload = state.preview = null;
+	state.refreshRows();
+}
+
 function add_mlo_interface_option(section, section_id, radioNet) {
 	var device = radioNet.getWifiDeviceName();
 	var htmode = uci.get('wireless', device, 'htmode') || '';
@@ -496,6 +532,7 @@ function add_mlo_interface_option(section, section_id, radioNet) {
 		var enabled = !!(state.checkbox && state.checkbox.checked);
 		var editor_visible = enabled && (!state.group || state.editing);
 		var visibility = {
+			_mlo_legacy: mlo_legacy_members(state.status).length > 0,
 			_mlo_members: editor_visible,
 			_mlo_ssid: editor_visible,
 			_mlo_password: editor_visible,
@@ -563,13 +600,45 @@ function add_mlo_interface_option(section, section_id, radioNet) {
 		state.checkbox = checkbox;
 		var caps = state.status && state.status.capabilities;
 		var at_capacity = !state.group && caps && state.status.groups && state.status.groups.length >= caps.max_groups;
-		checkbox.disabled = (!state.can_create && !state.group) || !!at_capacity;
+		checkbox.disabled = (!state.can_create && !state.group) || !!at_capacity ||
+			mlo_legacy_members(state.status).length > 0 || state.legacy_cleanup_staged;
 		checkbox.addEventListener('change', state.refreshRows);
 		var control = E('div', { 'class': 'mlo-inline-control' }, widget);
 		setTimeout(state.refreshRows, 0);
 		return control;
 	};
 
+	var legacy_row = mlo_add_display_option(section, state, section_id, '_mlo_legacy', _('Legacy MLO settings'), function() {
+		var note = E('p', { 'class': 'cbi-value-description' },
+			_('Legacy MLO flags occupy these radios. Turn off the old group before choosing radios.'));
+		var button = E('button', { 'type': 'button', 'class': 'cbi-button cbi-button-action',
+			'disabled': mlo_normalize_list(state.status && state.status.groups).length > 0 || null },
+			_('Stage legacy MLO removal'));
+		button.addEventListener('click', function() {
+			try {
+				mlo_stage_legacy_removal(state);
+				button.disabled = true;
+				note.textContent = _('Save this interface, then choose Save & Apply. Reopen it to select MLO radios.');
+			} catch (error) {
+				note.textContent = _('Wireless settings changed. Reload this page before clearing legacy MLO flags.');
+			}
+		});
+		return E('div', {}, [ note, button, E('p', { 'class': 'cbi-value-description' },
+			_('Only legacy MLO flags are cleared. Wireless names, passwords and network bindings are preserved.')) ]);
+	});
+	legacy_row.parse = function() {
+		if (state.legacy_cleanup_staged) {
+			try {
+				mlo_legacy_removal_members(state).forEach(function(item) {
+					uci.set('wireless', item.section, 'mlo', '0');
+				});
+				state.legacy_cleanup_staged = false;
+			} catch (error) {
+				throw new Error(_('Wireless settings changed. Reload this page before clearing legacy MLO flags.'));
+			}
+		}
+		return Promise.resolve();
+	};
 	mlo_add_display_option(section, state, section_id, '_mlo_members', _('Select radios'), function() { return state.getEditor().members; });
 	mlo_add_display_option(section, state, section_id, '_mlo_ssid', _('Wireless name'), function() { return state.getEditor().ssid; });
 	mlo_add_display_option(section, state, section_id, '_mlo_password', _('Password'), function() { return state.getEditor().password; });

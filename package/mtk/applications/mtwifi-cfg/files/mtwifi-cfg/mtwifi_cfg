@@ -467,7 +467,7 @@ end
 
 local function validate_mld_groups(cfg)
     local groups, affected, other_aps = {}, {}, {}
-    local legacy_mismatch = false
+    local disabled_legacy_groups = {}
     local cursor = uci.cursor()
     local current_device = cfg.device
     local current_device_type = cursor:get("wireless", current_device, "type")
@@ -556,20 +556,21 @@ local function validate_mld_groups(cfg)
                 if not member.legacy_boolean then legacy_only = false end
             end
             if mismatch and legacy_only then
-                -- Preserve old per-band SSIDs for explicit legacy mlo=1;
-                -- numeric MldGroup assignments remain strictly validated.
-                legacy_mismatch = true
+                -- Keep independent AP names/security, but never advertise an
+                -- inconsistent legacy group as one MLD. Explicit managed
+                -- numeric groups retain the strict validation below.
+                disabled_legacy_groups[group] = true
             elseif mismatch then
                 return false
             end
         end
     end
 
-    if legacy_mismatch then
-        nixio.syslog("warning", "mtwifi-cfg: preserving legacy mlo=1 groups; set explicit mldgroup to validate SSID/security consistency")
+    if next(disabled_legacy_groups) then
+        nixio.syslog("warning", "mtwifi-cfg: disabling inconsistent legacy MLO groups; independent AP settings are preserved")
     end
 
-    return true
+    return true, disabled_legacy_groups
 end
 
 local function valid_eht_restricted_twt(value)
@@ -589,7 +590,8 @@ function mtwifi_cfg_setup(argv)
         return false
     end
 
-    if not validate_mld_groups(cfg) then
+    local valid_mld, disabled_legacy_groups = validate_mld_groups(cfg)
+    if not valid_mld then
         nixio.syslog("err", "mtwifi-cfg: MLO group requires matching SSID and security settings")
         return false
     end
@@ -848,6 +850,9 @@ function mtwifi_cfg_setup(argv)
                 set_dat(dats, apidx, "EHT_ApRestrictedTwt", cfg.config.eht_restricted_twt)
             end
             local group = mld_group(v.config)
+            if group and disabled_legacy_groups and disabled_legacy_groups[group] and mld_legacy_boolean(v.config) then
+                group = 0
+            end
             if group ~= nil then
                 set_dat(dats, apidx, "MldGroup", group)
             end

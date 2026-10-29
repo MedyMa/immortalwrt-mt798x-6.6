@@ -429,3 +429,21 @@ msgstr "无线配置仍在应用或恢复；恢复记录已保存，请稍后查
 
 msgid "MLO could not be applied; the previous wireless settings were restored."
 msgstr "MLO 应用失败，已恢复之前的无线设置。"
+
+msgid "Legacy MLO settings"
+msgstr "旧版 MLO 配置"
+
+msgid "Legacy MLO flags occupy these radios. Turn off the old group before choosing radios."
+msgstr "旧版 MLO 配置占用了这些射频。请先关闭旧组，再选择需要的频段。"
+
+msgid "Stage legacy MLO removal"
+msgstr "关闭旧版 MLO 配置"
+
+msgid "Save this interface, then choose Save & Apply. Reopen it to select MLO radios."
+msgstr "请先保存此接口并点击“保存并应用”，再重新打开以选择 MLO 射频。"
+
+msgid "Wireless settings changed. Reload this page before clearing legacy MLO flags."
+msgstr "无线配置已变化，请刷新页面后再清理旧版 MLO 配置。"
+
+msgid "Only legacy MLO flags are cleared. Wireless names, passwords and network bindings are preserved."
+msgstr "此操作仅关闭旧版 MLO 标志，保留现有无线名称、密码和网络绑定。"

@@ -129,6 +129,38 @@ EOF
 	fi
 fi
 
+usage_available=0
+usage_coverage=driver_not_ready
+usage_milli=0
+if [ "$npu_ready:$npu_alive:$npu_coverage" = 1:1:complete ]; then
+	usage_coverage=helper_missing
+	if [ -x /usr/bin/mtk-npu-usage ]; then
+		usage_coverage=read_failed
+		usage_json=$(timeout 3 /usr/bin/mtk-npu-usage 2>/dev/null)
+		if [ "$?" -eq 0 ] && [ "${#usage_json}" -le 1024 ] &&
+		   jshn -r "$usage_json" >/dev/null 2>&1 && json_load "$usage_json" 2>/dev/null; then
+			usage_coverage=invalid
+			json_get_var usage_schema schema
+			json_get_type usage_schema_type schema
+			json_get_var usage_unit unit
+			json_get_var usage_status available
+			json_get_type usage_status_type available
+			json_get_var usage_complete coverage
+			json_get_var usage_milli percent_milli
+			json_get_type usage_milli_type percent_milli
+			json_get_var usage_cores core_count
+			json_get_type usage_cores_type core_count
+			if [ "$usage_schema:$usage_unit:$usage_status_type:$usage_status:$usage_complete" = \
+			     1:mean_core_busy_percent:boolean:1:complete ] &&
+			   [ "$usage_schema_type:$usage_milli_type:$usage_cores_type:$usage_cores" = int:int:int:5 ] &&
+			   valid_uint "$usage_milli" 100000; then
+				usage_available=1
+				usage_coverage=complete
+			fi
+		fi
+	fi
+fi
+
 json_init
 json_add_int schema 3
 json_add_object npu
@@ -138,6 +170,15 @@ json_add_boolean mcu_alive "$npu_alive"
 json_add_int registered_tunnel_types "$npu_types"
 json_add_string coverage "$npu_coverage"
 json_add_boolean packet_offload_verified 0
+json_add_object utilization
+json_add_boolean available "$usage_available"
+json_add_string coverage "$usage_coverage"
+json_add_string unit mean_core_busy_percent
+if [ "$usage_available" = 1 ]; then
+	json_add_int percent_milli "$usage_milli"
+	json_add_int core_count 5
+fi
+json_close_object
 json_close_object
 json_add_object tunnels
 json_add_string snapshot per_entry_software

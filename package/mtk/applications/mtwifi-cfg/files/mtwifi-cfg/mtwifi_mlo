@@ -489,8 +489,13 @@ local function build_status()
 	local inventory = {}
 	c:foreach("wireless", "wifi-iface", function(iface)
 		if iface.mode ~= "ap" or not iface.device then return end
+		if c:get("wireless", iface.device, "type") ~= "mtwifi" then return end
+		local legacy = (iface.mldgroup == nil or iface.mldgroup == "") and disabled(iface.mlo)
 		local device, htmode = device_info(c, iface[".name"])
-		if not device then return end
+		local supported = device ~= nil
+		if not supported and not legacy then return end
+		device = device or iface.device
+		htmode = htmode or c:get("wireless", device, "htmode") or ""
 		local group, valid = group_value(iface.mldgroup, iface.mlo)
 		local rec = valid and owned[group] or nil
 		inventory[#inventory + 1] = {
@@ -498,7 +503,8 @@ local function build_status()
 			band = band_name(c, device, htmode), ssid = scalar(iface.ssid) or "",
 			grouped = not valid or (group or 0) > 0,
 			managed = rec ~= nil,
-			eligible = not disabled(iface.wds),
+			eligible = supported and not disabled(iface.wds),
+			legacy = legacy,
 			disabled = disabled(iface.disabled) or disabled(c:get("wireless", device, "disabled"))
 		}
 	end)
