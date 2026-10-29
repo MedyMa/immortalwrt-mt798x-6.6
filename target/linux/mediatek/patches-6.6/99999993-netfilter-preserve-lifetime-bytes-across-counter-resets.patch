@@ -1,0 +1,117 @@
+--- a/include/net/netfilter/nf_conntrack_acct.h
++++ b/include/net/netfilter/nf_conntrack_acct.h
+@@ -5,6 +5,7 @@
+ 
+ #ifndef _NF_CONNTRACK_ACCT_H
+ #define _NF_CONNTRACK_ACCT_H
++#include <linux/seqlock.h>
+ #include <net/net_namespace.h>
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #include <linux/netfilter/nf_conntrack_tuple_common.h>
+@@ -20,7 +21,48 @@
+ 
+ struct nf_conn_acct {
+ 	struct nf_conn_counter counter[IP_CT_DIR_MAX];
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	/* GET_CTRZERO remains resettable for nlbwmon. Read-only proc clients
++	 * also need the bytes consumed by every earlier reset of this CT.
++	 * No extra work is added to software or hardware packet accounting.
++	 */
++	seqlock_t total_lock;
++	u64 reset_bytes[IP_CT_DIR_MAX];
++#endif
+ };
++
++static inline void nf_ct_acct_read_reset(struct nf_conn_acct *acct, u32 dir,
++					u64 *packets, u64 *bytes)
++{
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	write_seqlock_bh(&acct->total_lock);
++#endif
++	*packets = atomic64_xchg(&acct->counter[dir].packets, 0);
++	*bytes = atomic64_xchg(&acct->counter[dir].bytes, 0);
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	acct->reset_bytes[dir] += *bytes;
++	write_sequnlock_bh(&acct->total_lock);
++#endif
++}
++
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++static inline u64 nf_ct_acct_total_bytes(struct nf_conn_acct *acct, u32 dir)
++{
++	unsigned int seq;
++	u64 bytes;
++
++	/* Readers must not observe the gap between xchg and carry. Writers
++	 * serialize concurrent netlink dumps and disable BH while seq is odd.
++	 */
++	do {
++		seq = read_seqbegin(&acct->total_lock);
++		bytes = acct->reset_bytes[dir] +
++			atomic64_read(&acct->counter[dir].bytes);
++	} while (read_seqretry(&acct->total_lock, seq));
++
++	return bytes;
++}
++#endif
+ 
+ static inline
+ struct nf_conn_acct *nf_conn_acct_find(const struct nf_conn *ct)
+@@ -41,6 +83,10 @@
+ 	acct = nf_ct_ext_add(ct, NF_CT_EXT_ACCT, gfp);
+ 	if (!acct)
+ 		pr_debug("failed to add accounting extension area");
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	else
++		seqlock_init(&acct->total_lock);
++#endif
+ 
+ 
+ 	return acct;
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@ -265,8 +265,7 @@
+ 	u64 pkts, bytes;
+ 
+ 	if (type == IPCTNL_MSG_CT_GET_CTRZERO) {
+-		pkts = atomic64_xchg(&counter[dir].packets, 0);
+-		bytes = atomic64_xchg(&counter[dir].bytes, 0);
++		nf_ct_acct_read_reset(acct, dir, &pkts, &bytes);
+ 	} else {
+ 		pkts = atomic64_read(&counter[dir].packets);
+ 		bytes = atomic64_read(&counter[dir].bytes);
+--- a/net/netfilter/nf_conntrack_standalone.c
++++ b/net/netfilter/nf_conntrack_standalone.c
+@@ -293,6 +293,22 @@
+ 		   (unsigned long long)atomic64_read(&counter[dir].bytes));
+ }
+ 
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++static void seq_print_acct_totals(struct seq_file *s, const struct nf_conn *ct)
++{
++	struct nf_conn_acct *acct = nf_conn_acct_find(ct);
++
++	if (!acct)
++		return;
++	/* Leave the legacy tuple and counter fields in their original order.
++	 * These lifetime bytes are not consumed by netlink GET_CTRZERO.
++	 */
++	seq_printf(s, "bytes_total=%llu bytes_total=%llu ",
++		   (unsigned long long)nf_ct_acct_total_bytes(acct, IP_CT_DIR_ORIGINAL),
++		   (unsigned long long)nf_ct_acct_total_bytes(acct, IP_CT_DIR_REPLY));
++}
++#endif
++
+ static void
+ seq_print_qos(struct seq_file *s, const struct nf_conn *ct, int dir)
+ {
+@@ -387,6 +403,9 @@
+ 	ct_show_zone(s, ct, NF_CT_DEFAULT_ZONE_DIR);
+ 	ct_show_delta_time(s, ct);
+ 
++#ifdef CONFIG_NF_HNAT_PACKET_ACCOUNTING
++	seq_print_acct_totals(s, ct);
++#endif
+ 	seq_printf(s, "use=%u\n", refcount_read(&ct->ct_general.use));
+ 
+ 	if (seq_has_overflowed(s))
