@@ -37,6 +37,7 @@ define KernelPackage/npu-dpdk-autoload
   CATEGORY:=MTK Properties
   SUBMENU:=Drivers
   TITLE:= MediaTek Network Processor Unit with DPDK Feature Auto Load
+  DEFAULT:=y if MTK_NPU_24_10_DPDK_BACKEND
   KCONFIG:=
   DEPENDS:= \
 	kmod-npu-dpdk \

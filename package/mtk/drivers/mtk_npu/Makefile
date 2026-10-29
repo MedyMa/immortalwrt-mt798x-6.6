@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mtk_npu
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 PKG_BUILD_DEPENDS:=pce
 PKG_FILE_DEPENDS:=$(CURDIR)/src/
 SCAN_DEPS = *.mk Config*.in
@@ -20,6 +20,15 @@ NPU_PKGS:=
 
 include npu.mk
 include $(filter-out npu.mk,$(wildcard *.mk))
+
+PKG_CONFIG_DEPENDS += $(sort \
+	$(foreach option,$(EXTRA_KCONFIG),$(firstword $(subst =, ,$(option)))) \
+	$(foreach package,$(NPU_KERNEL_PKGS),CONFIG_PACKAGE_kmod-$(package)) \
+	CONFIG_MTK_NPU_24_10_TUNNEL_BACKEND CONFIG_MTK_NPU_24_10_MCAST_BACKEND \
+	CONFIG_MTK_NPU_24_10_FLOW_BACKEND CONFIG_MTK_NPU_24_10_DPDK_BACKEND \
+	CONFIG_MTK_NPU_REBB_SUPPORT CONFIG_MTK_NPU_PPP_SOCKET \
+	CONFIG_MTK_NPU_DPDK_MAC_FILTER_NUM \
+	CONFIG_NPU_TNL_NUM CONFIG_NPU_TNL_MAP_BIT CONFIG_NPU_TNL_TYPE_NUM)
 
 EXTRA_CFLAGS+= \
 	$(patsubst CONFIG_%, -DCONFIG_%=1, $(patsubst %=m,%,$(filter %=m,$(EXTRA_KCONFIG)))) \
@@ -44,6 +53,15 @@ define Build/InstallDev
 endef
 
 define Build/Compile
+	$(if $(filter y,$(CONFIG_MTK_NPU_24_10_TUNNEL_BACKEND)),\
+		$(if $(filter y,$(CONFIG_MTK_NPU_HNAT)),true,\
+			$(error NPU HNAT mode requires kmod-npu-nf_hnat)))
+	$(if $(filter y,$(CONFIG_MTK_NPU_24_10_MCAST_BACKEND)),\
+		$(if $(filter y,$(CONFIG_MTK_NPU_MCAST)),true,\
+			$(error NPU multicast mode requires kmod-npu-mcast)))
+	$(if $(filter y,$(CONFIG_MTK_NPU_24_10_DPDK_BACKEND)),\
+		$(if $(filter y,$(CONFIG_MTK_NPU_DPDK)),true,\
+			$(error NPU DPDK mode requires kmod-npu-dpdk)))
 	$(if $(filter y,$(CONFIG_MTK_NPU_24_10_FLOW_BACKEND)),\
 		$(if $(filter y,$(CONFIG_MTK_NPU_FLOW)),true,\
 			$(error Native NPU FLOW requires kmod-npu-flow with vendor HNAT disabled)))

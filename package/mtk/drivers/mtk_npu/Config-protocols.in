@@ -35,8 +35,7 @@ config MTK_NPU_GRE
 
 config MTK_NPU_GRETAP
 	bool "Mediatek NPU L2oGRE HW Offload"
-	depends on !MTK_NPU_24_10_DPDK_BACKEND
-	depends on !MTK_NPU_24_10_FLOW_BACKEND
+	depends on MTK_NPU_24_10_TUNNEL_BACKEND
 	default y
 	select MTK_NPU_GRE
 	select PACKAGE_kmod-gre
@@ -79,8 +78,7 @@ config MTK_NPU_L2TP_V2
 
 config MTK_NPU_VXLAN
 	bool "Mediatek NPU VXLAN HW Offload"
-	depends on !MTK_NPU_24_10_DPDK_BACKEND
-	depends on !MTK_NPU_24_10_FLOW_BACKEND
+	depends on MTK_NPU_24_10_TUNNEL_BACKEND
 	default y
 	select PACKAGE_kmod-vxlan
 	help

@@ -17,6 +17,7 @@ define KernelPackage/npu-mcast
   CATEGORY:=MTK Properties
   SUBMENU:=Drivers
   TITLE:=MediaTek Network Processor Unit with Multicast Feature
+  DEFAULT:=y if MTK_NPU_24_10_MCAST_BACKEND
   KCONFIG:=
   DEPENDS:= \
 	@MTK_NPU_24_10_MCAST_BACKEND \
@@ -34,6 +35,7 @@ define KernelPackage/npu-mcast-autoload
   CATEGORY:=MTK Properties
   SUBMENU:=Drivers
   TITLE:= MediaTek Network Processor Unit with Multicast Feature Auto Load
+  DEFAULT:=y if MTK_NPU_24_10_MCAST_BACKEND
   KCONFIG:=
   DEPENDS:= \
 	kmod-npu-mcast \

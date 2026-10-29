@@ -5,6 +5,48 @@
 # Author: Ren-Ting Wang <ren-ting.wang@mediatek.com>
 #
 
+# Reject incompatible backends even when stale flags bypass package Kconfig.
+npu-router-backends := $(CONFIG_MTK_NPU_HNAT) $(CONFIG_MTK_NPU_FLOW) $(CONFIG_MTK_NPU_MCAST)
+npu-tunnel-protocols := $(CONFIG_MTK_NPU_GRE) $(CONFIG_MTK_NPU_GRETAP) \
+	$(CONFIG_MTK_NPU_PPP) $(CONFIG_MTK_NPU_L2TP) $(CONFIG_MTK_NPU_L2TP_V2) \
+	$(CONFIG_MTK_NPU_PPTP) $(CONFIG_MTK_NPU_VXLAN)
+
+ifneq ($(filter y m,$(CONFIG_MTK_NPU_DPDK)),)
+ifneq ($(filter y m,$(npu-router-backends) $(npu-tunnel-protocols) \
+	$(CONFIG_MTK_NPU_ADPT_FWD) $(CONFIG_MTK_NPU_L4S) $(CONFIG_MTK_NPU_RATE_LIMIT)),)
+$(error NPU DPDK requires other NPU packet backends and tunnel protocols disabled)
+endif
+endif
+
+ifneq ($(filter y m,$(CONFIG_MTK_NPU_L4S)),)
+ifneq ($(filter y m,$(npu-router-backends) $(npu-tunnel-protocols) \
+	$(CONFIG_MTK_NPU_DPDK) $(CONFIG_MTK_NPU_ADPT_FWD) $(CONFIG_MTK_NPU_RATE_LIMIT)),)
+$(error The dedicated NPU L4S firmware mode cannot share other packet backends)
+endif
+endif
+
+ifneq ($(filter y m,$(CONFIG_MTK_NPU_FLOW)),)
+ifneq ($(filter y m,$(CONFIG_MTK_NPU_HNAT) $(CONFIG_MTK_NPU_MCAST) \
+	$(CONFIG_MTK_NPU_GRETAP) $(CONFIG_MTK_NPU_VXLAN) $(CONFIG_NET_MEDIATEK_HNAT)),)
+$(error Native NPU FLOW requires vendor HNAT and its tunnel/multicast backends disabled)
+endif
+ifneq ($(CONFIG_NET_MEDIATEK_NPU_FLOW),y)
+$(error Native NPU FLOW requires CONFIG_NET_MEDIATEK_NPU_FLOW=y in the kernel)
+endif
+endif
+
+ifneq ($(filter y m,$(CONFIG_MTK_NPU_HNAT) $(CONFIG_MTK_NPU_MCAST)),)
+ifeq ($(filter y m,$(CONFIG_NET_MEDIATEK_HNAT)),)
+$(error NPU HNAT/multicast requires the vendor HNAT kernel provider)
+endif
+endif
+
+ifneq ($(filter y m,$(CONFIG_MTK_NPU_PPTP) $(CONFIG_MTK_NPU_L2TP_V2)),)
+ifneq ($(CONFIG_MTK_PPP_TUNNEL_INFO),y)
+$(error NPU PPP tunnel protocols require CONFIG_MTK_PPP_TUNNEL_INFO=y in the kernel)
+endif
+endif
+
 # The adapter borrows the core mapping and follows the same platform lifetime.
 npu-$(CONFIG_MTK_NPU_DPDK) += npu-dpdk/init.o npu-dpdk/cdev.o npu-dpdk/mac-filter.o
 ifneq ($(filter y m,$(CONFIG_MTK_NPU_DPDK)),)

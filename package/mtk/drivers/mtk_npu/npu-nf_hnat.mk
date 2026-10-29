@@ -17,6 +17,7 @@ define KernelPackage/npu-nf_hnat
   CATEGORY:=MTK Properties
   SUBMENU:=Drivers
   TITLE:=MediaTek Network Processor Unit with HNAT Kernel Driver
+  DEFAULT:=y if MTK_NPU_24_10_TUNNEL_BACKEND
   KCONFIG:= CONFIG_MTK_PPP_TUNNEL_INFO=y
   DEPENDS:= \
 	@MTK_NPU_24_10_TUNNEL_BACKEND \
@@ -36,6 +37,7 @@ define KernelPackage/npu-nf_hnat-autoload
   CATEGORY:=MTK Properties
   SUBMENU:=Drivers
   TITLE:= MediaTek Network Processor Unit with HNAT Kernel Driver Auto Load
+  DEFAULT:=y if MTK_NPU_24_10_TUNNEL_BACKEND
   KCONFIG:=
   DEPENDS:= \
 	kmod-npu-nf_hnat \
