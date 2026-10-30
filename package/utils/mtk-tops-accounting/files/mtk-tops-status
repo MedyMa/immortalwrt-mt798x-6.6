@@ -129,6 +129,7 @@ EOF
 	fi
 fi
 
+core_values=
 usage_available=0
 usage_coverage=driver_not_ready
 usage_milli=0
@@ -156,18 +157,48 @@ if [ "$npu_ready:$npu_alive:$npu_coverage" = 1:1:complete ]; then
 			   valid_uint "$usage_milli" 100000; then
 				usage_available=1
 				usage_coverage=complete
+				if json_select cores 2>/dev/null; then
+					core_ok=1
+					core_values=
+					for core in Core0 Core1 Core2 Core3 CoreM; do
+						json_get_var core_value "$core"
+						json_get_type core_type "$core"
+						if [ "$core_type" != int ] || ! valid_uint "$core_value" 100000; then
+							core_ok=0
+							break
+						fi
+						core_values="$core_values $core:$core_value"
+					done
+					[ "$core_ok" = 1 ] || core_values=
+					json_select ..
+				fi
 			fi
 		fi
 	fi
 fi
 
+fw_info=
+if [ "$npu_ready:$npu_alive:$npu_coverage" = 1:1:complete ]; then
+	for fw_node in /sys/bus/platform/drivers/mediatek,npu/*/npu/mcu/fw_info; do
+		if bounded_read "$fw_node" 4096; then fw_info=$READ_VALUE; fi
+		break
+	done
+fi
+platform=
+if [ -r /proc/device-tree/model ] && command -v timeout >/dev/null 2>&1; then
+	# Device-tree strings end in NUL. Remove it before shell substitution.
+	platform=$(timeout 2 head -c 257 /proc/device-tree/model 2>/dev/null | tr -d '\000')
+	[ "${#platform}" -le 256 ] || platform=
+fi
 json_init
 json_add_int schema 3
+json_add_string platform "$platform"
 json_add_object npu
 json_add_boolean status_node_present "$npu_present"
 json_add_boolean firmware_ready "$npu_ready"
 json_add_boolean mcu_alive "$npu_alive"
 json_add_int registered_tunnel_types "$npu_types"
+json_add_string firmware_info "$fw_info"
 json_add_string coverage "$npu_coverage"
 json_add_boolean packet_offload_verified 0
 json_add_object utilization
@@ -177,6 +208,11 @@ json_add_string unit mean_core_busy_percent
 if [ "$usage_available" = 1 ]; then
 	json_add_int percent_milli "$usage_milli"
 	json_add_int core_count 5
+	if [ -n "$core_values" ]; then
+		json_add_object cores
+		for core_pair in $core_values; do json_add_int "${core_pair%%:*}" "${core_pair#*:}"; done
+		json_close_object
+	fi
 fi
 json_close_object
 json_close_object

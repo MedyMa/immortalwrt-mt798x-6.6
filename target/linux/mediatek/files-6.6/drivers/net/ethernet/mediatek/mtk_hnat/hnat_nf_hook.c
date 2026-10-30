@@ -552,7 +552,7 @@ void foe_clear_entry(struct neighbour *neigh)
 					mod_timer(&hnat_priv->hnat_sma_build_entry_timer,
 						  jiffies + 3 * HZ);
 
-					if (debug_level >= 7) {
+					if (debug_level >= 7 && net_ratelimit()) {
 						pr_info("%s: state=%d\n", __func__,
 							neigh->nud_state);
 						pr_info("Delete old entry: dip =%pI4\n", &dip);
@@ -649,7 +649,7 @@ unsigned int do_hnat_ext_to_ge(struct sk_buff *skb, const struct net_device *in,
 		return 0;
 	}
 
-	trace_printk("%s: called from %s fail\n", __func__, func);
+	pr_debug_ratelimited("%s: called from %s fail\n", __func__, func);
 	return -1;
 }
 
@@ -659,7 +659,7 @@ unsigned int do_hnat_ext_to_ge2(struct sk_buff *skb, const char *func)
 	struct net_device *dev;
 	struct foe_entry *entry;
 	
-	trace_printk("%s: vlan_prot=0x%x, vlan_tci=%x\n", __func__,
+	pr_debug_ratelimited("%s: vlan_prot=0x%x, vlan_tci=%x\n", __func__,
 		     ntohs(skb->vlan_proto), skb->vlan_tci);
 
 	if (skb_hnat_entry(skb) >= hnat_priv->foe_etry_num ||
@@ -716,7 +716,7 @@ unsigned int do_hnat_ext_to_ge2(struct sk_buff *skb, const char *func)
 				return 0;
 			}
 		}
-		trace_printk("%s: called from %s fail\n", __func__, func);
+		pr_debug_ratelimited("%s: called from %s fail\n", __func__, func);
 		return -1;
 	}
 }
@@ -748,7 +748,7 @@ unsigned int do_hnat_ge_to_ext(struct sk_buff *skb, const char *func)
 
 	dev = get_dev_from_index(index);
 	if (!dev) {
-		trace_printk("%s: called from %s. Get wifi interface fail\n",
+		pr_debug_ratelimited("%s: called from %s. Get wifi interface fail\n",
 			     __func__, func);
 		return 0;
 	}
@@ -773,7 +773,7 @@ unsigned int do_hnat_ge_to_ext(struct sk_buff *skb, const char *func)
 		skb_set_network_header(skb, 0);
 		skb_push(skb, ETH_HLEN);
 		dev_queue_xmit(skb);
-		trace_printk("%s: called from %s successfully\n", __func__,
+		pr_debug_ratelimited("%s: called from %s successfully\n", __func__,
 			     func);
 		return 0;
 	} else {
@@ -789,7 +789,7 @@ unsigned int do_hnat_ge_to_ext(struct sk_buff *skb, const char *func)
 					dev_queue_xmit(skb);
 					return 0;
 				}
-				trace_printk("%s: called from %s fail[MapE]\n", __func__,
+				pr_debug_ratelimited("%s: called from %s fail[MapE]\n", __func__,
 					     func);
 				return -1;
 			}
@@ -809,7 +809,7 @@ unsigned int do_hnat_ge_to_ext(struct sk_buff *skb, const char *func)
 		/* clear HWNAT cache */
 		hnat_cache_ebl(1);
 	}
-	trace_printk("%s: called from %s fail, index=%x\n", __func__,
+	pr_debug_ratelimited("%s: called from %s fail, index=%x\n", __func__,
 		     func, index);
 	return -1;
 }
@@ -817,7 +817,7 @@ unsigned int do_hnat_ge_to_ext(struct sk_buff *skb, const char *func)
 static void pre_routing_print(struct sk_buff *skb, const struct net_device *in,
 			      const struct net_device *out, const char *func)
 {
-	trace_printk(
+	pr_debug_ratelimited(
 		"[%s]: %s(iif=0x%x CB2=0x%x)-->%s (ppe_hash=0x%x) sport=0x%x reason=0x%x alg=0x%x from %s\n",
 		__func__, in->name, skb_hnat_iface(skb),
 		HNAT_SKB_CB2(skb)->magic, out->name, skb_hnat_entry(skb),
@@ -828,7 +828,7 @@ static void pre_routing_print(struct sk_buff *skb, const struct net_device *in,
 static void post_routing_print(struct sk_buff *skb, const struct net_device *in,
 			       const struct net_device *out, const char *func)
 {
-	trace_printk(
+	pr_debug_ratelimited(
 		"[%s]: %s(iif=0x%x, CB2=0x%x)-->%s (ppe_hash=0x%x) sport=0x%x reason=0x%x alg=0x%x from %s\n",
 		__func__, in->name, skb_hnat_iface(skb),
 		HNAT_SKB_CB2(skb)->magic, out->name, skb_hnat_entry(skb),
@@ -1401,7 +1401,7 @@ mtk_hnat_br_nf_local_in(void *priv, struct sk_buff *skb,
 
 	pre_routing_print(skb, state->in, state->out, __func__);
 
-	if (unlikely(debug_level >= 7)) {
+	if (unlikely(debug_level >= 7) && net_ratelimit()) {
 		hnat_cpu_reason_cnt(skb);
 		if (skb_hnat_reason(skb) == dbg_cpu_reason)
 			foe_dump_pkt(skb);
@@ -1750,7 +1750,7 @@ void hnat_flow_entry_delete(struct hnat_flow_entry *flow_entry)
  * chain; the saved key, rather than a hardware PRE_FILLED bit, is identity.
  */
 static struct hnat_flow_entry *hnat_flow_entry_search(
-		const struct foe_entry *data, u16 ppe_index, u16 hash)
+		const struct foe_entry *data, u16 ppe_index, u16 hash, bool live_key)
 {
 	struct hnat_flow_entry *flow_entry;
 	struct hlist_head *head;
@@ -1763,7 +1763,8 @@ static struct hnat_flow_entry *hnat_flow_entry_search(
 	hlist_for_each_entry(flow_entry, head, list) {
 		if (flow_entry->ppe_index == ppe_index &&
 		    flow_entry->hash == hash &&
-		    hnat_flow_entry_match(&flow_entry->data, data))
+		    (live_key ? hnat_flow_entry_unbind_match(&flow_entry->data, data) :
+		     hnat_flow_entry_match(&flow_entry->data, data)))
 			return flow_entry;
 	}
 
@@ -1832,16 +1833,44 @@ int hnat_tunnel_flush(u32 tops_entry)
 }
 EXPORT_SYMBOL_GPL(hnat_tunnel_flush);
 
-/* Software locks cannot prevent a concurrent PPE rewrite. This gate checks
- * the live state and key as close as software can get to a publication.
+/* pkt_type zero is IPv4 HNAPT, not an empty-slot marker. Only a zero
+ * four-tuple in a dynamic UNBIND IPv4 slot is an unlearned identity. Its
+ * prepared key must come from a live CT and be checked against the skb.
+ */
+static bool hnat_flow_entry_unbind_empty(const struct foe_entry *live)
+{
+	return live->udib1.pkt_type == IPV4_HNAPT && !live->udib1.sta &&
+	       !READ_ONCE(live->ipv4_hnapt.sip) &&
+	       !READ_ONCE(live->ipv4_hnapt.dip) &&
+	       !READ_ONCE(live->ipv4_hnapt.sport) &&
+	       !READ_ONCE(live->ipv4_hnapt.dport);
+}
+
+/* Software locks cannot prevent a concurrent PPE rewrite. Keep the live
+ * state/key gate at every prefill and publication, including empty slots.
  */
 bool hnat_flow_entry_unbind_match(const struct foe_entry *entry,
 				  const struct foe_entry *live)
 {
 	u32 info_blk1 = READ_ONCE(live->ipv4_hnapt.info_blk1);
+	bool match;
+#if defined(CONFIG_MEDIATEK_NETSYS_V2) || defined(CONFIG_MEDIATEK_NETSYS_V3)
+	const u32 identity_mask = GENMASK(31, 23);
+#else
+	const u32 identity_mask = GENMASK(31, 25);
+#endif
 
-	return ((info_blk1 >> 28) & 0x3) == UNBIND &&
-	       hnat_flow_entry_match(entry, live);
+	if (((info_blk1 >> 28) & 0x3) != UNBIND || (info_blk1 & BIT(31)))
+		return false;
+	dma_rmb();
+	if (hnat_flow_entry_unbind_empty(live))
+		match = entry->udib1.pkt_type == IPV4_HNAPT &&
+			entry->ipv4_hnapt.sip && entry->ipv4_hnapt.dip;
+	else
+		match = hnat_flow_entry_match(entry, live);
+	/* Ignore timestamps/counts; reject a state, format or protocol change. */
+	return match && !((info_blk1 ^ READ_ONCE(live->ipv4_hnapt.info_blk1)) &
+			 identity_mask);
 }
 
 static bool hnat_flow_entry_store(const struct foe_entry *entry, u32 ppe,
@@ -1979,7 +2008,7 @@ static bool hnat_flow_entry_lock_current(const struct foe_entry *key,
 	struct hnat_flow_entry *flow;
 
 	spin_lock_bh(&hnat_priv->flow_entry_lock);
-	flow = hnat_flow_entry_search(key, ppe, slot);
+	flow = hnat_flow_entry_search(key, ppe, slot, false);
 	if (!flow ||
 	    time_after_eq(jiffies, flow->last_update + 3 * HZ) ||
 	    flow->generation != generation || flow->sequence != sequence) {
@@ -2200,6 +2229,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	int gmac = NR_DISCARD;
 	int udp = 0;
 	bool account_handled, accepted = false;
+	bool empty_key = hnat_flow_entry_unbind_empty(foe);
 	u64 account_generation = 0;
 	u32 qid = 0;
 	int port_id = 0;
@@ -2334,6 +2364,20 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 				entry.ipv4_hnapt.dip = foe->ipv4_hnapt.dip;
 				entry.ipv4_hnapt.sport = foe->ipv4_hnapt.sport;
 				entry.ipv4_hnapt.dport = foe->ipv4_hnapt.dport;
+				if (empty_key) {
+					const struct nf_conntrack_tuple *key;
+
+					if (!ct || !nf_ct_is_confirmed(ct) || nf_ct_is_template(ct) || nf_ct_is_dying(ct))
+						return 0;
+					key = nf_ct_tuple(ct, CTINFO2DIR(ctinfo));
+					if (key->src.l3num != NFPROTO_IPV4 ||
+					    key->dst.protonum != iph->protocol)
+						return 0;
+					entry.ipv4_hnapt.sip = ntohl(key->src.u3.ip);
+					entry.ipv4_hnapt.dip = ntohl(key->dst.u3.ip);
+					entry.ipv4_hnapt.sport = ntohs(key->src.u.all);
+					entry.ipv4_hnapt.dport = ntohs(key->dst.u.all);
+				}
 
 				entry.ipv4_hnapt.new_sip = ntohl(iph->saddr);
 				entry.ipv4_hnapt.new_dip = ntohl(iph->daddr);
@@ -2361,7 +2405,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 		default:
 			return -1;
 		}
-		trace_printk(
+		pr_debug_ratelimited(
 			"[%s]skb->head=%p, skb->data=%p,ip_hdr=%p, skb->len=%d, skb->data_len=%d\n",
 			__func__, skb->head, skb->data, iph, skb->len,
 			skb->data_len);
@@ -2625,7 +2669,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 			return -1;
 		}
 
-		trace_printk(
+		pr_debug_ratelimited(
 			"[%s]skb->head=%p, skb->data=%p,ipv6_hdr=%p, skb->len=%d, skb->data_len=%d\n",
 			__func__, skb->head, skb->data, ip6h, skb->len,
 			skb->data_len);
@@ -2704,7 +2748,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 				entry.ipv4_hnapt.vlan1 = 2;
 		}
 
-		trace_printk("learn of lan or wan(iif=%x) --> %s(ext)\n",
+		pr_debug_ratelimited("learn of lan or wan(iif=%x) --> %s(ext)\n",
 			     skb_hnat_iface(skb), dev->name);
 		/* To CPU then stolen by pre-routing hant hook of LAN/WAN
 		 * Current setting is PDMA RX.
@@ -2840,7 +2884,7 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 	 * to the same CT direction.  Encapsulation needs its own identity parser;
 	 * this check does not infer an inner tuple or change those existing paths.
 	 */
-	if (FROM_WED(skb) && skb->protocol == htons(ETH_P_IP) &&
+	if ((empty_key || FROM_WED(skb)) && skb->protocol == htons(ETH_P_IP) &&
 	    !skb->encapsulation &&
 	    !hnat_flow_ipv4_ct_match(skb, &entry, ct, ctinfo))
 		return 0;
@@ -2933,7 +2977,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 	    !is_magic_tag_valid(skb) || !IS_SPACE_AVAILABLE_HEAD(skb))
 		return NF_ACCEPT;
 
-	trace_printk(
+	pr_debug_ratelimited(
 		"[%s]entry=%x reason=%x gmac_no=%x wdmaid=%x rxid=%x wcid=%x bssid=%x\n",
 		__func__, skb_hnat_entry(skb), skb_hnat_reason(skb), gmac_no,
 		skb_hnat_wdma_id(skb), skb_hnat_rx_id(skb), skb_hnat_wc_id(skb),
@@ -2961,7 +3005,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 	 */
 	spin_lock_bh(&hnat_priv->flow_entry_lock);
 	flow = hnat_flow_entry_search(hw_entry, skb_hnat_ppe(skb),
-				      skb_hnat_entry(skb));
+				      skb_hnat_entry(skb), true);
 	if (!flow || flow->tunnel_dev ||
 	    time_after_eq(jiffies, flow->last_update + 3 * HZ) ||
 	    flow->generation != account_generation ||
@@ -3267,7 +3311,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 	spin_unlock_bh(&hnat_priv->flow_entry_lock);
 
 #if defined(CONFIG_MEDIATEK_NETSYS_V3)
-	if (debug_level >= 7) {
+	if (debug_level >= 7 && net_ratelimit()) {
 		pr_info("%s %d dp:%d rxid:%d tid:%d usr_info:%d bssid:%d wcid:%d hsh-idx:%d sp:%d\n",
 			__func__, __LINE__,
 			gmac_no, skb_hnat_rx_id(skb), skb_hnat_tid(skb),
@@ -3495,7 +3539,7 @@ static void mtk_hnat_dscp_update(struct sk_buff *skb, struct foe_entry *entry)
 	}
 
 	if (flag) {
-		if (debug_level >= 7)
+		if (debug_level >= 7 && net_ratelimit())
 			pr_info("%s %d update entry idx=%d\n", __func__, __LINE__,
 			skb_hnat_entry(skb));
 		hnat_cache_ebl(1);
@@ -3950,7 +3994,7 @@ static bool hnat_tunnel_pending_outer(struct sk_buff *skb)
 		return false;
 	live = &hnat_priv->foe_table_cpu[ppe][slot];
 	spin_lock_bh(&hnat_priv->flow_entry_lock);
-	flow = hnat_flow_entry_search(live, ppe, slot);
+	flow = hnat_flow_entry_search(live, ppe, slot, true);
 	if (flow && flow->tunnel_dev && netif_running(flow->tunnel_dev) &&
 	    flow->generation == generation &&
 	    time_before(jiffies, flow->last_update + 3 * HZ) &&
@@ -4077,7 +4121,7 @@ static void hnat_tunnel_confirm(struct sk_buff *skb, const struct net_device *ou
 		goto reject;
 	live = &hnat_priv->foe_table_cpu[ppe][slot];
 	spin_lock_bh(&hnat_priv->flow_entry_lock);
-	flow = hnat_flow_entry_search(live, ppe, slot);
+	flow = hnat_flow_entry_search(live, ppe, slot, true);
 	if (!flow || !flow->tunnel_dev || flow->generation != generation ||
 	    time_after_eq(jiffies, flow->last_update + 3 * HZ) ||
 	    !hnat_flow_entry_unbind_match(&flow->data, live)) {
@@ -4268,7 +4312,7 @@ static unsigned int mtk_hnat_nf_post_routing(
 	if (!IS_WHNAT(out) && IS_EXT(out))
 		return 0;
 
-	trace_printk("[%s] case hit, %x-->%s, reason=%x\n", __func__,
+	pr_debug_ratelimited("[%s] case hit, %x-->%s, reason=%x\n", __func__,
 		     skb_hnat_iface(skb), out->name, skb_hnat_reason(skb));
 
 	entry = &hnat_priv->foe_table_cpu[skb_hnat_ppe(skb)][skb_hnat_entry(skb)];
@@ -4426,7 +4470,7 @@ mtk_hnat_ipv6_nf_post_routing(void *priv, struct sk_buff *skb,
 
 drop:
 	if (skb)
-		trace_printk(
+		pr_debug_ratelimited(
 			"%s:drop (iif=0x%x, out_dev=%s, CB2=0x%x, ppe_hash=0x%x,\n"
 			"sport=0x%x, reason=0x%x, alg=0x%x)\n",
 			__func__, skb_hnat_iface(skb), state->out->name,
@@ -4452,7 +4496,7 @@ mtk_hnat_ipv4_nf_post_routing(void *priv, struct sk_buff *skb,
 
 drop:
 	if (skb)
-		trace_printk(
+		pr_debug_ratelimited(
 			"%s:drop (iif=0x%x, out_dev=%s, CB2=0x%x, ppe_hash=0x%x,\n"
 			"sport=0x%x, reason=0x%x, alg=0x%x)\n",
 			__func__, skb_hnat_iface(skb), state->out->name,
@@ -4538,7 +4582,7 @@ mtk_hnat_br_nf_local_out(void *priv, struct sk_buff *skb,
 
 drop:
 	if (skb)
-		trace_printk(
+		pr_debug_ratelimited(
 			"%s:drop (iif=0x%x, out_dev=%s, CB2=0x%x, ppe_hash=0x%x,\n"
 			"sport=0x%x, reason=0x%x, alg=0x%x)\n",
 			__func__, skb_hnat_iface(skb), state->out->name,

@@ -56,7 +56,7 @@ static void get_mac_from_mdb_entry(struct br_mdb_entry *entry,
 		*mac_hi = swab32(entry->addr.u.ip6.s6_addr32[3]);
 		break;
 	}
-	trace_printk("%s:group mac_h=0x%08x, mac_l=0x%04x\n",
+	pr_debug_ratelimited("%s:group mac_h=0x%08x, mac_l=0x%04x\n",
 		     __func__, *mac_hi, *mac_lo);
 }
 
@@ -83,7 +83,7 @@ static int set_hnat_mtbl(struct ppe_mcast_group *group, u32 ppe_id, int index)
 	mcast_h.u.info.mc_px_en = mc_port;
 	mcast_l.addr = mac_hi;
 	mcast_h.u.info.valid = group->valid;
-	trace_printk("%s:index=%d,group info=0x%x,addr=0x%x\n",
+	pr_debug_ratelimited("%s:index=%d,group info=0x%x,addr=0x%x\n",
 		     __func__, index, mcast_h.u.value, mcast_l.addr);
 	if (index < 0x10) {
 		reg = hnat_priv->ppe_base[ppe_id] + PPE_MCAST_H_0 + ((index) * 8);
@@ -152,7 +152,7 @@ static int hnat_mcast_table_update(int type, struct br_mdb_entry *entry)
 			}
 		break;
 	}
-	trace_printk("%s:devname=%s,eif=%d,oif=%d\n", __func__,
+	pr_debug_ratelimited("%s:devname=%s,eif=%d,oif=%d\n", __func__,
 		     dev->name, group->eif, group->oif);
 	if (group->valid) {
 		if (group->oif && group->eif)
@@ -209,10 +209,10 @@ static void hnat_mcast_nlmsg_handler(struct work_struct *work)
 			}
 
 			entry = (struct br_mdb_entry *)nla_data(info);
-			trace_printk("%s:cmd=0x%2x,ifindex=0x%x,state=0x%x",
+			pr_debug_ratelimited("%s:cmd=0x%2x,ifindex=0x%x,state=0x%x",
 				     __func__, nlh->nlmsg_type,
 				     entry->ifindex, entry->state);
-			trace_printk("vid=0x%x,ip=0x%x,proto=0x%x\n",
+			pr_debug_ratelimited("vid=0x%x,ip=0x%x,proto=0x%x\n",
 				     entry->vid, entry->addr.u.ip4,
 				     entry->addr.proto);
 			hnat_mcast_table_update(nlh->nlmsg_type, entry);

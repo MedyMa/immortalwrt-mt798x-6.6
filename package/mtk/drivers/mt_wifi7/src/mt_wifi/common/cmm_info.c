@@ -12476,6 +12476,16 @@ INT Show_MacTable_Proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg)
 	CHAR *pch = NULL;
 	UINT32 check_aid = 0;
 	UINT32 check_bssidx = 0;
+	static unsigned long mac_table_dumped;
+	BOOLEAN one_shot;
+
+	one_shot = (arg == NULL || strlen(arg) == 0);
+	/* Module-wide default dump: concurrent pollers must not all print it.
+	 * Explicit stainfo views keep their normal repeatable diagnostic output.
+	 */
+	if (one_shot && test_and_set_bit(0, &mac_table_dumped))
+		return TRUE;
+
 
 	MTWF_PRINT("%s(): arg=%s\n", __func__, (arg == NULL ? "" : arg));
 

@@ -84,6 +84,7 @@ struct hnat_account_ppe {
 	u64 retire_rule_bytes, retire_rule_packets;
 	u64 ct_written_bytes, ct_written_packets;
 	u64 poll_scanned, poll_reads, poll_errors;
+	u64 final_reads, final_errors;
 };
 struct hnat_account_ctx {
 	struct mtk_hnat *h;
@@ -179,15 +180,24 @@ static void retire_locked(struct hnat_account_ppe *p, struct hnat_slot *s)
 	}
 }
 
-static bool owner_live(struct mtk_hnat *h, u32 ppe, u32 slot)
+static bool owner_matches(struct mtk_hnat *h, u32 ppe, u32 slot)
 {
 	struct hnat_owner *o = h->account->ppe[ppe].slots[slot].owner;
 	struct foe_entry *entry = &h->foe_table_cpu[ppe][slot];
 
-	return o && !nf_ct_is_dying(o->ct) &&
+	return o &&
 		o->generation == h->account->ppe[ppe].slots[slot].generation &&
 		(o->prefill ? hnat_flow_entry_unbind_match(&o->identity, entry) :
 		 entry->bfib1.state == BIND && account_identity(&o->identity, entry));
+}
+
+/* A dying CT is still pinned by its owner. It cannot acquire a new binding,
+ * but its final verified hardware delta still belongs to that old CT.
+ */
+static bool owner_live(struct mtk_hnat *h, u32 ppe, u32 slot)
+{
+	return owner_matches(h, ppe, slot) &&
+	       !nf_ct_is_dying(h->account->ppe[ppe].slots[slot].owner->ct);
 }
 
 /* Caller holds per-PPE lock across the complete SER transaction and ledger. */
@@ -213,7 +223,7 @@ static int drain_locked(struct mtk_hnat *h, u32 ppe, u32 slot,
 		p->quarantined = false;
 		return -EAGAIN;
 	}
-	if (s->owner && !owner_live(h, ppe, slot)) {
+	if (s->owner && !owner_matches(h, ppe, slot)) {
 		p->mismatch++;
 		retire_locked(p, s);
 	}
@@ -237,7 +247,7 @@ static int drain_locked(struct mtk_hnat *h, u32 ppe, u32 slot,
 		delta->bytes = r0 + ((u64)(r1 & 0xffff) << 32);
 		delta->packets = (r1 >> 16) + ((u64)(r2 & 0xffffff) << 16);
 	}
-	if (s->owner && !owner_live(h, ppe, slot)) {
+	if (s->owner && !owner_matches(h, ppe, slot)) {
 		p->mismatch++;
 		retire_locked(p, s);
 	}
@@ -259,6 +269,48 @@ static int drain_locked(struct mtk_hnat *h, u32 ppe, u32 slot,
 	}
 	p->reads++;
 	return 0;
+}
+
+/* Caller holds p->lock. Temporarily bypass pause only for this final read;
+ * no publisher can observe the temporary value while this lock is held.
+ */
+static void drain_final_locked(struct mtk_hnat *h, u32 ppe, u32 slot)
+{
+	struct hnat_account_ppe *p = &h->account->ppe[ppe];
+	struct hnat_slot *s = &p->slots[slot];
+	struct hnat_accounting delta;
+	bool paused = p->paused;
+
+	if (!s->owner || s->owner->prefill || !owner_matches(h, ppe, slot))
+		return;
+	p->paused = false;
+	if (drain_locked(h, ppe, slot, &delta))
+		p->final_errors++;
+	else
+		p->final_reads++;
+	p->paused = paused;
+}
+
+static bool retire_dying_locked(struct mtk_hnat *h, u32 ppe, u32 slot)
+{
+	struct hnat_account_ppe *p = &h->account->ppe[ppe];
+	struct hnat_slot *s = &p->slots[slot];
+	struct foe_entry *foe = &h->foe_table_cpu[ppe][slot];
+	bool invalidated = false;
+
+	drain_final_locked(h, ppe, slot);
+	if (s->owner && !s->owner->prefill && owner_matches(h, ppe, slot)) {
+		u32 info = READ_ONCE(foe->ipv4_hnapt.info_blk1);
+
+		WRITE_ONCE(foe->ipv4_hnapt.info_blk1, info & ~GENMASK(29, 28));
+		dma_wmb();
+		invalidated = true;
+	}
+	retire_locked(p, s);
+	s->generation++;
+	/* An in-flight PPE packet can finish after the final read. */
+	p->unknown_loss++;
+	return invalidated;
 }
 
 int hnat_account_drain(struct mtk_hnat *h, u32 ppe, u32 slot,
@@ -492,7 +544,7 @@ static bool account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		dma_wmb();
 	}
 	if (s->owner) {
-		s->owner->identity = *foe;
+		s->owner->identity = prefill ? *entry : *foe;
 		if (!s->owner->prefill)
 			__set_bit(slot, p->poll_active);
 	}
@@ -664,6 +716,7 @@ static bool account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase,
 		spin_unlock_bh(&p->lock);
 		return true;
 	}
+	drain_final_locked(h, ppe, slot);
 	retire_locked(p, &p->slots[slot]);
 	p->slots[slot].generation++;
 	p->unknown_loss++;
@@ -736,6 +789,7 @@ void hnat_account_pause(struct mtk_hnat *h, u32 ppe)
 		spin_lock_bh(&p->lock);
 		if (p->slots[i].owner)
 			p->unknown_loss++;
+		drain_final_locked(h, ppe, i);
 		retire_locked(p, &p->slots[i]);
 		p->slots[i].generation++;
 		spin_unlock_bh(&p->lock);
@@ -786,18 +840,22 @@ static void account_gc(struct work_struct *work)
 						struct hnat_account_ctx, gc);
 	struct mtk_hnat *h = ctx->h;
 	u32 ppe, n;
+	u64 started = ktime_get_ns();
 	if (READ_ONCE(ctx->stopping))
 		return;
-	/* Budget of 64 lifecycle checks per PPE per second; never MMIO/MIB. */
+	/* At most 64 lifecycle checks/PPE; only dying owned slots get a final MIB read. */
 	for (ppe = 0; ppe < min_t(u32, h->ppe_num,
 		min_t(u32, h->account->ppe_num, min_t(u32, MAX_PPE_NUM, CFG_PPE_NUM))); ppe++) {
 		struct hnat_account_ppe *p = &ctx->ppe[ppe];
 		for (n = 0; n < min_t(u32, 64, min(h->foe_etry_num, ctx->slot_count)); n++) {
 			struct hnat_owner *o;
 			u32 slot;
+			bool clear_cache = false;
 
 			/* Defer GC on contention; leave its cursor for the next pass. */
-			if (READ_ONCE(ctx->stopping) || !spin_trylock_bh(&p->lock))
+			if (READ_ONCE(ctx->stopping) ||
+			    ktime_get_ns() - started >= HNAT_ACCOUNT_POLL_TIME_NS ||
+			    !spin_trylock_bh(&p->lock))
 				break;
 			if (p->paused) {
 				spin_unlock_bh(&p->lock);
@@ -805,11 +863,15 @@ static void account_gc(struct work_struct *work)
 			}
 			slot = p->cursor++ % min(h->foe_etry_num, ctx->slot_count);
 			o = p->slots[slot].owner;
-			if (o && !owner_live(h, ppe, slot)) {
+			if (o && nf_ct_is_dying(o->ct)) {
+				clear_cache = retire_dying_locked(h, ppe, slot);
+			} else if (o && !owner_matches(h, ppe, slot)) {
 				p->unknown_loss++;
 				retire_locked(p, &p->slots[slot]);
 			}
 			spin_unlock_bh(&p->lock);
+			if (clear_cache)
+				hnat_cache_ebl(1);
 		}
 	}
 	if (!READ_ONCE(ctx->stopping))
@@ -843,6 +905,7 @@ static void account_poll(struct work_struct *work)
 		u32 ppe = ctx->poll_ppe % ppe_count;
 		u32 slot;
 		int err = 0;
+		bool clear_cache = false;
 
 		/* A service-time budget, not a guarantee about scheduler/lock waits.
 		 * One already-started SER transaction can exceed the deadline.
@@ -898,7 +961,9 @@ static void account_poll(struct work_struct *work)
 		n++;
 		p->poll_scanned++;
 		if (!p->paused && s->owner && !s->owner->prefill) {
-			if (!owner_live(h, ppe, slot)) {
+			if (nf_ct_is_dying(s->owner->ct)) {
+				clear_cache = retire_dying_locked(h, ppe, slot);
+			} else if (!owner_matches(h, ppe, slot)) {
 				p->mismatch++;
 				p->unknown_loss++;
 				retire_locked(p, s);
@@ -912,6 +977,8 @@ static void account_poll(struct work_struct *work)
 			}
 		}
 		spin_unlock_bh(&p->lock);
+		if (clear_cache)
+			hnat_cache_ebl(1);
 		/* Abort on busy, quarantine or timeout instead of burning the budget. */
 		if (err)
 			break;
@@ -1081,6 +1148,8 @@ int hnat_account_show(struct seq_file *m, void *unused)
 			   ppe, snap.poll_scanned, snap.poll_reads, snap.poll_errors,
 			   (unsigned long long)atomic64_read(&h->account->poll_lock_skips[ppe]),
 			   snap.ct_written_bytes, snap.ct_written_packets);
+		seq_printf(m, "ppe=%u final_reads=%llu final_errors=%llu\n",
+			   ppe, snap.final_reads, snap.final_errors);
 		seq_printf(m, "ppe=%u poll_active_owned_slots=%u poll_selection=owned_bitmap\n",
 			   ppe, active);
 	}

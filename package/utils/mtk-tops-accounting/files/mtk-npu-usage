@@ -19,7 +19,7 @@ sample=$(timeout 2 head -c 513 /proc/npu/cpu-utilization 2>/dev/null; rc=$?; pri
 sample=${sample%.}
 [ "${#sample}" -le 512 ] || unavailable oversized
 
-percent_milli=$(printf '%s' "$sample" | awk '
+result=$(printf '%s' "$sample" | awk '
 	NR == 1 { if ($0 != "CPU Utilization:") bad = 1; next }
 	{
 		if (NF != 2 || $1 !~ /^Core[0123M]$/ || seen[$1]++ ||
@@ -28,13 +28,14 @@ percent_milli=$(printf '%s' "$sample" | awk '
 		if ((length(value) > 1 && substr(value, 1, 1) == "0") || value + 0 > 100) {
 			bad = 1; next
 		}
-		sum += value; count++
+		core[$1] = value * 1000; sum += value; count++
 	}
 	END {
 		if (bad || NR != 6 || count != 5 || !seen["Core0"] ||
 		    !seen["Core1"] || !seen["Core2"] || !seen["Core3"] || !seen["CoreM"])
 			exit 1
-		printf "%.0f", sum * 1000 / 5
+		printf "{\"schema\":1,\"available\":true,\"unit\":\"mean_core_busy_percent\",\"percent_milli\":%.0f,\"core_count\":5,\"coverage\":\"complete\",\"cores\":{", sum * 1000 / 5
+		printf "\"Core0\":%d,\"Core1\":%d,\"Core2\":%d,\"Core3\":%d,\"CoreM\":%d}}", core["Core0"], core["Core1"], core["Core2"], core["Core3"], core["CoreM"]
 	}') || unavailable invalid
 
-printf '{"schema":1,"available":true,"unit":"mean_core_busy_percent","percent_milli":%s,"core_count":5,"coverage":"complete"}\n' "$percent_milli"
+printf '%s\n' "$result"
