@@ -12476,6 +12476,14 @@ INT Show_MacTable_Proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg)
 	CHAR *pch = NULL;
 	UINT32 check_aid = 0;
 	UINT32 check_bssidx = 0;
+	static BOOLEAN mac_table_dumped = FALSE;
+	BOOLEAN one_shot;
+
+	one_shot = (arg == NULL || strlen(arg) == 0);
+	if (one_shot && mac_table_dumped)
+		return TRUE;
+	if (one_shot)
+		mac_table_dumped = TRUE;
 
 	MTWF_PRINT("%s(): arg=%s\n", __func__, (arg == NULL ? "" : arg));
 
