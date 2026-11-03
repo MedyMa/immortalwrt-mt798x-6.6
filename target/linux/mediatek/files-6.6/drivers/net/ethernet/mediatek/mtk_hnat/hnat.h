@@ -1422,6 +1422,7 @@ struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
 
 /* Experimental accounting declarations require the structs above. */
 #include "hnat_account.h"
+#include "hnat_diag.h"
 
 static inline u16 foe_timestamp(struct mtk_hnat *h)
 {

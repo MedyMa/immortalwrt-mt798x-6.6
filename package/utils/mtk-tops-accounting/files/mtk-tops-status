@@ -115,7 +115,7 @@ fi
 account_coverage=$READ_COVERAGE
 
 tunnel_text=
-if bounded_read /proc/npu/tunnels 8192; then
+if bounded_read /proc/npu/tunnels 16384; then
 	tunnel_text=$READ_VALUE
 fi
 tunnel_coverage=$READ_COVERAGE
@@ -190,8 +190,34 @@ if [ -r /proc/device-tree/model ] && command -v timeout >/dev/null 2>&1; then
 	platform=$(timeout 2 head -c 257 /proc/device-tree/model 2>/dev/null | tr -d '\000')
 	[ "${#platform}" -le 256 ] || platform=
 fi
+
+# Both endpoints snapshot software state. Neither performs a hardware MIB
+# drain, resets counters, or sends an additional firmware command.
+optional_json() {
+	local expected="$3" source schema schema_type encoded
+	OPTIONAL_JSON='{"schema":1,"available":false,"read_coverage":"missing"}'
+	if bounded_read "$1" "$2"; then
+		if jshn -r "$READ_VALUE" >/dev/null 2>&1 && json_load "$READ_VALUE" 2>/dev/null; then
+			json_get_var schema schema
+			json_get_type schema_type schema
+			json_get_var source source
+			if [ "$schema:$schema_type:$source" = "1:int:$expected" ]; then
+				encoded=$(json_dump)
+				OPTIONAL_JSON="${encoded%?},\"available\":true,\"read_coverage\":\"complete\"}"
+				return
+			fi
+		fi
+		READ_COVERAGE=invalid_schema
+	fi
+	OPTIONAL_JSON="{\"schema\":1,\"available\":false,\"read_coverage\":\"$READ_COVERAGE\"}"
+}
+optional_json /sys/kernel/debug/hnat/flow_diagnostics 65536 hnat_owner_ledger
+flow_diagnostics=$OPTIONAL_JSON
+optional_json /proc/npu/communication 4096 host_mailbox_transport
+firmware_communication=$OPTIONAL_JSON
+
 json_init
-json_add_int schema 3
+json_add_int schema 4
 json_add_string platform "$platform"
 json_add_object npu
 json_add_boolean status_node_present "$npu_present"
@@ -227,8 +253,23 @@ invalid_count=0
 seen_indices=' '
 health_index=
 crypto_index=
+classifier_index=
 while read -r ti tg tif tt tp ts tsp td tdp te tde tsy extra; do
 	case "$ti:$tg" in
+
+		'#:cls')
+			[ -z "$classifier_index" ] || invalid_count=$((invalid_count + 1))
+			classifier_index=
+			if [ -z "$ts$tsp$td$tdp$te$tde$tsy$extra" ] && valid_uint "$tif" 31 &&
+			   valid_generation "$tt" && valid_uint "$tp" 65535; then
+				classifier_index=$tif
+				classifier_generation=$tt
+				classifier_entry=$tp
+			else
+				invalid_count=$((invalid_count + 1))
+			fi
+			continue
+			;;
 		'#:crypto')
 			[ -z "$crypto_index" ] || invalid_count=$((invalid_count + 1))
 			crypto_index=
@@ -283,6 +324,7 @@ while read -r ti tg tif tt tp ts tsp td tdp te tde tsy extra; do
 		invalid_count=$((invalid_count + 1))
 		health_index=
 		crypto_index=
+		classifier_index=
 		continue
 	fi
 	seen_indices="$seen_indices$ti "
@@ -301,6 +343,14 @@ while read -r ti tg tif tt tp ts tsp td tdp te tde tsy extra; do
 	json_add_boolean encapsulation "$te"
 	json_add_boolean decapsulation "$tde"
 	json_add_boolean synchronized "$tsy"
+	if [ -n "$classifier_index" ]; then
+		if [ "$classifier_index:$classifier_generation" = "$ti:$tg" ]; then
+			[ "$classifier_entry" = 65535 ] || json_add_int classifier_index "$classifier_entry"
+		else
+			invalid_count=$((invalid_count + 1))
+		fi
+		classifier_index=
+	fi
 	if [ -n "$crypto_index" ]; then
 		if [ "$crypto_index:$crypto_generation" = "$ti:$tg" ]; then
 			json_add_int cdrt_index "$crypto_context"
@@ -328,6 +378,7 @@ while read -r ti tg tif tt tp ts tsp td tdp te tde tsy extra; do
 done <<EOF
 $tunnel_text
 EOF
+[ -z "$classifier_index" ] || invalid_count=$((invalid_count + 1))
 [ -z "$health_index" ] || invalid_count=$((invalid_count + 1))
 [ -z "$crypto_index" ] || invalid_count=$((invalid_count + 1))
 json_close_array
@@ -398,4 +449,5 @@ json_add_string tops_counter_unit setup_events
 json_add_boolean add_tops_events_to_byte_totals 0
 json_add_boolean lossless_hardware_tail_proven 0
 json_close_object
-json_dump
+base_json=$(json_dump)
+printf '%s,"flow_diagnostics":%s,"firmware_communication":%s}\n' "${base_json%?}" "$flow_diagnostics" "$firmware_communication"

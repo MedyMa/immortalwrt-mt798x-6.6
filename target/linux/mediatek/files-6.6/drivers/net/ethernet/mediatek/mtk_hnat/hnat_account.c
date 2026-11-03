@@ -59,6 +59,7 @@ struct hnat_owner {
 	struct nf_conntrack_zone zone;
 	struct rcu_head rcu;
 	u64 generation;
+	u64 diag_bytes, diag_packets, diag_sampled_ms;
 	struct foe_entry identity;
 	unsigned int dir;
 	unsigned long seen;
@@ -200,6 +201,42 @@ static bool owner_live(struct mtk_hnat *h, u32 ppe, u32 slot)
 	       !nf_ct_is_dying(h->account->ppe[ppe].slots[slot].owner->ct);
 }
 
+
+/* Passive owner-validated snapshot. Never starts a MIB read-clear transaction. */
+bool hnat_account_diag_sample(struct mtk_hnat *h, const struct hnat_diag_key *key,
+			      u32 ppe, u32 slot, u64 generation,
+			      struct hnat_diag_sample *sample)
+{
+	struct hnat_account_ppe *p;
+	struct hnat_owner *owner;
+	struct foe_entry *entry;
+	bool valid = false;
+
+	if (!key->tracked || !generation || !account_valid(h, ppe, slot))
+		return false;
+	p = &h->account->ppe[ppe];
+	spin_lock_bh(&p->lock);
+	owner = p->slots[slot].owner;
+	if (p->paused || !owner || owner->prefill || owner->generation != generation ||
+	    owner->dir != key->direction || nf_ct_get_id(owner->ct) != key->ct_id ||
+	    owner->net->ns.inum != key->netns || owner->zone.id != key->zone ||
+	    owner->zone.dir != key->zone_dir || owner->zone.flags != key->zone_flags ||
+	    !nf_ct_tuple_equal(&owner->ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple, &key->tuple) ||
+	    !owner_live(h, ppe, slot))
+		goto out;
+	entry = &h->foe_table_cpu[ppe][slot];
+	sample->valid = true;
+	sample->available = owner->diag_sampled_ms != 0;
+	sample->bytes = owner->diag_bytes;
+	sample->packets = owner->diag_packets;
+	sample->sampled_ms = owner->diag_sampled_ms;
+	sample->npu_path = hnat_diag_npu_entry(entry);
+	valid = true;
+out:
+	spin_unlock_bh(&p->lock);
+	return valid;
+}
+
 /* Caller holds per-PPE lock across the complete SER transaction and ledger. */
 static int drain_locked(struct mtk_hnat *h, u32 ppe, u32 slot,
 			struct hnat_accounting *delta)
@@ -254,6 +291,9 @@ static int drain_locked(struct mtk_hnat *h, u32 ppe, u32 slot,
 	hnat_ledger_add(&h->acct[ppe][slot], &s->pending, delta,
 			s->owner && !s->owner->prefill);
 	if (s->owner && !s->owner->prefill) {
+		s->owner->diag_bytes += delta->bytes;
+		s->owner->diag_packets += delta->packets;
+		s->owner->diag_sampled_ms = ktime_to_ms(ktime_get());
 		s->pending_ct.bytes += delta->bytes;
 		s->pending_ct.packets += delta->packets;
 		/* Every read clears the hardware MIB, including keepalive/debug and
@@ -550,6 +590,7 @@ static bool account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 	}
 	if (accepted)
 		*accepted = true;
+	hnat_diag_bind(ct, info, ppe, slot, s->generation, entry, prefill);
 	spin_unlock_bh(&p->lock);
 	return true;
 }
@@ -1086,6 +1127,7 @@ void hnat_account_cleanup(struct mtk_hnat *h)
 {
 	struct hnat_account_ctx *ctx;
 	u32 ppe;
+	hnat_diag_remove();
 	if (!h || !h->account)
 		return;
 	ctx = h->account;

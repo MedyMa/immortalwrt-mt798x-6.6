@@ -109,6 +109,9 @@
 #define MBOX_CLUST0_MBOX_FROM_CM		(0x10)
 #define MBOX_CLUST0_MBOX_FROM_AP		(0x20)
 
+struct seq_file;
+void mtk_npu_mbox_health_show(struct seq_file *s);
+
 struct mailbox_msg;
 struct mailbox_dev;
 enum mbox_msg_cnt;

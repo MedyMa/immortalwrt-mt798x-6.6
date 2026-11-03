@@ -15,6 +15,8 @@
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/version.h>
+#include <linux/seq_file.h>
+#include <linux/math64.h>
 
 #include "npu/mcu.h"
 #include "npu/mbox.h"
@@ -255,6 +257,77 @@ out:
 	mbox_write(msg_reg + 0x10, 0);
 }
 
+
+/* Passive transport history. Command clearing is an ACK, never a heartbeat. */
+struct npu_mail_health {
+	u64 attempts, submitted, acknowledged, timeouts, errors;
+	u64 last_send_ms, last_ack_ms, last_timeout_ms, last_finish_ns;
+	u32 last_command, last_argument;
+	int last_error;
+};
+static DEFINE_SPINLOCK(mail_health_lock);
+static struct npu_mail_health mail_health[CORE_NPU_NUM];
+
+static void mbox_health_record(struct mailbox_dev *dev, u32 argument,
+			       u64 started_ms, u64 finished_ns, int error, bool wait)
+{
+	struct npu_mail_health *h;
+	unsigned long flags;
+	u64 now = div_u64(finished_ns, NSEC_PER_MSEC);
+
+	if (!dev || (unsigned int)dev->core >= CORE_NPU_NUM)
+		return;
+	spin_lock_irqsave(&mail_health_lock, flags);
+	h = &mail_health[dev->core];
+	h->attempts++;
+	if (!error) {
+		h->submitted++;
+		if (wait) {
+			h->acknowledged++;
+			h->last_ack_ms = max(h->last_ack_ms, now);
+		}
+	} else {
+		h->errors++;
+		if (error == -ETIMEDOUT) {
+			h->timeouts++;
+			h->last_timeout_ms = max(h->last_timeout_ms, now);
+		}
+	}
+	if (finished_ns >= h->last_finish_ns) {
+		h->last_finish_ns = finished_ns;
+		h->last_send_ms = started_ms;
+		h->last_command = dev->cmd_id;
+		h->last_argument = argument;
+		h->last_error = error;
+	}
+	spin_unlock_irqrestore(&mail_health_lock, flags);
+}
+
+void mtk_npu_mbox_health_show(struct seq_file *s)
+{
+	struct npu_mail_health h;
+	unsigned long flags;
+	u32 core;
+
+	seq_printf(s, "{\"schema\":1,\"source\":\"host_mailbox_transport\","
+		   "\"heartbeat_available\":false,\"sampled_ms\":\"%llu\",\"cores\":[",
+		   (u64)ktime_to_ms(ktime_get()));
+	for (core = 0; core < CORE_NPU_NUM; core++) {
+		spin_lock_irqsave(&mail_health_lock, flags);
+		h = mail_health[core];
+		spin_unlock_irqrestore(&mail_health_lock, flags);
+		seq_printf(s, "%s{\"core\":%u,\"attempts\":\"%llu\",\"submitted\":\"%llu\","
+			   "\"acknowledged\":\"%llu\",\"timeouts\":\"%llu\",\"errors\":\"%llu\","
+			   "\"last_send_ms\":\"%llu\",\"last_ack_ms\":\"%llu\","
+			   "\"last_timeout_ms\":\"%llu\",\"last_command\":%u,"
+			   "\"last_argument\":%u,\"last_error\":%d}",
+			   core ? "," : "", core, h.attempts, h.submitted, h.acknowledged,
+			   h.timeouts, h.errors, h.last_send_ms, h.last_ack_ms,
+			   h.last_timeout_ms, h.last_command, h.last_argument, h.last_error);
+	}
+	seq_puts(s, "]}\n");
+}
+
 static inline bool mbox_send_msg_chk_timeout(ktime_t start)
 {
 	return ktime_to_us(ktime_sub(ktime_get(), start)) > MBOX_SEND_TIMEOUT;
@@ -313,17 +386,26 @@ int mbox_send_msg_no_wait(struct mailbox_dev *mdev, struct mailbox_msg *msg)
 	struct mailbox_reg mbox_reg = {0};
 	unsigned long flag = 0;
 	int ret = 0;
+	u64 started_ms = ktime_to_ms(ktime_get());
+	u64 finished_ns = 0;
+	u32 argument = msg ? msg->msg1 : 0;
 
 	ret = mbox_get_send_reg(mdev, &mbox_reg);
 	if (ret)
-		return ret;
+		goto record;
 
 	spin_lock_irqsave(&mbox.core[MBOX_SEND][mdev->core].lock, flag);
 
 	/* send cmd + msg */
 	ret = __mbox_send_msg_no_wait_irq(mdev, msg, &mbox_reg);
 
+	finished_ns = ktime_get_ns();
 	spin_unlock_irqrestore(&mbox.core[MBOX_SEND][mdev->core].lock, flag);
+
+record:
+	if (!finished_ns)
+		finished_ns = ktime_get_ns();
+	mbox_health_record(mdev, argument, started_ms, finished_ns, ret, false);
 
 	return ret;
 }
@@ -336,10 +418,13 @@ int mbox_send_msg(struct mailbox_dev *mdev, struct mailbox_msg *msg, void *priv,
 	unsigned long flag = 0;
 	ktime_t start;
 	int ret = 0;
+	u64 started_ms = ktime_to_ms(ktime_get());
+	u64 finished_ns = 0;
+	u32 argument = msg ? msg->msg1 : 0;
 
 	ret = mbox_get_send_reg(mdev, &mbox_reg);
 	if (ret)
-		return ret;
+		goto record;
 
 	spin_lock_irqsave(&mbox.core[MBOX_SEND][mdev->core].lock, flag);
 
@@ -363,7 +448,13 @@ int mbox_send_msg(struct mailbox_dev *mdev, struct mailbox_msg *msg, void *priv,
 	mbox_post_send(mbox_reg.msg_reg, msg, priv, ret_handler);
 
 out:
+	finished_ns = ktime_get_ns();
 	spin_unlock_irqrestore(&mbox.core[MBOX_SEND][mdev->core].lock, flag);
+
+record:
+	if (!finished_ns)
+		finished_ns = ktime_get_ns();
+	mbox_health_record(mdev, argument, started_ms, finished_ns, ret, true);
 
 	return ret;
 }
