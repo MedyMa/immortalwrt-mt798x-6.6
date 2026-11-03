@@ -1,0 +1,95 @@
+Subject: [PATCH] net: ethernet: mediatek: keep PPE running independently of MAC state
+
+Adapt MediaTek commit 4da8f23cdf716cd3339c83cc3b5143335163ca47.
+Keep PPE running for WiFi-only WED forwarding, restart it across FE
+reset, and stop it on probe unwind and remove. Start only after PPE
+and NAPI allocation succeeds, before exposing the first netdev.
+Retain the built-in and modular proprietary HNAT ownership guards.
+
+Upstream: https://github.com/mediatek/mtk-openwrt-feeds/commit/4da8f23cdf716cd3339c83cc3b5143335163ca47
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -4395,11 +4395,6 @@
+ 			return err;
+ 		}
+ 
+-#if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
+-		for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
+-			mtk_ppe_start(eth->ppe[i]);
+-#endif
+-
+ 		err = 0;
+ 		if (err)
+ 			netdev_err(dev, "%s: could not start ppe roaming work: %d\n",
+@@ -4568,11 +4563,6 @@
+ 	mtk_dma_free(eth);
+ 
+ 	// mtk_ppe_roaming_stop(eth);
+-
+-#if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
+-	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
+-		mtk_ppe_stop(eth->ppe[i]);
+-#endif
+ 
+ 	return 0;
+ }
+@@ -5685,12 +5675,22 @@
+ 		__set_bit(i, &restart);
+ 	}
+ 
++#if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
++		mtk_ppe_stop(eth->ppe[i]);
++#endif
++
+ 	usleep_range(15000, 16000);
+ 
+ 	if (eth->dev->pins)
+ 		pinctrl_select_state(eth->dev->pins->p,
+ 				     eth->dev->pins->default_state);
+ 	mtk_hw_init(eth, true);
++
++#if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
++		mtk_ppe_start(eth->ppe[i]);
++#endif
+ 
+ 	/* restart DMA and enable IRQs */
+ 	for (i = 0; i < MTK_MAX_DEVS; i++) {
+@@ -7150,6 +7150,12 @@
+ 
+ 	eth->rx_buf_len = MTK_MAX_RX_LENGTH;
+ 
++#if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
++	/* Keep PPE feedback available to WED with every MAC down. */
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
++		mtk_ppe_start(eth->ppe[i]);
++#endif
++
+ 	for (i = 0; i < MTK_MAX_DEVS; i++) {
+ 		if (!eth->netdev[i])
+ 			continue;
+@@ -7183,6 +7189,11 @@
+ 
+ err_unreg_netdev:
+ 	mtk_unreg_dev(eth);
++#if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
++	cancel_work_sync(&eth->pending_work);
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
++		mtk_ppe_stop(eth->ppe[i]);
++#endif
+ 	mtk_napi_del(eth);
+ 	free_netdev(eth->dummy_dev);
+ err_deinit_ppe:
+@@ -7225,6 +7236,10 @@
+ 	 * NAPI, phylink and PCS dependencies are still alive.
+ 	 */
+ 	mtk_unreg_dev(eth);
++#if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
++		mtk_ppe_stop(eth->ppe[i]);
++#endif
+ 	mtk_release_all_muxes(eth);
+ 	mtk_napi_del(eth);
+ 	mtk_wed_exit();

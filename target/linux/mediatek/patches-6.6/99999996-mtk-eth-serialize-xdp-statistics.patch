@@ -1,0 +1,36 @@
+Subject: [PATCH] net: ethernet: mediatek: serialize RSS XDP statistics writers
+
+Backport MediaTek commit 19c458b512b5afe0e355f9009f9228c408973dc6.
+Multiple RSS NAPI instances can update one MAC statistics block at
+the same time. Serialize both XDP writers with the existing stats_lock,
+as required by u64_stats_update_begin/end.
+
+Upstream: https://github.com/mediatek/mtk-openwrt-feeds/commit/19c458b512b5afe0e355f9009f9228c408973dc6
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -2444,10 +2444,12 @@
+ 		nxmit++;
+ 	}
+ 
++	spin_lock(&hw_stats->stats_lock);
+ 	u64_stats_update_begin(&hw_stats->syncp);
+ 	hw_stats->xdp_stats.tx_xdp_xmit += nxmit;
+ 	hw_stats->xdp_stats.tx_xdp_xmit_errors += num_frame - nxmit;
+ 	u64_stats_update_end(&hw_stats->syncp);
++	spin_unlock(&hw_stats->stats_lock);
+ 
+ 	return nxmit;
+ }
+@@ -2506,9 +2508,11 @@
+ 				virt_to_head_page(xdp->data), true);
+ 
+ update_stats:
++	spin_lock(&hw_stats->stats_lock);
+ 	u64_stats_update_begin(&hw_stats->syncp);
+ 	*count = *count + 1;
+ 	u64_stats_update_end(&hw_stats->syncp);
++	spin_unlock(&hw_stats->stats_lock);
+ out:
+ 	rcu_read_unlock();
+ 
