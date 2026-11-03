@@ -38,6 +38,12 @@ const struct of_device_id warp_of_ids[][2] = {
 	},
 };
 
+unsigned int warp_platform_wed_count(void)
+{
+	return ARRAY_SIZE(warp_of_ids);
+}
+
+
 #ifdef CONFIG_WARP_DBG_SUPPORT
 static void wifi_dump_skb(
 	u8 idx,

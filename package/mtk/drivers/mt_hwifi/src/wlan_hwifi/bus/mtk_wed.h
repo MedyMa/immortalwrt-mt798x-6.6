@@ -88,6 +88,9 @@ struct wed_trans {
 	const struct mtk_bus_io_ops *io_ops;
 	const struct mtk_bus_dma_ops *dma_ops;
 	struct wifi_hw *wifi_hw;
+	u32 warp_caps;
+	int irq_error;
+	bool irq_requested;
 };
 
 struct wed_driver {

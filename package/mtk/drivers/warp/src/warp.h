@@ -76,6 +76,7 @@ struct warp_entry {
 	void *proc_pao;
 	void *proc_rtqm;
 	void *proc_rro;
+	bool initialized;
 };
 
 struct warp_ctrl {

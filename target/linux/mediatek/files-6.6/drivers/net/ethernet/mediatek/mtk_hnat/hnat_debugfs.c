@@ -3270,8 +3270,9 @@ err0:
 
 void hnat_deinit_debugfs(struct mtk_hnat *h)
 {
-	hnat_diag_remove();
 	int i;
+
+	hnat_diag_remove();
 
 	debugfs_remove_recursive(h->root);
 	h->root = NULL;

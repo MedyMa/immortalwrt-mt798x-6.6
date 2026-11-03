@@ -48,6 +48,8 @@ extern void wdma_entry_proc_exit(struct warp_entry *warp,
 
 extern int rxbm_proc_init(struct warp_entry *warp, struct wed_entry *wed);
 extern void rxbm_proc_exit(struct warp_entry *warp, struct wed_entry *wed);
+extern int wed_ser_init(struct wed_entry *wed);
+extern void wed_ser_exit(struct wed_entry *wed);
 extern void wo_proc_exit(struct warp_entry *warp);
 extern void wo_exep_proc_exit(struct warp_entry *warp);
 
@@ -200,7 +202,8 @@ warp_entry_assign_by_pdev(void *pdev)
 	for (i = 0; i < warp_ctrl->warp_num; i++) {
 		entry = &warp_ctrl->entry[i];
 
-		if (entry->pdev == NULL && entry->pdriver.probe != NULL) {
+		if (entry->pdev == NULL &&
+		    ((struct platform_device *)pdev)->dev.driver == &entry->pdriver.driver) {
 			entry->pdev = pdev;
 			warp_dbg(WARP_DBG_OFF, "%s():prob success!return entry[%d]\n", __func__, i);
 			return &warp_ctrl->entry[i];
@@ -408,6 +411,7 @@ warp_probe(struct platform_device *pdev)
 	struct wifi_entry *wifi;
 	struct wifi_hw *hw;
 	struct warp_bus *bus = warp_bus_get();
+	int ret;
 
 	warp = warp_entry_assign_by_pdev(pdev);
 
@@ -417,6 +421,7 @@ warp_probe(struct platform_device *pdev)
 	}
 
 	memset(&warp->wdma.res_ctrl, 0, sizeof(warp->wdma.res_ctrl));
+	warp->initialized = false;
 	/* register warp msg */
 #ifdef WED_RX_HW_RRO_2_0
 	warp_msg_init(warp->idx);
@@ -426,8 +431,9 @@ warp_probe(struct platform_device *pdev)
 	wifi = &warp->wifi;
 	hw = &wifi->hw;
 
-	if (warp_set_dma_mask(pdev, hw))
-		return -1;
+	ret = warp_set_dma_mask(pdev, hw);
+	if (ret)
+		goto err_msg;
 
 	/*build sw base cr mirror mapping */
 	warp_mtable_build_hw(warp);
@@ -435,7 +441,9 @@ warp_probe(struct platform_device *pdev)
 	wed = &warp->wed;
 	wed->warp = warp;
 	wed->sw_conf = &warp->sw_conf;
-	wed_init(pdev, warp->idx, wed);
+	ret = wed_init(pdev, warp->idx, wed);
+	if (ret)
+		goto err_msg;
 	wed_entry_proc_init(warp, wed);
 #ifdef WED_RX_D_SUPPORT
 	rxbm_proc_init(warp, wed);
@@ -444,7 +452,9 @@ warp_probe(struct platform_device *pdev)
 	wdma = &warp->wdma;
 	wdma->warp = warp;
 	wdma->sw_conf = &warp->sw_conf;
-	wdma_init(pdev, warp->idx, wdma, wed->ver);
+	ret = wdma_init(pdev, warp->idx, wdma, wed->ver);
+	if (ret)
+		goto err_wed;
 	wdma_entry_proc_init(warp, wdma);
 #ifdef WED_INTER_AGENT_SUPPORT
 	/*request irq*/
@@ -464,7 +474,8 @@ warp_probe(struct platform_device *pdev)
 #endif
 	/*wo interface initial*/
 #ifdef WED_RX_HW_RRO_2_0
-	if (woif_init(warp, bus) < 0) {
+	ret = woif_init(warp, bus);
+	if (ret < 0) {
 		warp_dbg(WARP_DBG_INF, "%s(): WO FM DL failed!\n", __func__);
 		warp_fwdl_get_wo_heartbeat(&warp->woif.fwdl_ctrl, &heart_beat, warp->idx);
 		warp_dbg(WARP_DBG_ERR, "%s()wo heartbeat: 0x%x!\n", __func__, heart_beat);
@@ -474,13 +485,48 @@ warp_probe(struct platform_device *pdev)
 			warp_wo_pc_lr_cr_dump(warp->idx);
 		}
 		warp_dbg(WARP_DBG_ERR, "%s()======WO PC LR dump======\n", __func__);
+		woif_exit(&warp->woif);
+		goto err_wifi;
 	}
 #endif
+	/* The monitor may access WED, WDMA and Wi-Fi: publish it last. */
+	ret = wed_ser_init(wed);
+	if (ret)
+		goto err_wo;
+	warp->initialized = true;
 	if (wifi->ops->set_attach)
 		wifi->ops->set_attach(wifi->hw.priv, true);
 
 	warp_dbg(WARP_DBG_INF, "%s(): platform device probe is done\n", __func__);
 	return 0;
+err_wo:
+#ifdef WED_RX_HW_RRO_2_0
+	wo_proc_exit(warp);
+	wo_exep_proc_exit(warp);
+	woif_exit(&warp->woif);
+err_wifi:
+#endif
+#ifdef WED_INTER_AGENT_SUPPORT
+	wifi_chip_set_irq(wifi, WIFI_FREE_IRQ, wed->irq);
+	if (hw->msi_enable)
+		warp_bus_msi_set(warp, bus, 0);
+	warp_bus_reset_hw(wed, bus, warp->idx);
+	wifi_chip_remove(wifi);
+#endif
+	wdma_entry_proc_exit(warp, wdma);
+	wdma_exit(pdev, wdma);
+err_wed:
+#ifdef WED_RX_D_SUPPORT
+	rxbm_proc_exit(warp, wed);
+#endif
+	wed_entry_proc_exit(warp, wed);
+	wed_exit(pdev, wed);
+err_msg:
+#ifdef WED_RX_HW_RRO_2_0
+	warp_msg_deinit(warp->idx);
+#endif
+	warp_entry_release_pdev(warp);
+	return ret;
 }
 
 
@@ -511,6 +557,9 @@ warp_remove(struct platform_device *pdev)
 	wifi = &warp->wifi;
 	hw = &wifi->hw;
 
+	/* Stop the monitor before clearing IRQ, Wi-Fi or WDMA resources. */
+	wed_ser_exit(wed);
+	warp->initialized = false;
 	if (wifi->ops->set_attach)
 		wifi->ops->set_attach(wifi->hw.priv, false);
 
@@ -534,14 +583,10 @@ warp_remove(struct platform_device *pdev)
 #ifdef WED_RX_HW_RRO_2_0
 	wo_proc_exit(warp);
 	wo_exep_proc_exit(warp);
+	woif_exit(&warp->woif);
 #endif
 	wed_entry_proc_exit(warp, wed);
 	wed_exit(pdev, wed);
-#ifdef WED_RX_D_SUPPORT
-#ifdef WED_RX_HW_RRO_2_0
-	woif_exit(&warp->woif);
-#endif
-#endif
 
 	/*reomve warp entry from warp_ctrl*/
 	warp_entry_release_pdev(warp);
@@ -802,8 +847,10 @@ warp_ctrl_init(struct warp_ctrl *warp_ctrl)
 	warp_ctrl->warp_num = wed_get_entry_num();
 	warp_ctrl->bus.warp_num = warp_ctrl->warp_num;
 
-	if (warp_ctrl->warp_num > WED_MAX_NUM) {
-		warp_dbg(WARP_DBG_ERR, "%s(): Error: wed_get_entry_num is more than %d\n", __func__, WED_MAX_NUM);
+	if (warp_ctrl->warp_num > WED_MAX_NUM ||
+	    warp_ctrl->warp_num > warp_platform_wed_count()) {
+		warp_dbg(WARP_DBG_ERR, "%s(): Unsupported WED count %u (maximum %u)\n", __func__,
+			 warp_ctrl->warp_num, min_t(u32, WED_MAX_NUM, warp_platform_wed_count()));
 		return -1;
 	}
 
@@ -1089,9 +1136,19 @@ warp_register_client(struct wifi_hw *hw, struct wifi_ops *ops)
 	int ret = 0;
 	struct warp_ctrl *warp_ctrl = warp_ctrl_get();
 	struct platform_driver *pdriver;
-	struct wifi_entry *wifi = to_wifi_entry(hw);
-	struct warp_entry *warp = to_warp_entry(wifi);
-	static char name[MAX_NAME_SIZE] = "";
+	struct wifi_entry *wifi;
+	struct warp_entry *warp;
+	char *name;
+
+	if (!hw || !ops)
+		return -EINVAL;
+	wifi = to_wifi_entry(hw);
+	warp = to_warp_entry(wifi);
+	if (warp->idx >= warp_ctrl->warp_num ||
+	    warp->idx >= warp_platform_wed_count())
+		return -EINVAL;
+	if (warp->pdriver.probe)
+		return -EBUSY;
 
 	if (!warp) {
 		warp_dbg(WARP_DBG_OFF,
@@ -1102,22 +1159,35 @@ warp_register_client(struct wifi_hw *hw, struct wifi_ops *ops)
 	/*assign wifi ops*/
 	wifi->ops = ops;
 	/*assign & create a pdriver*/
-	ret = snprintf(name, sizeof(name), "%s%d", WHNAT_PLATFORM_DEV_NAME,
-			warp_ctrl->warp_driver_idx++);
-
-	if (ret < 0)
-		goto err;
+	name = kasprintf(GFP_KERNEL, "%s%u", WHNAT_PLATFORM_DEV_NAME, warp->idx);
+	if (!name) {
+		warp_entry_release(warp);
+		return -ENOMEM;
+	}
 
 	pdriver = &warp->pdriver;
 	pdriver->probe = warp_probe;
 	pdriver->remove = warp_remove;
 	pdriver->driver.name = name;
 	pdriver->driver.owner = THIS_MODULE;
+	pdriver->driver.probe_type = PROBE_FORCE_SYNCHRONOUS;
 	pdriver->driver.of_match_table = warp_of_ids[warp->idx];
 	warp_entry_proc_init(warp_ctrl, warp);
+	ret = platform_driver_register(pdriver);
+	if (!ret && (!warp->pdev || !warp->initialized ||
+		     warp->pdev->dev.driver != &pdriver->driver)) {
+		/* Driver registration alone does not prove its hardware probe ran. */
+		platform_driver_unregister(pdriver);
+		ret = -ENODEV;
+	}
+	if (ret) {
+		warp_entry_proc_exit(warp_ctrl, warp);
+		kfree(name);
+		warp_entry_release(warp);
+		return ret;
+	}
 	warp_increase_ref();
-
-	return platform_driver_register(pdriver);
+	return 0;
 err:
 	return -1;
 }
@@ -1138,8 +1208,10 @@ warp_client_remove(void *priv_data)
 		return;
 
 	platform_driver_unregister(&warp->pdriver);
+	kfree(warp->pdriver.driver.name);
 	warp_entry_release(warp);
 	warp_entry_proc_exit(warp_ctrl, warp);
+	warp_decrease_ref();
 	warp_dbg(WARP_DBG_OFF, "%s(): warp entry clear done!!\n", __func__);
 }
 EXPORT_SYMBOL(warp_client_remove);
@@ -1249,7 +1321,7 @@ warp_ring_exit(void *priv_data)
 	if (check_and_update_warp(&warp, &wed, &wdma, &wifi, priv_data) == false)
 		goto end;
 
-	warp_decrease_ref();
+
 
 	/*Reset Ring and HW setting*/
 	warp_eint_ctrl_hw(wed, false);

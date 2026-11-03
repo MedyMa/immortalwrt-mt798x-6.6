@@ -22,6 +22,7 @@
 #include <warp_platform/warp_mtk.h>
 #endif
 
+unsigned int warp_platform_wed_count(void);
 extern const struct of_device_id warp_of_ids[][2];
 
 int wifi_tx_tuple_add(struct wifi_entry *wifi, u8 idx, u8 *tx_info, u32 wdma_rx_port);

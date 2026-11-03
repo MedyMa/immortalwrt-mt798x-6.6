@@ -352,6 +352,7 @@ wed_ser_init(struct wed_entry *wed)
 
 	ser_ctrl->ser_task = kthread_create(wed_ser_task, wed, name);
 	if (IS_ERR(ser_ctrl->ser_task)) {
+		ret = PTR_ERR(ser_ctrl->ser_task);
 		ser_ctrl->ser_task = NULL;
 		goto err;
 	}
@@ -383,7 +384,9 @@ wed_ser_exit(struct wed_entry *wed)
 {
 	struct wed_ser_ctrl *ser_ctrl = &wed->ser_ctrl;
 
-	kthread_stop(ser_ctrl->ser_task);
+	if (!IS_ERR_OR_NULL(ser_ctrl->ser_task))
+		kthread_stop(ser_ctrl->ser_task);
+	ser_ctrl->ser_task = NULL;
 	spin_lock_init(&ser_ctrl->ser_lock);
 	memset(&ser_ctrl->state, 0, sizeof(ser_ctrl->state));
 }

@@ -138,7 +138,7 @@ wdma_rx_ring_exit(struct wdma_entry *wdma, struct wdma_rx_ring_ctrl *ring_ctrl)
 {
 	int i;
 
-	for (i = 0; i < ring_ctrl->ring_num; i++)
+	for (i = 0; ring_ctrl->desc && i < ring_ctrl->ring_num; i++)
 		rx_ring_exit(wdma, i, ring_ctrl);
 
 	if (ring_ctrl->ring)
@@ -309,7 +309,7 @@ wdma_tx_ring_exit(struct wdma_entry *wdma, struct wdma_tx_ring_ctrl *ring_ctrl)
 {
 	int i;
 
-	for (i = 0; i < ring_ctrl->ring_num; i++)
+	for (i = 0; ring_ctrl->desc && i < ring_ctrl->ring_num; i++)
 		tx_ring_exit(wdma, i, ring_ctrl);
 
 	if (ring_ctrl->ring)
@@ -362,6 +362,7 @@ wdma_ring_init(struct wdma_entry *wdma)
 	struct wdma_tx_ctrl *tx_ctrl = &res->tx_ctrl;
 	struct wdma_rx_ctrl *rx_ctrl = &res->rx_ctrl;
 	struct sw_conf_t *sw_conf = wdma->sw_conf;
+	int ret = 0;
 
 	/* initial default value */
 	if (wdma->ver >= 2) {
@@ -382,13 +383,21 @@ wdma_ring_init(struct wdma_entry *wdma)
 	__func__, tx_ctrl, rx_ctrl);
 
 #ifdef WED_HW_RX_SUPPORT
-	wdma_tx_ring_init(wdma, &tx_ctrl->tx_ring_ctrl);
+	ret = wdma_tx_ring_init(wdma, &tx_ctrl->tx_ring_ctrl);
+	if (ret)
+		return ret;
 #endif
 
 #ifdef WED_HW_TX_SUPPORT
-	wdma_rx_ring_init(wdma, &rx_ctrl->rx_ring_ctrl);
+	ret = wdma_rx_ring_init(wdma, &rx_ctrl->rx_ring_ctrl);
+	if (ret) {
+#ifdef WED_HW_RX_SUPPORT
+		wdma_tx_ring_exit(wdma, &tx_ctrl->tx_ring_ctrl);
 #endif
-	return 0;
+		return ret;
+	}
+#endif
+	return ret;
 }
 
 void
@@ -421,15 +430,22 @@ wdma_init(struct platform_device *pdev, u8 idx, struct wdma_entry *wdma, u8 ver)
 	int ret = 0;
 
 	node = of_find_compatible_node(NULL, NULL, WDMA_DEV_NODE);
-	ret = of_address_to_resource(node, idx, &res);
-	if (ret)
+	if (!node)
 		return -ENODEV;
+	ret = of_address_to_resource(node, idx, &res);
+	if (ret) {
+		of_node_put(node);
+		return ret;
+	}
 
 	warp_dbg(WARP_DBG_INF, "%s(): get node=%p\n", __func__, &node);
 
 	/* get wdma physical addr and ioremap addr */
 	wdma->base_phy_addr = res.start;
 	wdma->base_addr = (unsigned long)of_iomap(node, idx);
+	of_node_put(node);
+	if (!wdma->base_addr)
+		return -ENOMEM;
 	wdma->pdev = pdev;
 	warp_dbg(WARP_DBG_INF, "%s(): wdma(%d) base_addr=0x%lx, base_phy_addr=0x%lx\n",
 		__func__, idx, wdma->base_addr, wdma->base_phy_addr);
@@ -442,13 +458,18 @@ wdma_init(struct platform_device *pdev, u8 idx, struct wdma_entry *wdma, u8 ver)
 		warp_dbg(WARP_DBG_ERR,
 			"%s(): Unexpected error %d from getting wdma port with idx %u\n",
 			__func__, ret, idx);
-		return ret;
+		goto err_unmap;
 	}
 
 	/* initial wdma ring resource */
-	wdma_ring_init(wdma);
-
+	ret = wdma_ring_init(wdma);
+	if (ret)
+		goto err_unmap;
 	return 0;
+err_unmap:
+	iounmap((void *)wdma->base_addr);
+	wdma->base_addr = 0;
+	return ret;
 }
 
 /*

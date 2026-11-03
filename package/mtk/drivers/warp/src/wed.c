@@ -235,13 +235,16 @@ wed_tx_ring_exit(struct wed_entry *entry, struct wed_tx_ctrl *tx_ctrl)
 	len = sizeof(struct warp_ring) * ring_ctrl->ring_num;
 
 	/*free skb in ring*/
-	for (i = 0; i < ring_ctrl->ring_num; i++)
-		tx_ring_exit(entry, &ring_ctrl->ring[i], &ring_ctrl->desc[i]);
+	if (ring_ctrl->ring && ring_ctrl->desc) {
+		for (i = 0; i < ring_ctrl->ring_num; i++)
+			tx_ring_exit(entry, &ring_ctrl->ring[i], &ring_ctrl->desc[i]);
+	}
 
 	/*free wed tx ring*/
 	warp_os_free_mem(ring_ctrl->ring);
 	/*free desc*/
 	warp_os_free_mem(ring_ctrl->desc);
+	memset(ring_ctrl, 0, sizeof(*ring_ctrl));
 }
 
 /*
@@ -318,6 +321,9 @@ rx_ring_hw_desc_base_spare_exit(struct wed_entry *entry, struct warp_rx_ring *ri
 {
 	struct platform_device *pdev = entry->pdev;
 	u32 size = WED_CR_SIZE * 4;
+
+	if (!ring->hw_desc_base_va)
+		return;
 #ifdef WED_MEM_LEAK_DBG
 	struct _MEM_INFO_LIST_ENTRY *delEntry;
 
@@ -331,6 +337,8 @@ rx_ring_hw_desc_base_spare_exit(struct wed_entry *entry, struct warp_rx_ring *ri
 #endif	/* WED_MEM_LEAK_DBG */
 
 	dma_free_coherent(&pdev->dev, size, ring->hw_desc_base_va, ring->hw_desc_base_pa);
+	ring->hw_desc_base_va = NULL;
+	ring->hw_desc_base_pa = 0;
 }
 
 static int
@@ -546,14 +554,17 @@ wed_rx_ring_exit(struct wed_entry *entry, struct wed_rx_ctrl *rx_ctrl)
 	struct wed_rx_ring_ctrl *ring_ctrl = &rx_ctrl->ring_ctrl;
 	u8 i;
 
-	for (i = 0; i < ring_ctrl->ring_num; i++)
-		rx_ring_exit(entry, &ring_ctrl->ring[i],
-			    ring_ctrl->ring[i].ring_lens, &ring_ctrl->desc[i]);
+	if (ring_ctrl->ring && ring_ctrl->desc) {
+		for (i = 0; i < ring_ctrl->ring_num; i++)
+			rx_ring_exit(entry, &ring_ctrl->ring[i],
+				    ring_ctrl->ring[i].ring_lens, &ring_ctrl->desc[i]);
+	}
 
 	/*free wed rx ring*/
 	warp_os_free_mem(ring_ctrl->ring);
 	/*free desc*/
 	warp_os_free_mem(ring_ctrl->desc);
+	memset(ring_ctrl, 0, sizeof(*ring_ctrl));
 }
 
 static int
@@ -643,18 +654,21 @@ wed_rx_rro_data_ring_exit(struct wed_entry *entry, struct wed_rx_ctrl *rx_ctrl)
 	struct warp_dma_buf *desc;
 	int i;
 
-	for (i = 0; i < ring_ctrl->ring_num; i++) {
-		ring = &ring_ctrl->ring[i];
-		desc = &ring_ctrl->desc[i];
+	if (ring_ctrl->ring && ring_ctrl->desc) {
+		for (i = 0; i < ring_ctrl->ring_num; i++) {
+			ring = &ring_ctrl->ring[i];
+			desc = &ring_ctrl->desc[i];
 
-		if (ring->spare) {
-			warp_dma_buf_free(entry->pdev, desc);
-			rx_ring_hw_desc_base_spare_exit(entry, ring);
+			if (ring->spare) {
+				warp_dma_buf_free(entry->pdev, desc);
+				rx_ring_hw_desc_base_spare_exit(entry, ring);
+			}
 		}
 	}
 
 	warp_os_free_mem(ring_ctrl->ring);
 	warp_os_free_mem(ring_ctrl->desc);
+	memset(ring_ctrl, 0, sizeof(*ring_ctrl));
 }
 
 int
@@ -760,18 +774,21 @@ wed_rx_rro_page_ring_exit(struct wed_entry *entry, struct wed_rx_ctrl *rx_ctrl)
 	struct warp_dma_buf *desc;
 	int i;
 
-	for (i = 0; i < ring_ctrl->ring_num; i++) {
-		ring = &ring_ctrl->ring[i];
-		desc = &ring_ctrl->desc[i];
+	if (ring_ctrl->ring && ring_ctrl->desc) {
+		for (i = 0; i < ring_ctrl->ring_num; i++) {
+			ring = &ring_ctrl->ring[i];
+			desc = &ring_ctrl->desc[i];
 
-		if (ring->spare) {
-			warp_dma_buf_free(entry->pdev, desc);
-			rx_ring_hw_desc_base_spare_exit(entry, ring);
+			if (ring->spare) {
+				warp_dma_buf_free(entry->pdev, desc);
+				rx_ring_hw_desc_base_spare_exit(entry, ring);
+			}
 		}
 	}
 
 	warp_os_free_mem(ring_ctrl->ring);
 	warp_os_free_mem(ring_ctrl->desc);
+	memset(ring_ctrl, 0, sizeof(*ring_ctrl));
 }
 
 int
@@ -871,6 +888,7 @@ wed_rx_rro_ind_cmd_ring_exit(struct wed_entry *entry, struct wed_rx_ctrl *rx_ctr
 	struct wed_rx_ring_ctrl *ring_ctrl = &rx_ctrl->rro_ind_cmd_ring_ctrl;
 
 	warp_os_free_mem(ring_ctrl->ring);
+	memset(ring_ctrl, 0, sizeof(*ring_ctrl));
 }
 
 int
@@ -929,6 +947,7 @@ wed_rx_rro_3_1_ring_exit(struct wed_entry *entry, struct wed_rx_ctrl *rx_ctrl)
 
 	warp_os_free_mem(ring_ctrl->ring);
 	warp_os_free_mem(ring_ctrl->desc);
+	memset(ring_ctrl, 0, sizeof(*ring_ctrl));
 }
 
 int
@@ -1087,29 +1106,74 @@ wed_ring_init(struct wed_entry *entry)
 	bool wifi_cap_rro_3_1 = hw->hw_cap & BIT(WIFI_HW_CAP_RRO_3_1);
 #endif /* WED_RX_HW_RRO_3_0 || WED_RX_HW_RRO_3_1 */
 #endif /* WED_RX_D_SUPPORT */
-	int ret = 0;
+	int ret;
+	u32 initialized = 0;
 
-	wed_tx_ring_init(entry, tx_ctrl);
+	ret = wed_tx_ring_init(entry, tx_ctrl);
+	if (ret)
+		goto err;
+	initialized |= BIT(0);
 #ifdef WED_RX_D_SUPPORT
 #ifdef WED_RX_HW_RRO_2_0
-	wed_rx_ring_init(entry, rx_ctrl);
+	ret = wed_rx_ring_init(entry, rx_ctrl);
+	if (ret)
+		goto err;
+	initialized |= BIT(1);
 #endif
 #if defined(WED_RX_HW_RRO_3_0) || defined(WED_RX_HW_RRO_3_1)
-	if (wifi_cap_rro_3_0 || wifi_cap_rro_3_1)
-		wed_rx_rro_data_ring_init(entry, rx_ctrl);
+	if (wifi_cap_rro_3_0 || wifi_cap_rro_3_1) {
+		ret = wed_rx_rro_data_ring_init(entry, rx_ctrl);
+		if (ret)
+			goto err;
+		initialized |= BIT(2);
+	}
 #endif
 #ifdef WED_RX_HW_RRO_3_0
 	if (wifi_cap_rro_3_0) {
-		wed_rx_rro_page_ring_init(entry, rx_ctrl);
-		wed_rx_rro_ind_cmd_ring_init(entry, rx_ctrl);
+		ret = wed_rx_rro_page_ring_init(entry, rx_ctrl);
+		if (ret)
+			goto err;
+		initialized |= BIT(3);
+		ret = wed_rx_rro_ind_cmd_ring_init(entry, rx_ctrl);
+		if (ret)
+			goto err;
+		initialized |= BIT(4);
 	}
 #endif
 #ifdef WED_RX_HW_RRO_3_1
-	if (wifi_cap_rro_3_1)
-		wed_rx_rro_3_1_ring_init(entry, rx_ctrl);
+	if (wifi_cap_rro_3_1) {
+		ret = wed_rx_rro_3_1_ring_init(entry, rx_ctrl);
+		if (ret)
+			goto err;
+		initialized |= BIT(5);
+	}
 #endif /* WED_RX_HW_RRO_3_1 */
 #endif /* WED_RX_D_SUPPORT */
 
+	return 0;
+err:
+#ifdef WED_RX_D_SUPPORT
+#ifdef WED_RX_HW_RRO_3_1
+	if (initialized & BIT(5))
+		wed_rx_rro_3_1_ring_exit(entry, rx_ctrl);
+#endif
+#ifdef WED_RX_HW_RRO_3_0
+	if (initialized & BIT(4))
+		wed_rx_rro_ind_cmd_ring_exit(entry, rx_ctrl);
+	if (initialized & BIT(3))
+		wed_rx_rro_page_ring_exit(entry, rx_ctrl);
+#endif
+#if defined(WED_RX_HW_RRO_3_0) || defined(WED_RX_HW_RRO_3_1)
+	if (initialized & BIT(2))
+		wed_rx_rro_data_ring_exit(entry, rx_ctrl);
+#endif
+#ifdef WED_RX_HW_RRO_2_0
+	if (initialized & BIT(1))
+		wed_rx_ring_exit(entry, rx_ctrl);
+#endif
+#endif
+	if (initialized & BIT(0))
+		wed_tx_ring_exit(entry, tx_ctrl);
 	return ret;
 }
 
@@ -1232,9 +1296,11 @@ wed_init(struct platform_device *pdev, u8 idx, struct wed_entry *wed)
 	/*assign to pdev*/
 	int ret = -1;
 	struct resource *res;
-	u32 irq;
+	int irq;
 	unsigned long base_addr;
-	struct warp_entry *warp = NULL;
+
+	if (!wed->warp)
+		return -EINVAL;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, TO_RES_IDX(idx));
 	if (!res) {
@@ -1244,8 +1310,12 @@ wed_init(struct platform_device *pdev, u8 idx, struct wed_entry *wed)
 	}
 
 	irq = platform_get_irq(pdev, TO_RES_IDX(idx));
+	if (irq < 0)
+		return irq;
 	base_addr = (unsigned long)devm_ioremap(&pdev->dev, res->start,
 						resource_size(res));
+	if (!base_addr)
+		return -ENOMEM;
 	warp_dbg(WARP_DBG_OFF,
 		 "%s(%d): res_start = %pa[p], size = %x, irq=%d,base_addr=0x%lx\n",
 		 __func__, idx, &res->start, (u32)resource_size(res), irq, base_addr);
@@ -1256,12 +1326,9 @@ wed_init(struct platform_device *pdev, u8 idx, struct wed_entry *wed)
 	/*initial wed hw cap for related decision*/
 	warp_conf_hwcap(wed);
 	/*allocate ring first*/
-	wed_ring_init(wed);
-	/*assign tx ring to ad*/
-	if (wed->warp)
-		warp = (struct warp_entry *)wed->warp;
-	else
-		goto err;
+	ret = wed_ring_init(wed);
+	if (ret)
+		goto err_unmap;
 
 #ifdef WED_RX_D_SUPPORT
 #ifdef WED_RX_HW_RRO_2_0
@@ -1273,10 +1340,10 @@ wed_init(struct platform_device *pdev, u8 idx, struct wed_entry *wed)
 	if(IS_WED_HW_CAP(wed, WED_HW_CAP_DYN_TXBM))
 		regist_dl_dybm_task(wed);
 #endif	/* WED_DYNAMIC_TXBM_SUPPORT */
-	wed_ser_init(wed);
-	ret = 0;
-
-err:
+	return 0;
+err_unmap:
+	devm_iounmap(&pdev->dev, (void *)wed->base_addr);
+	wed->base_addr = 0;
 	return ret;
 }
 

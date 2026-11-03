@@ -7,6 +7,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mt_hwifi
+PKG_RELEASE:=2
 WIFI_DRIVER_NAME:=mt_hwifi
 P4REV:=
 PKG_VERSION:=TEST
