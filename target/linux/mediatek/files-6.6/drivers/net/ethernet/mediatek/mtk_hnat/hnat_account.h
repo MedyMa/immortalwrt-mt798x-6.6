@@ -34,6 +34,7 @@ bool hnat_account_clear(struct mtk_hnat *h, u32 ppe, u32 slot, bool erase);
 /* True includes a stale token already handled without descriptor mutation. */
 bool hnat_account_clear_if_generation(struct mtk_hnat *h, u32 ppe, u32 slot,
 				      bool erase, u64 generation);
+bool hnat_account_clear_all_bindings(struct mtk_hnat *h, u32 ppe);
 bool hnat_account_clear_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 				 struct foe_entry *entry, u64 *generation);
 bool hnat_account_clear_entry(struct mtk_hnat *h, struct foe_entry *entry);

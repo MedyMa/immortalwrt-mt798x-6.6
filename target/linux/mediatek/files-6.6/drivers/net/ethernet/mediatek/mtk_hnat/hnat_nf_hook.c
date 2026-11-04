@@ -364,6 +364,9 @@ static void foe_clear_all_bind_entries_body(void)
 	for (i = 0; i < CFG_PPE_NUM; i++) {
 		cr_set_field(hnat_priv->ppe_base[i] + PPE_TB_CFG,
 			     SMA, SMA_ONLY_FWD_CPU);
+		if (hnat_account_enabled(hnat_priv) &&
+		    hnat_account_clear_all_bindings(hnat_priv, i))
+			continue;
 
 		for (hash_index = 0; hash_index < hnat_priv->foe_etry_num; hash_index++) {
 			entry = hnat_priv->foe_table_cpu[i] + hash_index;
@@ -382,6 +385,7 @@ static void foe_clear_all_bind_entries_body(void)
 				}
 			}
 		}
+		hnat_flow_entry_clear(i);
 	}
 
 	/* clear HWNAT cache */
@@ -1939,7 +1943,7 @@ static bool hnat_flow_entry_store(const struct foe_entry *entry, u32 ppe,
 	struct hlist_head *head;
 	struct hlist_node *next;
 	struct foe_entry *live;
-	u64 seq;
+	u64 seq, live_generation;
 
 	if (ppe >= MAX_PPE_NUM || ppe >= CFG_PPE_NUM ||
 	    slot >= hnat_priv->foe_etry_num || !hnat_priv->foe_flow[ppe])
@@ -1971,7 +1975,12 @@ static bool hnat_flow_entry_store(const struct foe_entry *entry, u32 ppe,
 	live = &hnat_priv->foe_table_cpu[ppe][slot];
 	head = &hnat_priv->foe_flow[ppe][slot / 4];
 	spin_lock_bh(&hnat_priv->flow_entry_lock);
-	if (!hnat_flow_entry_unbind_match(entry, live)) {
+	/* Serialize the final epoch check with bulk shadow retirement. */
+	if ((hnat_account_enabled(hnat_priv) &&
+	     (!hnat_account_generation_snapshot(hnat_priv, ppe, slot,
+					       &live_generation) ||
+	      live_generation != generation)) ||
+	    !hnat_flow_entry_unbind_match(entry, live)) {
 		spin_unlock_bh(&hnat_priv->flow_entry_lock);
 		hnat_flow_entry_delete(new_flow);
 		return false;

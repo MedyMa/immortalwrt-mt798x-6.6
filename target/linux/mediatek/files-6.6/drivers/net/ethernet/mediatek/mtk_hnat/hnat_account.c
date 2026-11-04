@@ -79,6 +79,7 @@ struct hnat_account_ppe {
 	u32 poll_cursor;
 	u32 cursor;
 	bool paused;
+	bool clearing;
 	bool quarantined;
 	u64 reads, read_error, unknown_loss, untracked, mismatch;
 	u64 retired, no_acct, discarded_bytes, discarded_packets;
@@ -217,7 +218,7 @@ bool hnat_account_diag_sample(struct mtk_hnat *h, const struct hnat_diag_key *ke
 	p = &h->account->ppe[ppe];
 	spin_lock_bh(&p->lock);
 	owner = p->slots[slot].owner;
-	if (p->paused || !owner || owner->prefill || owner->generation != generation ||
+	if (p->paused || p->clearing || !owner || owner->prefill || owner->generation != generation ||
 	    owner->dir != key->direction || nf_ct_get_id(owner->ct) != key->ct_id ||
 	    owner->net->ns.inum != key->netns || owner->zone.id != key->zone ||
 	    owner->zone.dir != key->zone_dir || owner->zone.flags != key->zone_flags ||
@@ -382,7 +383,7 @@ bool hnat_account_entry_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 	spin_lock_bh(&p->lock);
 	*entry = h->foe_table_cpu[ppe][slot];
 	*generation = p->slots[slot].generation;
-	if (p->paused)
+	if (p->paused || p->clearing)
 		entry->bfib1.state = BIND; /* caller skips publication */
 	spin_unlock_bh(&p->lock);
 	return true;
@@ -397,7 +398,7 @@ bool hnat_account_generation_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 		return false;
 	p = &h->account->ppe[ppe];
 	spin_lock_bh(&p->lock);
-	if (p->paused) {
+	if (p->paused || p->clearing) {
 		spin_unlock_bh(&p->lock);
 		return false;
 	}
@@ -471,7 +472,7 @@ static bool account_commit(struct mtk_hnat *h, u32 ppe, u32 slot,
 		call_rcu(&o->rcu, owner_free);
 		o = NULL;
 	}
-	if (p->paused) {
+	if (p->paused || p->clearing) {
 		if (o)
 			call_rcu(&o->rcu, owner_free);
 		spin_unlock_bh(&p->lock);
@@ -646,7 +647,7 @@ bool hnat_account_publish_delta(struct mtk_hnat *h, u32 ppe, u32 slot,
 	p = &h->account->ppe[ppe];
 	s = &p->slots[slot];
 	spin_lock_bh(&p->lock);
-	if (p->paused || !owner_live(h, ppe, slot))
+	if (p->paused || p->clearing || !owner_live(h, ppe, slot))
 		goto out;
 	zone = nf_ct_zone(ct);
 	if (s->owner->prefill || ct != s->owner->ct || dir != s->owner->dir ||
@@ -713,6 +714,10 @@ bool hnat_account_tunnel_invalidate(struct mtk_hnat *h, u32 ppe, u32 slot)
 	p = &h->account->ppe[ppe];
 	foe = &h->foe_table_cpu[ppe][slot];
 	spin_lock_bh(&p->lock);
+	if (p->clearing) {
+		spin_unlock_bh(&p->lock);
+		return true; /* the bulk clear owns this epoch */
+	}
 	memcpy(&before, foe, sizeof(before));
 	/* drain_locked attributes only a live owner's verified identity.  The
 	 * return value never authorizes publishing data to a different owner.
@@ -796,6 +801,53 @@ bool hnat_account_clear_if_generation(struct mtk_hnat *h, u32 ppe, u32 slot,
 				      bool erase, u64 generation)
 {
 	return account_clear(h, ppe, slot, erase, true, generation, false);
+}
+
+/* Fence new publishers while retiring both BIND owners and UNBIND prefills.
+ * Software tunnel shadows are removed outside the accounting lock so their
+ * RCU callbacks can release conntrack and device references safely.
+ */
+bool hnat_account_clear_all_bindings(struct mtk_hnat *h, u32 ppe)
+{
+	struct hnat_account_ppe *p;
+	u32 slot, count;
+
+	if (!hnat_account_enabled(h) || ppe >= MAX_PPE_NUM || ppe >= CFG_PPE_NUM ||
+	    ppe >= h->ppe_num || ppe >= h->account->ppe_num ||
+	    !account_valid(h, ppe, 0))
+		return false;
+
+	p = &h->account->ppe[ppe];
+	spin_lock_bh(&p->lock);
+	if (p->clearing) {
+		spin_unlock_bh(&p->lock);
+		return true; /* an overlapping clear is already retiring this PPE */
+	}
+	p->clearing = true;
+	spin_unlock_bh(&p->lock);
+
+	count = min(h->foe_etry_num, h->account->slot_count);
+	for (slot = 0; slot < count; slot++) {
+		bool needs_clear;
+
+		spin_lock_bh(&p->lock);
+		needs_clear = h->foe_table_cpu[ppe][slot].bfib1.state == BIND ||
+			      p->slots[slot].owner;
+		spin_unlock_bh(&p->lock);
+
+		/* Publishers are fenced. Another retirement may advance generation
+		 * without clearing BIND, so do not turn that into a skipped clear.
+		 */
+		if (needs_clear)
+			account_clear(h, ppe, slot, false, false, 0, false);
+	}
+
+	hnat_flow_entry_clear(ppe);
+
+	spin_lock_bh(&p->lock);
+	p->clearing = false;
+	spin_unlock_bh(&p->lock);
+	return true;
 }
 
 bool hnat_account_clear_entry(struct mtk_hnat *h, struct foe_entry *entry)
