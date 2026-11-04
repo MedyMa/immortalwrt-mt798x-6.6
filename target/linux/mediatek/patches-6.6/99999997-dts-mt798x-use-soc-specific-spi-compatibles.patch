@@ -1,0 +1,114 @@
+Subject: [PATCH] arm64: dts: mediatek: match SoC-specific SPI controller data
+
+Pair with the per-compatible tick delay driver change.
+
+--- a/arch/arm64/boot/dts/mediatek/mt7981.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt7981.dtsi
+@@ -282,7 +282,7 @@
+ 		};
+ 
+ 		spi2: spi@11009000 {
+-			compatible = "mediatek,mt7986-spi-ipm", "mediatek,spi-ipm";
++			compatible = "mediatek,mt7981-spi";
+ 			reg = <0 0x11009000 0 0x100>;
+ 			interrupts = <GIC_SPI 142 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&topckgen CLK_TOP_CB_M_D2>,
+@@ -296,7 +296,7 @@
+ 		};
+ 
+ 		spi0: spi@1100a000 {
+-			compatible = "mediatek,mt7986-spi-ipm", "mediatek,spi-ipm";
++			compatible = "mediatek,mt7981-spi";
+ 			reg = <0 0x1100a000 0 0x100>;
+ 			interrupts = <GIC_SPI 140 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&topckgen CLK_TOP_CB_M_D2>,
+@@ -310,7 +310,7 @@
+ 		};
+ 
+ 		spi1: spi@1100b000 {
+-			compatible = "mediatek,mt7986-spi-ipm", "mediatek,spi-ipm";
++			compatible = "mediatek,mt7981-spi";
+ 			reg = <0 0x1100b000 0 0x100>;
+ 			interrupts = <GIC_SPI 141 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&topckgen CLK_TOP_CB_M_D2>,
+--- a/arch/arm64/boot/dts/mediatek/mt7986a.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt7986a.dtsi
+@@ -304,7 +304,7 @@
+ 		};
+ 
+ 		spi0: spi@1100a000 {
+-			compatible = "mediatek,mt7986-spi-ipm", "mediatek,spi-ipm";
++			compatible = "mediatek,mt7986-spi";
+ 			reg = <0 0x1100a000 0 0x100>;
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
+@@ -318,7 +318,7 @@
+ 		};
+ 
+ 		spi1: spi@1100b000 {
+-			compatible = "mediatek,mt7986-spi-ipm", "mediatek,spi-ipm";
++			compatible = "mediatek,mt7986-spi";
+ 			reg = <0 0x1100b000 0 0x100>;
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
+--- a/arch/arm64/boot/dts/mediatek/mt7987.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt7987.dtsi
+@@ -498,8 +498,7 @@
+ 		};
+ 
+ 		spi0: spi@11007800 {
+-			compatible = "mediatek,ipm-spi-quad",
+-				     "mediatek,spi-ipm";
++			compatible = "mediatek,mt7987-spi";
+ 			reg = <0 0x11007800 0 0x100>;
+ 			interrupts = <GIC_SPI 140 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&topckgen CLK_TOP_CB_M_D2>,
+@@ -516,8 +515,7 @@
+ 		};
+ 
+ 		spi1: spi@11008800 {
+-			compatible = "mediatek,ipm-spi-single",
+-				     "mediatek,spi-ipm";
++			compatible = "mediatek,mt7987-spi";
+ 			reg = <0 0x11008800 0 0x100>;
+ 			interrupts = <GIC_SPI 141 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&topckgen CLK_TOP_CB_M_D2>,
+@@ -535,8 +533,7 @@
+ 		};
+ 
+ 		spi2: spi@11009800 {
+-			compatible = "mediatek,ipm-spi-quad",
+-				     "mediatek,spi-ipm";
++			compatible = "mediatek,mt7987-spi";
+ 			reg = <0 0x11009800 0 0x100>;
+ 			interrupts = <GIC_SPI 142 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&topckgen CLK_TOP_CB_M_D2>,
+--- a/arch/arm64/boot/dts/mediatek/mt7988a.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt7988a.dtsi
+@@ -948,7 +948,7 @@
+ 		};
+ 
+ 		spi0: spi@11007000 {
+-			compatible = "mediatek,ipm-spi-quad", "mediatek,spi-ipm";
++			compatible = "mediatek,mt7988-spi";
+ 			reg = <0 0x11007000 0 0x100>;
+ 			interrupts = <GIC_SPI 140 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&topckgen CLK_TOP_MPLL_D2>,
+@@ -963,7 +963,7 @@
+ 		};
+ 
+ 		spi1: spi@11008000 {
+-			compatible = "mediatek,ipm-spi-single", "mediatek,spi-ipm";
++			compatible = "mediatek,mt7988-spi";
+ 			reg = <0 0x11008000 0 0x100>;
+ 			interrupts = <GIC_SPI 141 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&topckgen CLK_TOP_MPLL_D2>,
+@@ -980,7 +980,7 @@
+ 		};
+ 
+ 		spi2: spi@11009000 {
+-			compatible = "mediatek,ipm-spi-quad", "mediatek,spi-ipm";
++			compatible = "mediatek,mt7988-spi";
+ 			reg = <0 0x11009000 0 0x100>;
+ 			interrupts = <GIC_SPI 142 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&topckgen CLK_TOP_MPLL_D2>,

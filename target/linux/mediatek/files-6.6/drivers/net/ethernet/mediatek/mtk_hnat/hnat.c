@@ -441,7 +441,7 @@ static int entry_delete_by_mac_body(u8 *mac)
 
 	for (i = 0; i < CFG_PPE_NUM; i++) {
 		entry = hnat_priv->foe_table_cpu[i];
-		for (index = 0; index < DEF_ETRY_NUM; entry++, index++) {
+		for (index = 0; index < hnat_priv->foe_etry_num; entry++, index++) {
 			if (hnat_account_enabled(hnat_priv)) {
 				if (!hnat_account_clear_snapshot(hnat_priv, i, index,
 							 &snapshot, &account_generation))

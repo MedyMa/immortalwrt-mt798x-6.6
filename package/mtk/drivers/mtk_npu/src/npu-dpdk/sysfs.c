@@ -32,10 +32,29 @@ static ssize_t dpdk_mac_filter_enable_store(struct device *dev, struct device_at
 	return ret ? ret : count;
 }
 
+static ssize_t dpdk_mac_filter_drop_pkt_show(struct device *dev,
+                                           struct device_attribute *attr, char *buf)
+{
+	u32 count;
+	int ret;
+
+	ret = mtk_npu_dpdk_access_begin();
+	if (ret)
+		return ret;
+	ret = mtk_npu_dpdk_mac_filter_drop_pkt_count(&count);
+	mtk_npu_dpdk_access_end();
+	if (ret)
+		return ret;
+
+	return scnprintf(buf, PAGE_SIZE, "MAC filter drop packets: %u\n", count);
+}
+
 static NPU_DEV_ATTR_WO(dpdk, mac_filter_enable);
+static NPU_DEV_ATTR_RO(dpdk, mac_filter_drop_pkt);
 
 static struct attribute *dpdk_attributes[] = {
 	&dev_attr_dpdk_mac_filter_enable.attr,
+	&dev_attr_dpdk_mac_filter_drop_pkt.attr,
 	NULL,
 };
 
