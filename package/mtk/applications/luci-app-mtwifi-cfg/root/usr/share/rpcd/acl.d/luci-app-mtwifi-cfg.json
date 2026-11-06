@@ -3,6 +3,7 @@
 		"description": "Grant access to mtwifi configuration and MLO management",
 		"read": {
 			"file": {
+				"/sbin/l1util": ["exec"],
 				"/usr/sbin/iwpriv": ["exec"],
 				"/usr/sbin/mwctl": ["exec"],
 				"/usr/sbin/mtwifi-mlo-status": ["exec"]

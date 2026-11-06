@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+
+START=90
+USE_PROCD=1
+
+reload_service() {
+	# setup/teardown apply WHNAT themselves while holding this same lock.
+	lock -n /tmp/mtwifi.lock || return 0
+	local result=0
+	/sbin/mtwifi_cfg whnat || result=1
+	lock -u /tmp/mtwifi.lock
+	[ "$result" = 0 ] || logger -t mtwifi-cfg "WHNAT update failed"
+	return "$result"
+}
+
+start_service() {
+	reload_service
+}
+
+service_triggers() {
+	procd_add_reload_trigger wireless
+}

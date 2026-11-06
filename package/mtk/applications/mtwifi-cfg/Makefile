@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=mtwifi-cfg
 PKG_LICENSE:=GPL-2.0+
 PKG_VERSION:=1
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -16,7 +16,7 @@ define Package/mtwifi-cfg
   CATEGORY:=MTK Properties
   SUBMENU:=Applications
   TITLE:=mtwifi configure scripts for mt798x
-  DEPENDS:=+iwinfo +wifi-dats +wifi-scripts +lua-cjson +libuci-lua +luci-lib-nixio +datconf-lua @!PACKAGE_luci-app-mtk @!PACKAGE_wifi-profile
+  DEPENDS:=+wireless-tools +iwinfo +wifi-dats +wifi-scripts +lua-cjson +libuci-lua +luci-lib-nixio +datconf-lua @!PACKAGE_luci-app-mtk @!PACKAGE_wifi-profile
 endef
 
 define Build/Compile
@@ -34,6 +34,7 @@ define Package/mtwifi-cfg/install
 	$(INSTALL_BIN) ./files/mtwifi-cfg/mtwifi_mlo $(1)/usr/sbin/mtwifi-mlo-status
 	$(INSTALL_BIN) ./files/mtwifi-cfg/mtwifi_mlo $(1)/usr/sbin/mtwifi-mlo-control
 	$(INSTALL_BIN) ./files/mtwifi-cfg/mtwifi-mlo-recover $(1)/etc/init.d/mtwifi-mlo-recover
+	$(INSTALL_BIN) ./files/mtwifi-cfg/mtwifi-whnat $(1)/etc/init.d/mtwifi-whnat
 	$(INSTALL_DATA) ./files/mtwifi-cfg/keep.d $(1)/lib/upgrade/keep.d/mtwifi-cfg
 	$(INSTALL_BIN) ./files/mtwifi-cfg/inspect.lua $(1)/usr/lib/lua/
 	$(INSTALL_BIN) ./files/mtwifi-cfg/mtwifi_defs.lua $(1)/usr/lib/lua/

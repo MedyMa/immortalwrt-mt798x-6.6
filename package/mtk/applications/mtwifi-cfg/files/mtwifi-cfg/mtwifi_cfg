@@ -35,9 +35,8 @@ function string:split(sep)
 end
 
 function load_profile(path)
-    local cfgs = {}
-
-    cfgobj = datconf.openfile(path)
+    local cfgs
+    local cfgobj = datconf.openfile(path)
     if cfgobj then
         cfgs = cfgobj:getall()
         cfgobj:close()
@@ -48,14 +47,105 @@ end
 
 function save_profile(cfgs, path)
     if not cfgs then
-        return
+        return false
     end
 
     local datobj = datconf.openfile(path)
+    if not datobj then return false end
     datobj:merge(cfgs)
-    datobj:close(true)
+    local result = datobj:commit()
+    datobj:close()
+    if result ~= 0 then
+        nixio.syslog("err", "mtwifi-cfg: cannot save profile " .. path)
+        return false
+    end
 
     os.execute("sync")
+    return true
+end
+
+local function whnat_groups()
+    return l1parser.whnat_groups(l1dat)
+end
+
+local function whnat_group(dev)
+    for _, group in ipairs(whnat_groups()) do
+        if group.profiles[dev.profile_path] then return group end
+    end
+end
+
+local function whnat_value(group)
+    local cursor = uci.cursor()
+    local value = cursor:get("wireless", group.master, "whnat")
+    cursor:close()
+    -- The existing LuCI flag defaults to enabled when its UCI option is absent.
+    if value == nil or value == "" or value == true or value == 1 or value == "1" then
+        return "1"
+    elseif value == false or value == 0 or value == "0" then
+        return "0"
+    end
+    nixio.syslog("err", "mtwifi-cfg: invalid WHNAT value for " .. group.master)
+end
+
+local function whnat_save(group, value, current_path, current_dats)
+    local profiles = {}
+    -- Resolve the raw L1 entry, including band aliases whose mainidx differs.
+    for path in pairs(group.profiles) do
+        profiles[path] = path == current_path and current_dats or load_profile(path)
+        if not profiles[path] then
+            nixio.syslog("err", "mtwifi-cfg: cannot read WHNAT profile " .. path)
+            return false
+        end
+    end
+    profiles[group.path] = load_profile(group.path)
+    if not profiles[group.path] then
+        nixio.syslog("err", "mtwifi-cfg: cannot read WHNAT init profile " .. group.path)
+        return false
+    end
+
+    for path, dats in pairs(profiles) do
+        if path == current_path then
+            dats.WHNAT = value
+        elseif tostring(dats.WHNAT) ~= value then
+            if not save_profile({WHNAT = value}, path) then return false end
+            local saved = load_profile(path)
+            if not saved or saved.WHNAT ~= value then
+                nixio.syslog("err", "mtwifi-cfg: cannot save WHNAT profile " .. path)
+                return false
+            end
+        end
+    end
+    return true
+end
+
+local function whnat_apply(group, value)
+    local applied, ok = {}, true
+    for vif in utils.read_pipe("ls /sys/class/net"):gmatch("[^\n]+") do
+        local dev = l1dat.ifname_ridx[vif]
+        if dev and group.profiles[dev.profile_path] and not applied[dev.profile_path] and
+            vif_status(vif) == "up" then
+            local quoted = "'" .. vif:gsub("'", "'\\''") .. "'"
+            local result = os.execute("iwpriv " .. quoted .. " set whnat_en=" .. value)
+            if result == true or result == 0 then
+                applied[dev.profile_path] = true
+            else
+                nixio.syslog("err", "mtwifi-cfg: WHNAT command failed on " .. vif)
+                ok = false
+            end
+        end
+    end
+    return ok
+end
+
+function mtwifi_cfg_whnat()
+    local ok = true
+    for _, group in ipairs(whnat_groups()) do
+        local value = whnat_value(group)
+        if not value or not whnat_save(group, value) or not whnat_apply(group, value) then
+            ok = false
+        end
+    end
+    return ok
 end
 
 function diff_cfg(cfg1, cfg2)
@@ -337,7 +427,7 @@ function mtwifi_cfg_iwpriv_hook(cfg)
     mtwifi_cfg_foreach_vif(cfg, "sta", apcli_hook)
 end
 
-function set_chip_cfg(cfg, dats)
+function set_chip_cfg(cfg, dats, init_whnat)
     local dev_dats
     local uci
     local dat_key
@@ -348,11 +438,13 @@ function set_chip_cfg(cfg, dats)
         uci = k
         dat_key = v[1]
 
-        -- reset chip cfgs to default
-        dats[dat_key] = v[2]
+        if not (init_whnat and dat_key == "WHNAT") then
+            -- reset chip cfgs to default
+            dats[dat_key] = v[2]
 
-        -- setup current dev cfg
-        set_dev_dat(dats, dat_key, cfg.config[uci])
+            -- setup current dev cfg
+            set_dev_dat(dats, dat_key, cfg.config[uci])
+        end
     end
 
     -- setup other dev cfg
@@ -364,7 +456,9 @@ function set_chip_cfg(cfg, dats)
             if dev_dats then
                 for _,j in pairs(defs.chip_cfgs) do
                     dat_key = j[1]
-                    set_dev_dat(dev_dats, dat_key, dats[dat_key])
+                    if not (init_whnat and dat_key == "WHNAT") then
+                        set_dev_dat(dev_dats, dat_key, dats[dat_key])
+                    end
                 end
                 save_profile(dev_dats, v.profile_path)
             end
@@ -585,6 +679,8 @@ function mtwifi_cfg_setup(argv)
 
     if not dev then return end
 
+    local whnat = whnat_group(dev)
+
     if not valid_eht_restricted_twt(cfg.config.eht_restricted_twt) then
         nixio.syslog("err", "mtwifi-cfg: invalid EHT Restricted TWT value")
         return false
@@ -601,7 +697,7 @@ function mtwifi_cfg_setup(argv)
     local dats = load_profile(profile)
     if not dats then
         nixio.syslog("err", "mtwifi-cfg: profile ".. profile .. "open failed")
-        return
+        return false
     end
     local dats_orig = load_profile(profile)
     set_optional_dev_dat(dats, "Vht1024QamSupport", cfg.config.vht_1024)
@@ -743,7 +839,7 @@ function mtwifi_cfg_setup(argv)
     end
 
     -- setup chip cfgs
-    set_chip_cfg(cfg, dats)
+    set_chip_cfg(cfg, dats, whnat ~= nil)
 
     -- setup other dev cfgs
     if type(cfg.config.country) == type("") and #cfg.config.country == 2 then
@@ -941,12 +1037,28 @@ function mtwifi_cfg_setup(argv)
     end
 
     local reinstall_wifidrv = false
+    local whnat_enabled
+    if whnat then
+        whnat_enabled = whnat_value(whnat)
+        if not whnat_enabled or not whnat_save(whnat, whnat_enabled, profile, dats) then
+            return false
+        end
+    end
     local cfg_diff = diff_cfg(dats_orig, dats)
 
-    save_profile(dats, profile)
+    if not save_profile(dats, profile) then return false end
 
     for _,v in pairs(defs.reinstall_cfgs) do
-        if cfg_diff[v] ~= nil then
+        local changed = cfg_diff[v] ~= nil
+        -- Collapsing a template's all-disabled WDS tokens (0;0 -> 0) does
+        -- not change its state and must not unload the WiFi7 module stack.
+        if whnat and changed and v == "WdsEnable" and
+            tostring(dats_orig[v]):match("^0[0;]*$") and tostring(dats[v]):match("^0[0;]*$") then
+            changed = false
+        end
+        -- WiFi7 reads WHNAT from init_path at probe and supports a native
+        -- runtime setter; unloading the legacy module stack cannot apply it.
+        if changed and not (whnat and v == "WHNAT") then
             if utils.exists("/sys/module/mt_wifi") == false then
                 nixio.syslog("err", "mtwifi-cfg: mtwifi module is build-in, please reboot the device!")
                 return
@@ -1011,6 +1123,7 @@ function mtwifi_cfg_setup(argv)
     end
 
     mtwifi_cfg_iwpriv_hook(cfg)
+    if whnat and not whnat_apply(whnat, whnat_enabled) then return false end
 end
 
 function mtwifi_cfg_down(devname)
@@ -1024,6 +1137,9 @@ function mtwifi_cfg_down(devname)
 end
 
 local action = {
+    ["whnat"] = function()
+        if not mtwifi_cfg_whnat() then os.exit(1) end
+    end,
     ["down"] = function(devname)
         mtwifi_cfg_down(devname)
     end,

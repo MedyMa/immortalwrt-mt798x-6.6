@@ -56,6 +56,56 @@ function l1dat_parser.token_get(str, n, v)
     return tmp[tonumber(n)] or v
 end
 
+function l1dat_parser.whnat_groups(devs)
+    local groups, seen = {}, {}
+    for _, entry in ipairs(devs) do
+        local path = entry.init_path
+        if path and path ~= "" and not seen[path] then
+            local profiles, first = {}, nil
+            for profile in (entry.profile_path or ""):gmatch("[^;]+") do
+                first = first or profile
+                profiles[profile] = true
+            end
+            local master
+            for name, dev in pairs(devs.devname_ridx) do
+                if dev.profile_path == first and dev.INDEX == entry.INDEX and
+                    dev.mainidx == entry.mainidx then
+                    master = name
+                    break
+                end
+            end
+            if master then
+                groups[#groups + 1] = {path = path, profiles = profiles, master = master}
+                seen[path] = true
+            end
+        end
+    end
+    return groups
+end
+
+function l1dat_parser.whnat_owners(devs)
+    local owners = {}
+    for _, group in ipairs(l1dat_parser.whnat_groups(devs)) do
+        for name, dev in pairs(devs.devname_ridx) do
+            if group.profiles[dev.profile_path] then owners[name] = group.master end
+        end
+    end
+    -- Older DBDC profiles have no separate init_path.
+    for name, dev in pairs(devs.devname_ridx) do
+        if not owners[name] then
+            owners[name] = name
+            for primary, candidate in pairs(devs.devname_ridx) do
+                if candidate.INDEX == dev.INDEX and candidate.mainidx == dev.mainidx and
+                    candidate.subidx == 1 then
+                    owners[name] = primary
+                    break
+                end
+            end
+        end
+    end
+    return owners
+end
+
 function l1dat_parser.add_default_value(l1cfg)
     for k, v in ipairs(l1cfg) do
 

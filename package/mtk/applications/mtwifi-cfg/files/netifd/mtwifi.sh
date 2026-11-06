@@ -134,6 +134,8 @@ drv_mtwifi_teardown() {
 	logger -t "netifd-mtwifi" "down: $dev"
 
 	/sbin/mtwifi_cfg down "$dev"
+	# A disabled primary radio can still change the chip's WHNAT setting.
+	/sbin/mtwifi_cfg whnat || logger -t netifd-mtwifi "WHNAT update failed"
 
 	lock -u $LOCK_FILE
 }

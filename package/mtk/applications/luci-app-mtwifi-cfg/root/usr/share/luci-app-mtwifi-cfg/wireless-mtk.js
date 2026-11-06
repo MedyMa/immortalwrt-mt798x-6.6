@@ -2169,11 +2169,37 @@ return view.extend({
 
 					var is_dbdc_main = uci.get('wireless', radioNet.getWifiDeviceName(), 'dbdc_main') == '1';
 
+					o = ss.taboption('advanced', form.Flag, 'whnat', _('Wireless HWNAT'));
+					o.default = o.enabled;
+					o.rmempty = false;
+					o.retain = true;
+					o.whnatOwners = {};
+					o.load = function(section_id) {
+						return fs.exec('/sbin/l1util', [ 'whnat' ]).then(L.bind(function(result) {
+							if (result.code != 0)
+								throw new Error(_('Failed to load the wireless configuration'));
+							this.whnatOwners = JSON.parse(result.stdout);
+							var owner = this.whnatOwners[section_id];
+							if (!owner || uci.get('wireless', owner, 'type') != 'mtwifi')
+								throw new Error(_('Failed to load the wireless configuration'));
+							return this.cfgvalue(section_id);
+						}, this));
+					};
+					o.cfgvalue = function(section_id) {
+						return uci.get('wireless', this.whnatOwners[section_id] || section_id, 'whnat') || this.enabled;
+					};
+					o.write = function(section_id, value) {
+						var owner = this.whnatOwners[section_id];
+						if (!owner || uci.get('wireless', owner, 'type') != 'mtwifi')
+							throw new Error(_('Failed to load the wireless configuration'));
+						uci.set('wireless', owner, 'whnat', value);
+					};
+					o.remove = function(section_id) {
+						this.write(section_id, this.enabled);
+					};
+
 					if (is_dbdc_main)
 					{
-						o = ss.taboption('advanced', form.Flag, 'whnat', _('Wireless HWNAT'));
-						o.default = o.enabled;
-	
 						o = ss.taboption('advanced', form.Value, 'beacon_int', _('Beacon Interval'));
 						o.optional = true;
 						o.datatype = 'range(20,999)';
