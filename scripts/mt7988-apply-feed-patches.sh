@@ -14,29 +14,6 @@ patches=(
 )
 
 cd "$source_root"
-
-# Samba 4.18.11's host and target sources share the same package patch queue.
-# Install this after feed updates so a new checkout or restored cache gets it.
-samba_package="$source_root/feeds/packages/net/samba4"
-samba_patch="$source_root/package/mtk/patches/samba4/106-fix-memset-explicit-prototype.patch"
-samba_target="$samba_package/patches/$(basename -- "$samba_patch")"
-if [[ -f "$samba_package/Makefile" ]] && \
-   grep -qxF 'PKG_VERSION:=4.18.11' "$samba_package/Makefile"; then
-    if [[ ! -s "$samba_patch" ]]; then
-        printf 'Samba source patch is missing: %s\n' "$samba_patch" >&2
-        exit 1
-    fi
-    if [[ -e "$samba_target" ]] && ! cmp -s -- "$samba_patch" "$samba_target"; then
-        printf 'Refusing to overwrite modified Samba patch: %s\n' "$samba_target" >&2
-        exit 1
-    fi
-    install -Dm644 -- "$samba_patch" "$samba_target"
-elif [[ -f "$samba_package/Makefile" && -f "$samba_target" ]] && \
-     cmp -s -- "$samba_patch" "$samba_target"; then
-    # An upgraded feed must not retain this untracked patch for the old source.
-    rm -- "$samba_target"
-fi
-
 for target in "${targets[@]}"; do
     if [[ ! -f "$target" ]]; then
         printf 'MT7988 LuCI patch target is missing: %s\n' "$target" >&2
