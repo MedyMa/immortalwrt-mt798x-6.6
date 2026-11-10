@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Copyright (C) 2024 MediaTek Inc.
+ *
+ * Author: Frank-zj Lin <frank-zj.lin@mediatek.com>
+ */
+
+#include <linux/debugfs.h>
+#include <linux/module.h>
+#include <linux/spinlock.h>
+#include <linux/netdevice.h>
+
+#include <pce/cdrt.h>
+
+#include "crypto-eip/crypto-eip.h"
+#include "crypto-eip/debugfs.h"
+
+struct dentry *mtk_crypto_debugfs_root;
+int mac_filter_enable;
+
+static int mtk_crypto_debugfs_read(struct seq_file *s, void *private)
+{
+	struct xfrm_params_list *xfrm_params_list;
+	struct mtk_xfrm_params *xfrm_params;
+
+	xfrm_params_list = mtk_xfrm_params_list_get();
+
+	spin_lock_bh(&xfrm_params_list->lock);
+
+	list_for_each_entry(xfrm_params, &xfrm_params_list->list, node) {
+		seq_printf(s, "XFRM STATE: spi 0x%x, cdrt_idx %3d: ",
+			   htonl(xfrm_params->xs->id.spi),
+			   xfrm_params->cdrt->idx);
+
+		if (xfrm_params->cdrt->type == CDRT_DECRYPT)
+			seq_puts(s, "INBOUND\n");
+		else if (xfrm_params->cdrt->type == CDRT_ENCRYPT)
+			seq_puts(s, "OUTBOUND\n");
+		else
+			seq_puts(s, "\n");
+
+		seq_printf(s, "\tState: %s\n", xfrm_params->dead ? "rekey-required" : "configured");
+		seq_printf(s, "\tHost bytes: %llu\n", atomic64_read(&xfrm_params->bytes));
+		seq_printf(s, "\tHost packets (TX submitted / RX delivered): %llu\n", atomic64_read(&xfrm_params->packets));
+	}
+
+	spin_unlock_bh(&xfrm_params_list->lock);
+
+	return 0;
+}
+
+static int mtk_crypto_debugfs_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, mtk_crypto_debugfs_read, file->private_data);
+}
+
+static const struct file_operations mtk_crypto_debugfs_fops = {
+	.open = mtk_crypto_debugfs_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.owner = THIS_MODULE,
+	.release = single_release,
+};
+
+int mtk_crypto_debugfs_init(void)
+{
+	mtk_crypto_debugfs_root = debugfs_create_dir("mtk_crypto", NULL);
+
+	debugfs_create_file("xfrm_params", 0400, mtk_crypto_debugfs_root, NULL,
+			    &mtk_crypto_debugfs_fops);
+
+	return 0;
+}
+
+void mtk_crypto_debugfs_exit(void)
+{
+	debugfs_remove_recursive(mtk_crypto_debugfs_root);
+}

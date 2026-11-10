@@ -210,5 +210,6 @@ static inline void mtk_pce_fe_mem_msg_config(struct fe_mem_msg *msg,
 int mtk_pce_enable(void);
 void mtk_pce_disable(void);
 
+bool mtk_pce_is_ready(void);
 int mtk_pce_fe_mem_msg_send(struct fe_mem_msg *msg);
 #endif /* _MTK_PCE_H_ */

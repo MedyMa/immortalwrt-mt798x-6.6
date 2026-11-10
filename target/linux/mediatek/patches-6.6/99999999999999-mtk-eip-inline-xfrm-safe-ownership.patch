@@ -1,0 +1,515 @@
+From: MedyMa <75345465+MedyMa@users.noreply.github.com>
+Subject: [PATCH] net: adapt MediaTek EIP inline secpath and QDMA support
+
+Based on official MediaTek b1a72ada, 9bdd02a0 and 6c132901. Preserve
+Linux policy checks, explicit skb ownership and HNAT accounting fences.
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -30,6 +30,9 @@
+ #include <net/dsa.h>
+ #include <net/dst_metadata.h>
+ #include <net/gso.h>
++#include <net/xfrm.h>
++#include <linux/srcu.h>
++#include <linux/version.h>
+ #include <net/page_pool/helpers.h>
+ 
+ #include "mtk_eth_soc.h"
+@@ -43,6 +46,214 @@
+ #endif
+ struct net_device *ppd_dev;
+ EXPORT_SYMBOL(ppd_dev);
++static DEFINE_MUTEX(mtk_crypto_net_lock);
++DEFINE_STATIC_SRCU(mtk_crypto_srcu);
++static const struct mtk_crypto_net_ops __rcu *mtk_crypto_net_ops;
++
++int mtk_crypto_net_register(const struct mtk_crypto_net_ops *ops)
++{
++        int ret = 0;
++
++        if (!ops || !ops->rx || !ops->tx || !ops->owner || !ops->xfrm)
++                return -EINVAL;
++        mutex_lock(&mtk_crypto_net_lock);
++        if (rcu_access_pointer(mtk_crypto_net_ops))
++                ret = -EBUSY;
++        else
++                rcu_assign_pointer(mtk_crypto_net_ops, ops);
++        mutex_unlock(&mtk_crypto_net_lock);
++        return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_crypto_net_register);
++
++void mtk_crypto_net_unregister(const struct mtk_crypto_net_ops *ops)
++{
++        mutex_lock(&mtk_crypto_net_lock);
++        if (rcu_access_pointer(mtk_crypto_net_ops) == ops) {
++                RCU_INIT_POINTER(mtk_crypto_net_ops, NULL);
++                synchronize_net();
++                synchronize_srcu(&mtk_crypto_srcu);
++        }
++        mutex_unlock(&mtk_crypto_net_lock);
++}
++EXPORT_SYMBOL_GPL(mtk_crypto_net_unregister);
++
++#if IS_ENABLED(CONFIG_XFRM_OFFLOAD)
++/* A permanent MAC-side dispatch table keeps XFRM from retaining pointers to
++ * removable EIP module text. SRCU covers sleeping add/free callbacks; module
++ * references are returned here, after the provider callback has returned.
++ */
++static int mtk_crypto_state_add(struct xfrm_state *xs, struct netlink_ext_ack *extack)
++{
++        const struct mtk_crypto_net_ops *ops;
++        int idx, ret = -ENODEV;
++
++        idx = srcu_read_lock(&mtk_crypto_srcu);
++        ops = srcu_dereference(mtk_crypto_net_ops, &mtk_crypto_srcu);
++        if (ops && try_module_get(ops->owner)) {
++                ret = ops->xfrm->xdo_dev_state_add(xs, extack);
++                if (ret)
++                        module_put(ops->owner);
++        }
++        srcu_read_unlock(&mtk_crypto_srcu, idx);
++        return ret;
++}
++
++static int mtk_crypto_policy_add(struct xfrm_policy *xp, struct netlink_ext_ack *extack)
++{
++        const struct mtk_crypto_net_ops *ops;
++        int idx, ret = -ENODEV;
++
++        idx = srcu_read_lock(&mtk_crypto_srcu);
++        ops = srcu_dereference(mtk_crypto_net_ops, &mtk_crypto_srcu);
++        if (ops && try_module_get(ops->owner)) {
++                ret = ops->xfrm->xdo_dev_policy_add(xp, extack);
++                if (ret)
++                        module_put(ops->owner);
++        }
++        srcu_read_unlock(&mtk_crypto_srcu, idx);
++        return ret;
++}
++
++static bool mtk_crypto_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
++{
++        const struct mtk_crypto_net_ops *ops;
++        bool ok = false;
++        int idx;
++
++        idx = srcu_read_lock(&mtk_crypto_srcu);
++        ops = srcu_dereference(mtk_crypto_net_ops, &mtk_crypto_srcu);
++        if (ops)
++                ok = ops->xfrm->xdo_dev_offload_ok(skb, xs);
++        srcu_read_unlock(&mtk_crypto_srcu, idx);
++        return ok;
++}
++
++static int mtk_crypto_packet_xmit(struct sk_buff *skb, struct xfrm_state *xs)
++{
++        const struct mtk_crypto_net_ops *ops;
++        int idx, ret = -ENODEV;
++
++        idx = srcu_read_lock(&mtk_crypto_srcu);
++        ops = srcu_dereference(mtk_crypto_net_ops, &mtk_crypto_srcu);
++        if (ops)
++                ret = ops->xfrm->xdo_dev_packet_xmit(skb, xs);
++        else
++                kfree_skb(skb);
++        srcu_read_unlock(&mtk_crypto_srcu, idx);
++        return ret;
++}
++
++static void mtk_crypto_state_delete(struct xfrm_state *xs)
++{
++        const struct mtk_crypto_net_ops *ops;
++        int idx = srcu_read_lock(&mtk_crypto_srcu);
++
++        ops = srcu_dereference(mtk_crypto_net_ops, &mtk_crypto_srcu);
++        if (ops)
++                ops->xfrm->xdo_dev_state_delete(xs);
++        srcu_read_unlock(&mtk_crypto_srcu, idx);
++}
++
++static void mtk_crypto_state_free(struct xfrm_state *xs)
++{
++        const struct mtk_crypto_net_ops *ops;
++        int idx = srcu_read_lock(&mtk_crypto_srcu);
++
++        ops = srcu_dereference(mtk_crypto_net_ops, &mtk_crypto_srcu);
++        if (ops) {
++                ops->xfrm->xdo_dev_state_free(xs);
++                module_put(ops->owner);
++        }
++        srcu_read_unlock(&mtk_crypto_srcu, idx);
++}
++
++static void mtk_crypto_state_stats(struct xfrm_state *xs)
++{
++        const struct mtk_crypto_net_ops *ops;
++        int idx = srcu_read_lock(&mtk_crypto_srcu);
++
++        ops = srcu_dereference(mtk_crypto_net_ops, &mtk_crypto_srcu);
++        if (ops) {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++                ops->xfrm->xdo_dev_state_update_stats(xs);
++#else
++                ops->xfrm->xdo_dev_state_update_curlft(xs);
++#endif
++        }
++        srcu_read_unlock(&mtk_crypto_srcu, idx);
++}
++
++static void mtk_crypto_policy_delete(struct xfrm_policy *xp)
++{
++        const struct mtk_crypto_net_ops *ops;
++        int idx = srcu_read_lock(&mtk_crypto_srcu);
++
++        ops = srcu_dereference(mtk_crypto_net_ops, &mtk_crypto_srcu);
++        if (ops)
++                ops->xfrm->xdo_dev_policy_delete(xp);
++        srcu_read_unlock(&mtk_crypto_srcu, idx);
++}
++
++static void mtk_crypto_policy_free(struct xfrm_policy *xp)
++{
++        const struct mtk_crypto_net_ops *ops;
++        int idx = srcu_read_lock(&mtk_crypto_srcu);
++
++        ops = srcu_dereference(mtk_crypto_net_ops, &mtk_crypto_srcu);
++        if (ops) {
++                ops->xfrm->xdo_dev_policy_free(xp);
++                module_put(ops->owner);
++        }
++        srcu_read_unlock(&mtk_crypto_srcu, idx);
++}
++
++static const struct xfrmdev_ops mtk_crypto_xfrm_ops = {
++        .xdo_dev_state_add = mtk_crypto_state_add,
++        .xdo_dev_state_delete = mtk_crypto_state_delete,
++        .xdo_dev_state_free = mtk_crypto_state_free,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++        .xdo_dev_state_update_stats = mtk_crypto_state_stats,
++#else
++        .xdo_dev_state_update_curlft = mtk_crypto_state_stats,
++#endif
++        .xdo_dev_offload_ok = mtk_crypto_offload_ok,
++        .xdo_dev_packet_xmit = mtk_crypto_packet_xmit,
++        .xdo_dev_policy_add = mtk_crypto_policy_add,
++        .xdo_dev_policy_delete = mtk_crypto_policy_delete,
++        .xdo_dev_policy_free = mtk_crypto_policy_free,
++};
++#endif
++
++const struct xfrmdev_ops *mtk_crypto_xfrmdev_ops(void)
++{
++#if IS_ENABLED(CONFIG_XFRM_OFFLOAD)
++        return &mtk_crypto_xfrm_ops;
++#else
++        return NULL;
++#endif
++}
++EXPORT_SYMBOL_GPL(mtk_crypto_xfrmdev_ops);
++
++static bool mtk_crypto_tx_skb(struct sk_buff *skb)
++{
++#if IS_ENABLED(CONFIG_XFRM_OFFLOAD)
++        struct sec_path *sp = skb_sec_path(skb);
++        struct xfrm_offload *xo;
++        struct xfrm_state *xs;
++
++        if (!sp || !sp->len || sp->len > XFRM_MAX_DEPTH)
++                return false;
++        xo = xfrm_offload(skb);
++        if (!xo || !(xo->flags & XFRM_XMIT))
++                return false;
++        xs = xfrm_input_state(skb);
++        return xs && xs->xso.type == XFRM_DEV_OFFLOAD_PACKET;
++#else
++        return false;
++#endif
++}
++
+ static int mtk_msg_level = -1;
+ module_param_named(msg_level, mtk_msg_level, int, 0);
+ MODULE_PARM_DESC(msg_level, "Message level (-1=defaults,0=none,...,16=all)");
+@@ -1855,6 +2066,7 @@
+ 		data &= ~(0xf << TX_DMA_FPORT_SHIFT_V2);
+ 		data |= 0x3 << TX_DMA_FPORT_SHIFT_V2;
+ 	}
++	data |= FIELD_PREP(GENMASK(3, 0), info->tport);
+ 	WRITE_ONCE(desc->txd4, data);
+ 
+ 	data = 0;
+@@ -1878,7 +2090,8 @@
+ 	WRITE_ONCE(desc->txd6, data);
+ 
+ 	WRITE_ONCE(desc->txd7, 0);
+-	WRITE_ONCE(desc->txd8, 0);
++	/* MediaTek QDMA v3: CDRT is txd8[7:0], TPORT 3 is EIP -> QDMA. */
++	WRITE_ONCE(desc->txd8, FIELD_PREP(GENMASK(7, 0), info->cdrt));
+ }
+ 
+ static void mtk_tx_set_dma_desc(struct net_device *dev, void *txd,
+@@ -1921,6 +2134,23 @@
+ 	int queue = skb_get_queue_mapping(skb);
+ 	int k = 0;
+ 
++        if (mtk_crypto_tx_skb(skb)) {
++                const struct mtk_crypto_net_ops *ops;
++                bool valid = false;
++
++                rcu_read_lock_bh();
++                ops = rcu_dereference_bh(mtk_crypto_net_ops);
++                if (ops && mtk_is_netsys_v3_or_greater(eth))
++                        valid = ops->tx(skb, dev, &txd_info.cdrt);
++                rcu_read_unlock_bh();
++                /* An unresolved/retired SA must never transmit plaintext. */
++                if (!valid || !txd_info.cdrt)
++                        return -EINVAL;
++                txd_info.tport = 3;
++                txd_info.ext_ppe = false;
++                hnat_to_ppe = false;
++        }
++
+ 	txq = netdev_get_tx_queue(dev, queue);
+ 	itxd = ring->next_free;
+ 	itxd_pdma = qdma_to_pdma(ring, itxd);
+@@ -2619,7 +2849,8 @@
+ 					 false);
+ 			xdp_buff_clear_frags_flag(&xdp);
+ 
+-			ret = mtk_xdp_run(eth, ring, &xdp, netdev);
++			ret = mtk_is_netsys_v3_or_greater(eth) && ((trxd.rxd7 >> 8) & 0xff) ?
++                                XDP_PASS : mtk_xdp_run(eth, ring, &xdp, netdev);
+ 			if (ret == XDP_REDIRECT)
+ 				xdp_flush = true;
+ 
+@@ -2717,6 +2948,24 @@
+ 		else
+ 			skb_checksum_none_assert(skb);
+ 		skb->protocol = eth_type_trans(skb, netdev);
++                if (mtk_is_netsys_v3_or_greater(eth) && ((trxd.rxd7 >> 8) & 0xff)) {
++                        const struct mtk_crypto_net_ops *ops;
++                        bool valid = false;
++
++                        rcu_read_lock_bh();
++                        ops = rcu_dereference_bh(mtk_crypto_net_ops);
++                        if (ops)
++                                valid = ops->rx(skb, (trxd.rxd7 >> 8) & 0xff);
++                        rcu_read_unlock_bh();
++                        if (!valid) {
++                                dev_kfree_skb_any(skb);
++                                if (tnl_dev)
++                                        dev_put(tnl_dev);
++                                goto skip_rx;
++                        }
++                        sent_ppd = false;
++                }
++
+ 
+ 		/* When using VLAN untagging in combination with DSA, the
+ 		 * hardware treats the MTK special tag as a VLAN and untags it.
+@@ -2747,8 +2996,8 @@
+ 		/* Allocation failure keeps software forwarding, never an ownerless BIND. */
+ 		if (tnl_dev && !mtk_npu_rx_meta_add(skb, &tnl_meta))
+ 			skb_hnat_alg(skb) = 1;
+-		skb_hnat_cdrt(skb) = 0;
+-		skb_hnat_is_decrypt(skb) = 0;
++		skb_hnat_cdrt(skb) = (trxd.rxd7 >> 8) & 0xff;
++		skb_hnat_is_decrypt(skb) = !!skb_hnat_cdrt(skb);
+ 		skb_hnat_is_pppoe(skb) = 0;
+ #endif
+ 		skb_hnat_magic_tag(skb) = HNAT_MAGIC_TAG;
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1438,6 +1438,8 @@
+ 		      MTK_NETSYS_RX_9K)
+ 
+ struct mtk_tx_dma_desc_info {
++	u8 cdrt;
++	u8 tport;
+ 	dma_addr_t	addr;
+ 	u32		size;
+ 	u16		vlan_tci;
+@@ -1962,4 +1964,15 @@
+ bool mtk_shaper_is_available(struct mtk_eth *eth, int idx);
+ void mtk_shaper_update_refcnt(struct mtk_eth *eth, int idx, bool add);
+ 
++/* Published only while the optional EIP inline module is ready. */
++struct mtk_crypto_net_ops {
++        struct module *owner;
++        const struct xfrmdev_ops *xfrm;
++        bool (*rx)(struct sk_buff *skb, u16 cdrt);
++        bool (*tx)(struct sk_buff *skb, struct net_device *dev, u8 *cdrt);
++};
++const struct xfrmdev_ops *mtk_crypto_xfrmdev_ops(void);
++int mtk_crypto_net_register(const struct mtk_crypto_net_ops *ops);
++void mtk_crypto_net_unregister(const struct mtk_crypto_net_ops *ops);
++
+ #endif /* MTK_ETH_H */
+--- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat.c
++++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat.c
+@@ -244,14 +244,37 @@
+ 			     SMA, SMA_FWD_CPU_BUILD_ENTRY);
+ }
+ 
++static DEFINE_SPINLOCK(hnat_cache_lock);
++
++static void __hnat_cache_invalidate(u32 ppe)
++{
++        cr_set_field(hnat_priv->ppe_base[ppe] + PPE_CAH_CTRL, CAH_X_MODE, 1);
++        cr_set_field(hnat_priv->ppe_base[ppe] + PPE_CAH_CTRL, CAH_X_MODE, 0);
++}
++
++void hnat_cache_invalidate(u32 ppe)
++{
++        unsigned long flags;
++
++        if (ppe >= CFG_PPE_NUM || !hnat_priv->ppe_base[ppe])
++                return;
++        spin_lock_irqsave(&hnat_cache_lock, flags);
++        /* Flush the affected PPE without enabling a cache paused by HNAT. */
++        __hnat_cache_invalidate(ppe);
++        spin_unlock_irqrestore(&hnat_cache_lock, flags);
++}
++
+ void hnat_cache_ebl(int enable)
+ {
+-	int i;
+-	for (i = 0; i < CFG_PPE_NUM; i++) {
+-		cr_set_field(hnat_priv->ppe_base[i] + PPE_CAH_CTRL, CAH_X_MODE, 1);
+-		cr_set_field(hnat_priv->ppe_base[i] + PPE_CAH_CTRL, CAH_X_MODE, 0);
+-		cr_set_field(hnat_priv->ppe_base[i] + PPE_CAH_CTRL, CAH_EN, enable);
+-	}
++        unsigned long flags;
++        int i;
++
++        spin_lock_irqsave(&hnat_cache_lock, flags);
++        for (i = 0; i < CFG_PPE_NUM; i++) {
++                __hnat_cache_invalidate(i);
++                cr_set_field(hnat_priv->ppe_base[i] + PPE_CAH_CTRL, CAH_EN, enable);
++        }
++        spin_unlock_irqrestore(&hnat_cache_lock, flags);
+ }
+ EXPORT_SYMBOL(hnat_cache_ebl);
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
++++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
+@@ -1414,6 +1414,7 @@
+ int hnat_enable_hook(void);
+ int hnat_disable_hook(void);
+ void hnat_cache_ebl(int enable);
++void hnat_cache_invalidate(u32 ppe);
+ void hnat_qos_shaper_ebl(u32 id, u32 enable);
+ void set_gmac_ppe_fwd(int gmac_no, int enable);
+ int entry_detail(u32 ppe_id, int index);
+@@ -1436,3 +1437,5 @@
+ {
+ 	return (readl(hnat_priv->fe_base + 0x0010)) & 0xffff;
+ }
++
++void foe_clear_crypto_entry(u32 cdrt_idx);
+--- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
++++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
+@@ -25,6 +25,7 @@
+ #include <net/ipv6.h>
+ #include <net/ip6_route.h>
+ #include <net/ip.h>
++#include <net/xfrm.h>
+ #include <net/route.h>
+ #include <net/addrconf.h>
+ #include <net/tcp.h>
+@@ -357,6 +358,50 @@
+ 	return i;
+ }
+ 
++/* SA/policy retirement uses the same accounting generation fence as all
++ * other HNAT owners. Inbound cleartext remains on the Linux policy path.
++ */
++void foe_clear_crypto_entry(u32 cdrt_idx)
++{
++#if defined(CONFIG_MEDIATEK_NETSYS_V3)
++        struct foe_entry snapshot, *entry;
++        u32 ppe, slot;
++        u64 generation;
++        bool accounted, changed;
++
++        if (!cdrt_idx || !hnat_external_callback_enter())
++                return;
++        for (ppe = 0; ppe < CFG_PPE_NUM; ppe++) {
++                if (!hnat_priv->foe_table_cpu[ppe])
++                        continue;
++                changed = false;
++                for (slot = 0; slot < hnat_priv->foe_etry_num; slot++) {
++                        spin_lock_bh(&hnat_priv->entry_lock);
++                        entry = &hnat_priv->foe_table_cpu[ppe][slot];
++                        accounted = hnat_account_clear_snapshot(hnat_priv, ppe, slot,
++                                                                 &snapshot, &generation);
++                        if (!accounted)
++                                snapshot = *entry;
++                        if (snapshot.bfib1.state == BIND &&
++                            ((IS_IPV4_HNAPT(&snapshot) && snapshot.ipv4_hnapt.cdrt_id == cdrt_idx) ||
++                             (IS_IPV6_5T_ROUTE(&snapshot) && snapshot.ipv6_5t_route.cdrt_id == cdrt_idx))) {
++                                if (!accounted ||
++                                    !hnat_account_clear_if_generation(hnat_priv, ppe, slot, false, generation)) {
++                                        entry->bfib1.state = INVALID;
++                                        dma_wmb();
++                                }
++                                changed = true;
++                        }
++                        spin_unlock_bh(&hnat_priv->entry_lock);
++                }
++                if (changed)
++                        hnat_cache_invalidate(ppe);
++        }
++        hnat_external_callback_exit();
++#endif
++}
++EXPORT_SYMBOL_GPL(foe_clear_crypto_entry);
++
+ static void foe_clear_all_bind_entries_body(void)
+ {
+ 	int i, hash_index;
+@@ -3123,6 +3168,9 @@
+ 	struct ethhdr *eth;
+ 	struct hnat_tunnel_token rx_token = {};
+ 	const struct mtk_npu_rx_meta *rx = mtk_npu_rx_meta_find(skb);
++
++	if (skb_sec_path(skb))
++                return NF_ACCEPT;
+ 
+ 	if (skb_hnat_alg(skb) || !is_hnat_info_filled(skb) ||
+ 	    !is_magic_tag_valid(skb) || !IS_SPACE_AVAILABLE_HEAD(skb))
+@@ -3644,7 +3692,7 @@
+ 	 * is from local_out which is also filtered in sanity check.
+ 	 */
+ 	dst = skb_dst(skb);
+-	if (dst && dst_xfrm(dst))
++	if (skb_sec_path(skb) || (dst && dst_xfrm(dst)))
+ 		return 0;
+ 
+ 	ct = nf_ct_get(skb, &ctinfo);
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1090,6 +1090,8 @@
+ 	void	(*xdo_dev_state_free) (struct xfrm_state *x);
+ 	bool	(*xdo_dev_offload_ok) (struct sk_buff *skb,
+ 				       struct xfrm_state *x);
++        /* Consumes skb on all paths; eligibility callbacks remain read-only. */
++        int     (*xdo_dev_packet_xmit)(struct sk_buff *skb, struct xfrm_state *x);
+ 	void	(*xdo_dev_state_advance_esn) (struct xfrm_state *x);
+ 	void	(*xdo_dev_state_update_curlft) (struct xfrm_state *x);
+ 	int	(*xdo_dev_policy_add) (struct xfrm_policy *x, struct netlink_ext_ack *extack);
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -761,6 +761,11 @@
+ 			return -EHOSTUNREACH;
+ 		}
+ 
++#ifdef CONFIG_XFRM_OFFLOAD
++                if (x->xso.dev->xfrmdev_ops->xdo_dev_packet_xmit)
++                        return x->xso.dev->xfrmdev_ops->xdo_dev_packet_xmit(skb, x);
++#endif
++
+ 		/* Exclusive direct xmit for tunnel mode, as
+ 		 * some filtering or matching rules may apply
+ 		 * in transport mode.
