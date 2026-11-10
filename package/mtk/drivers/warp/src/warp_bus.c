@@ -18,6 +18,7 @@
 #include "warp_hw.h"
 #include "warp_utility.h"
 #include "warp_meminfo_list.h"
+#include "warp_platform.h"
 
 #ifdef WARP_CPU_TRACER
 
@@ -88,23 +89,44 @@ int
 bus_config_init(struct warp_bus *bus)
 {
 	u32 size = 0;
+	u32 capacity;
+
+	if (!bus || !bus->warp_num ||
+	    bus->warp_num > warp_platform_wed_count())
+		return -EINVAL;
+	/* SoC setup fills the complete register layout, including unused WEDs. */
+	capacity = warp_platform_wed_count();
 
 	/* allocate memory according to warp number */
-	size = sizeof(void *) * bus->warp_num;
+	size = sizeof(void *) * capacity;
 	warp_os_alloc_mem((unsigned char **)&bus->base_addr, size, GFP_ATOMIC);
+	if (!bus->base_addr)
+		goto err_alloc;
 	memset(bus->base_addr, 0, size);
-	size = sizeof(u32) * bus->warp_num;
+	size = sizeof(u32) * capacity;
 	warp_os_alloc_mem((unsigned char **)&bus->pcie_base, size, GFP_ATOMIC);
+	if (!bus->pcie_base)
+		goto err_alloc;
 	memset(bus->pcie_base, 0, size);
 	warp_os_alloc_mem((unsigned char **)&bus->pcie_ints, size, GFP_ATOMIC);
+	if (!bus->pcie_ints)
+		goto err_alloc;
 	memset(bus->pcie_ints, 0, size);
 	warp_os_alloc_mem((unsigned char **)&bus->pcie_intm, size, GFP_ATOMIC);
+	if (!bus->pcie_intm)
+		goto err_alloc;
 	memset(bus->pcie_intm, 0, size);
 	warp_os_alloc_mem((unsigned char **)&bus->pcie_msis, size, GFP_ATOMIC);
+	if (!bus->pcie_msis)
+		goto err_alloc;
 	memset(bus->pcie_msis, 0, size);
 	warp_os_alloc_mem((unsigned char **)&bus->pcie_msim, size, GFP_ATOMIC);
+	if (!bus->pcie_msim)
+		goto err_alloc;
 	memset(bus->pcie_msim, 0, size);
 	warp_os_alloc_mem((unsigned char **)&bus->wpdma_base, size, GFP_ATOMIC);
+	if (!bus->wpdma_base)
+		goto err_alloc;
 	memset(bus->wpdma_base, 0, size);
 
 	bus_setup(bus);
@@ -113,6 +135,17 @@ bus_config_init(struct warp_bus *bus)
 #endif /*WARP_CPU_TRACER*/
 
 	return 0;
+
+err_alloc:
+	warp_os_free_mem(bus->wpdma_base);
+	warp_os_free_mem(bus->pcie_msim);
+	warp_os_free_mem(bus->pcie_msis);
+	warp_os_free_mem(bus->pcie_intm);
+	warp_os_free_mem(bus->pcie_ints);
+	warp_os_free_mem(bus->pcie_base);
+	warp_os_free_mem(bus->base_addr);
+	bus_remove(bus);
+	return -ENOMEM;
 }
 
 /*

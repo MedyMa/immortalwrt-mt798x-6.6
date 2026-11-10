@@ -663,7 +663,7 @@ VOID operate_loader_phy(struct wifi_dev *wdev, struct freq_cfg *cfg)
 		chandef->chan->freq_offset);
 #endif /*KERNEL_VERSION(5, 8, 0) > LINUX_VERSION_CODE || defined(BACKPORT_NOSTDINC)*/
 #if defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(6, 1, 0) <= CFG_CFG80211_VERSION)
-		cfg80211_ch_switch_notify(net_dev, chandef, 0, 0);
+		cfg80211_ch_switch_notify(net_dev, chandef, 0);
 #else
 		cfg80211_ch_switch_notify(net_dev, chandef);
 #endif /* CFG_CFG80211_VERSION */

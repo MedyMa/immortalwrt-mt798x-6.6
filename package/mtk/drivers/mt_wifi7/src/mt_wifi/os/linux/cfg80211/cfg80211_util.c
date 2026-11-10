@@ -538,13 +538,13 @@ static void CFG80211_sband_data_eht_cap_init(
 
 static void CFG80211_sband_data_init(
 	struct _RTMP_ADAPTER *pAd,
+	CFG80211_CB *cb,
 	struct _RTMP_ADAPTER *mac_ad,
 	struct __CFG80211_BAND *pDriverBandInfo,
 	enum nl80211_band band_idx,
 	struct ieee80211_supported_band *band_info,
 	UINT8 re_init)
 {
-	struct _RTMP_CHIP_CAP *chip_cap;
 	struct ieee80211_sband_iftype_data *data;
 	enum PHY_CAP phy_caps = 0;
 	struct mcs_nss_caps *nss_cap;
@@ -565,16 +565,15 @@ static void CFG80211_sband_data_init(
 			__func__, band_idx, NUM_NL80211_BANDS);
 		return;
 	}
-	chip_cap = PD_GET_CHIP_CAP_PTR(mac_ad->physical_dev);
 	phy_caps = pDriverBandInfo->phy_caps;
 	nss_cap = MCS_NSS_CAP(mac_ad);
-	data = &chip_cap->sband_data[band_idx];
+	data = &cb->sband_data[band_idx];
 	os_zero_mem(data, sizeof(struct ieee80211_sband_iftype_data));
-	data->types_mask = BIT(NL80211_IFTYPE_AP);
+	data->types_mask = BIT(NL80211_IFTYPE_AP) | BIT(NL80211_IFTYPE_STATION);
 	CFG80211_sband_data_he_cap_init(phy_caps, band_idx, data, pDriverBandInfo);
 	CFG80211_sband_data_eht_cap_init(pAd, phy_caps, nss_cap, band_idx, data);
 	band_info->n_iftype_data = 1;
-	band_info->iftype_data = &chip_cap->sband_data[band_idx];
+	band_info->iftype_data = &cb->sband_data[band_idx];
 
 	/*
 	 * ATE would call CFG80211OS_SupBandReInit directly
@@ -724,13 +723,9 @@ BOOLEAN CFG80211_SupBandInit(
 		pDriverBandInfo->RFICType = RFIC_24GHZ | RFIC_5GHZ | RFIC_6GHZ;
 
 	/* 1. Calcute the Channel Number */
-	NumOfChan = CFG80211_NUM_OF_CHAN_2GHZ;
-
-	if (pDriverBandInfo->RFICType & RFIC_5GHZ)
-		NumOfChan += CFG80211_NUM_OF_CHAN_5GHZ;
-
-	if (pDriverBandInfo->RFICType & RFIC_6GHZ)
-		NumOfChan += CFG80211_NUM_OF_CHAN_6GHZ;
+	/* All band pointers use these fixed offsets, including a 6-GHz-only radio. */
+	NumOfChan = CFG80211_NUM_OF_CHAN_2GHZ + CFG80211_NUM_OF_CHAN_5GHZ +
+		    CFG80211_NUM_OF_CHAN_6GHZ;
 
 	/*need to check why FlgIsBMode set to TRUE*/
 	NumOfRate = 4 + 8;
@@ -757,7 +752,8 @@ BOOLEAN CFG80211_SupBandInit(
 		pRates = kcalloc(NumOfRate, sizeof(*pRates), GFP_KERNEL);
 
 		if (!pRates) {
-			os_free_mem(pChannels);
+			if (!pChannelsOrg)
+				os_free_mem(pChannels);
 			MTWF_DBG(NULL, DBG_CAT_CFG80211, CATCFG80211_CMM, DBG_LVL_ERROR,
 				"80211> ieee80211_rate allocation fail!\n");
 			return FALSE;
@@ -793,7 +789,8 @@ BOOLEAN CFG80211_SupBandInit(
 		pChannels[IdLoop].flags = 0;
 
 		/* if (RadarChannelCheck(pAd, Cfg80211_Chan[IdLoop])) */
-		if (IsRadarChannel(Cfg80211_Chan[IdLoop])) {
+		if (pChannels[IdLoop].band == IEEE80211_BAND_5GHZ &&
+		    IsRadarChannel(Cfg80211_Chan[IdLoop])) {
 			MTWF_DBG(NULL, DBG_CAT_CHN, CATCHN_DFS, DBG_LVL_INFO,
 				"====> Radar Channel %d\n", Cfg80211_Chan[IdLoop]);
 #ifdef CFG80211_FULL_OPS_SUPPORT
@@ -901,7 +898,7 @@ BOOLEAN CFG80211_SupBandInit(
 		}
 #endif /* DOT11_N_SUPPORT */
 		CFG80211_sband_data_init(
-			pAd, mac_ad, pDriverBandInfo, IEEE80211_BAND_2GHZ, pBand, ReInit);
+			pAd, pCfg80211_CB, mac_ad, pDriverBandInfo, IEEE80211_BAND_2GHZ, pBand, ReInit);
 		pWiphy->bands[IEEE80211_BAND_2GHZ] = pBand;
 	} else {
 		pWiphy->bands[IEEE80211_BAND_2GHZ] = NULL;
@@ -997,17 +994,17 @@ BOOLEAN CFG80211_SupBandInit(
 					"80211 rx_vht_mcs=%04x\n", vht_mcs);
 
 		pBand->vht_cap.vht_mcs.rx_mcs_map = vht_mcs;
-		pBand->vht_cap.vht_mcs.rx_highest = cpu_to_le16(VHT_HIGH_RATE_BW80[2][pDriverBandInfo->RxStream & 0x03]);
+		pBand->vht_cap.vht_mcs.rx_highest = cpu_to_le16(VHT_HIGH_RATE_BW80[2][clamp_t(UINT32, pDriverBandInfo->RxStream, 1, 4) - 1]);
 
 		vht_mcs = get_vht_mcs_map(pDriverBandInfo->TxStream, IEEE80211_VHT_MCS_SUPPORT_0_9);
 		MTWF_DBG(NULL, DBG_CAT_CFG80211, CATCFG80211_CMM, DBG_LVL_DEBUG,
 					"80211 tx_vht_mcs=%04x\n", vht_mcs);
 
 		pBand->vht_cap.vht_mcs.tx_mcs_map = vht_mcs;
-		pBand->vht_cap.vht_mcs.tx_highest = cpu_to_le16(VHT_HIGH_RATE_BW80[2][pDriverBandInfo->TxStream & 0x03]);
+		pBand->vht_cap.vht_mcs.tx_highest = cpu_to_le16(VHT_HIGH_RATE_BW80[2][clamp_t(UINT32, pDriverBandInfo->TxStream, 1, 4) - 1]);
 #endif /* DOT11_VHT_AC */
 		CFG80211_sband_data_init(
-			pAd, mac_ad, pDriverBandInfo, IEEE80211_BAND_5GHZ, pBand, ReInit);
+			pAd, pCfg80211_CB, mac_ad, pDriverBandInfo, IEEE80211_BAND_5GHZ, pBand, ReInit);
 		pWiphy->bands[IEEE80211_BAND_5GHZ] = pBand;
 	} else {
 		pWiphy->bands[IEEE80211_BAND_5GHZ] = NULL;
@@ -1026,7 +1023,7 @@ BOOLEAN CFG80211_SupBandInit(
 			&pChannels[CFG80211_NUM_OF_CHAN_2GHZ + CFG80211_NUM_OF_CHAN_5GHZ];
 		pBand->bitrates = &pRates[4];
 		CFG80211_sband_data_init(
-			pAd, mac_ad, pDriverBandInfo, IEEE80211_BAND_6GHZ, pBand, ReInit);
+			pAd, pCfg80211_CB, mac_ad, pDriverBandInfo, IEEE80211_BAND_6GHZ, pBand, ReInit);
 		pWiphy->bands[IEEE80211_BAND_6GHZ] = pBand;
 	} else {
 		pWiphy->bands[IEEE80211_BAND_6GHZ] = NULL;
@@ -1087,10 +1084,10 @@ BOOLEAN CFG80211OS_SupBandReInit(
 		/* re-init bands */
 		cap = hc_get_chip_cap(mac_ad->hdev_ctrl);
 		pBandInfo->phy_caps = cap->phy_caps;
-		CFG80211_SupBandInit(pAd, pCfg80211_CB, pBandInfo, pWiphy,
+		if (!CFG80211_SupBandInit(pAd, pCfg80211_CB, pBandInfo, pWiphy,
 				pCfg80211_CB->pCfg80211_Channels,
-				pCfg80211_CB->pCfg80211_Rates,
-				TRUE);
+				pCfg80211_CB->pCfg80211_Rates, TRUE))
+			return FALSE;
 		/* re-init PHY */
 		pWiphy->rts_threshold = pBandInfo->RtsThreshold;
 		pWiphy->frag_threshold = pBandInfo->FragmentThreshold;
@@ -1396,7 +1393,7 @@ VOID CFG80211OS_Scaning(
 #if (KERNEL_VERSION(5, 0, 0) < LINUX_VERSION_CODE)
 		struct timespec64 tv;
 
-		ktime_get_real_ts64(&tv);
+		mt_ktime_get_real_ts64(&tv);
 		mgmt->u.probe_resp.timestamp = (((UINT64) tv.tv_sec * 1000000000) + tv.tv_nsec)/1000;
 #else
 		struct timeval tv;

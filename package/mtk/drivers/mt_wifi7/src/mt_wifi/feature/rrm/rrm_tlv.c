@@ -883,7 +883,7 @@ INT rrm_send_beacon_req_param(
 	Event->measuretype = BCN_MEASURE_REQ;
 	RTMPMoveMemory(Event->stamac, pBcnReq->peer_address, MAC_ADDR_LEN);
 	Event->DataLen = BcnReqLen;
-	NdisMoveMemory(Event->Data, pBcnReq, BcnReqLen);
+	NdisMoveMemory((UCHAR *)Event + offsetof(BCN_EVENT_DATA, Data), pBcnReq, BcnReqLen);
 
 	if (MlmeEnqueue(pAd, BCN_STATE_MACHINE, BCN_REQ, Len, pBuf, 0) == FALSE) {
 		NStatus = NDIS_STATUS_FAILURE;
@@ -979,7 +979,6 @@ VOID RRM_EnqueueNeighborRep(
 	IN PCHAR pSsid,
 	IN UINT8 SsidLen)
 {
-#define MIN(_x, _y) ((_x) > (_y) ? (_x) : (_y))
 	UINT loop;
 	HEADER_802_11 ActHdr;
 	PUCHAR pOutBuffer = NULL;
@@ -1043,8 +1042,8 @@ VOID RRM_EnqueueNeighborRep(
 			break;
 
 		if (SsidLen != 0)
-			BssMatch = RTMPEqualMemory(pBssEntry->Ssid, pSsid,
-									   MIN(SsidLen, pBssEntry->SsidLen));
+			BssMatch = SsidLen == pBssEntry->SsidLen &&
+						RTMPEqualMemory(pBssEntry->Ssid, pSsid, SsidLen);
 		else
 			BssMatch = TRUE;
 

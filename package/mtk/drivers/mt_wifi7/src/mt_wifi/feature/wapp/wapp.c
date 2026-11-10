@@ -3959,13 +3959,17 @@ INT	wapp_event_handle(
 			PWSC_CTRL pWscControl = NULL;
 
 #ifdef RT_CFG80211_SUPPORT
-			struct net_device *pNetDev = nl_wdev->netdev;
+			struct net_device *pNetDev;
+
+			if (!nl_wdev || !nl_wdev->netdev)
+				return -EINVAL;
+			pNetDev = nl_wdev->netdev;
 #else
 			POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;
 #endif
 
 #ifdef RT_CFG80211_SUPPORT
-			ifIndex = CFG80211_FindStaIdxByNetDevice(pAd, pNetDev);
+			ifIndex = CFG80211_FindApcliIdxByNetDevice(pAd, pNetDev);
 			if (ifIndex == WDEV_NOT_FOUND) {
 				MTWF_DBG(pAd, DBG_CAT_AP, CATAP_WAPP, DBG_LVL_ERROR,
 					"failed - [ERROR] can't find ifIndex in driver.\n");
@@ -3974,7 +3978,8 @@ INT	wapp_event_handle(
 #else
 			ifIndex = pObj->ioctl_if;
 #endif
-			if (ifIndex >= pAd->ApCfg.BssidNum) {
+			if (ifIndex < 0 || ifIndex >= pAd->ApCfg.ApCliNum ||
+			    ifIndex >= MAX_APCLI_NUM || ifIndex >= MAX_MULTI_STA) {
 				MTWF_DBG(pAd, DBG_CAT_PROTO, CATPROTO_RRM, DBG_LVL_ERROR,
 					"Unknown If index (%d)", ifIndex);
 				return NDIS_STATUS_FAILURE;

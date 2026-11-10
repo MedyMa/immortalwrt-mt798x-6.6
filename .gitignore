@@ -38,4 +38,5 @@ git-src
 
 !/dl/datconf*
 !/dl/mt79*
+!/dl/mt_wifi_osal-a53418.tar.xz
 !/dl/warp*

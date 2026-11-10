@@ -88,12 +88,30 @@ void mt_synchronize_rcu(void)
 }
 EXPORT_SYMBOL(mt_synchronize_rcu);
 
+void mt_rcu_barrier(void)
+{
+	rcu_barrier();
+}
+EXPORT_SYMBOL(mt_rcu_barrier);
+
+void *mt_skb_pull_rcsum(struct sk_buff *skb, unsigned int len)
+{
+	return skb_pull_rcsum(skb, len);
+}
+EXPORT_SYMBOL(mt_skb_pull_rcsum);
+
 
 ktime_t mt_ktime_get(void)
 {
 	return ktime_get();
 }
 EXPORT_SYMBOL(mt_ktime_get);
+
+void mt_ktime_get_real_ts64(struct timespec64 *ts)
+{
+	ktime_get_real_ts64(ts);
+}
+EXPORT_SYMBOL(mt_ktime_get_real_ts64);
 
 
 ktime_t mt_ktime_get_with_offset(enum tk_offsets offs)
@@ -212,7 +230,8 @@ EXPORT_SYMBOL(mt_devm_kzalloc);
 
 int mt_init_dummy_netdev(struct net_device *dev)
 {
-	return init_dummy_netdev(dev);
+	init_dummy_netdev(dev);
+	return 0;
 }
 EXPORT_SYMBOL(mt_init_dummy_netdev);
 

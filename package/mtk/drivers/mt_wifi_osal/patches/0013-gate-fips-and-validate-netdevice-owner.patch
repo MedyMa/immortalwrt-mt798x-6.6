@@ -1,0 +1,110 @@
+Subject: osal: require an explicitly enabled FIPS transport and validate its netdevice
+
+--- a/mt_osal_genl.c
++++ b/mt_osal_genl.c
+@@ -2,6 +2,7 @@
+ /* Copyright (C) 2024 MediaTek Inc. */
+ #include <linux/version.h>
+ #include <linux/netdevice.h>
++#include <linux/rtnetlink.h>
+ #include <linux/types.h>
+ #include <linux/proc_fs.h>
+ #include <linux/version.h>
+@@ -69,7 +70,7 @@
+ 	struct net_device *dev = NULL;
+ 	struct mt_net_dev_priv *net_priv_info = NULL;
+ 	struct mt_cmm_genl_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+-	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig, *pIoctlConfig = &IoctlConfig;
++	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig = {}, *pIoctlConfig = &IoctlConfig;
+ 	unsigned int attr_tmp;
+ 	int ret;
+ 
+@@ -92,26 +93,26 @@
+ 		return -EINVAL;
+ 	}
+ 
+-#if KERNEL_VERSION(4, 12, 0) <= LINUX_VERSION_CODE
+-	if (nla_validate(na, na->nla_len, MT_CMM_GENL_ATTR_MAX, mt_cmm_genl_policy, NULL))
+-#else
+-	if (nla_validate(na, na->nla_len, MT_CMM_GENL_ATTR_MAX, mt_cmm_genl_policy))
+-#endif
+-	{
+-		MT_DEBUG_ERROR("nla_validate fail!!!\n");
+-		return -EINVAL;
+-	}
++	/* Generic Netlink has already checked this attribute against the policy. */
+ 
+ 	ctrl_data_ptr->data = (unsigned char *) nla_data(na);
+ 	ctrl_data_ptr->data_len = (unsigned short) nla_len(na);
+ 	ctrl_data_ptr->info = (void *) info;
+ 	ctrl_data_ptr->attr = attr_tmp;
+ 
++	rtnl_lock();
+ 	dev = dev_get_by_name(genl_info_net(info), "ra0");
+ 
+ 	if (!dev) {
+ 		MT_DEBUG_ERROR("genl_rev not find net_dev ra0\n");
+-		return -EFAULT;
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++
++	/* Legacy WiFi7/WEXT uses a different netdev_priv layout. */
++	if (!dev->netdev_ops || dev->netdev_ops->ndo_do_ioctl != mt_os_wifi_ioctl) {
++		ret = -EOPNOTSUPP;
++		goto out_dev;
+ 	}
+ 
+ 	net_priv_info = (struct mt_net_dev_priv *)netdev_priv((struct net_device *)dev);
+@@ -130,10 +131,13 @@
+ 	pIoctlConfig->priv_flags = mt_os_net_dev_get_priv_flags(dev);
+ 	pIoctlConfig->cmd = MT_IO_CMM_GENL;
+ 	pIoctlConfig->data = ctrl_data_ptr;
++	pIoctlConfig->data_len = sizeof(*ctrl_data_ptr);
+ 	ret = net_priv_info->ioctl(dev, pIoctlConfig);
+ 
+ out_dev:
+ 	dev_put(dev);
++out_unlock:
++	rtnl_unlock();
+ 	return ret;
+ }
+ 
+@@ -189,7 +193,7 @@
+ 		return ret;
+ 	}
+ 
+-	MT_DEBUG_ERROR("register FIPS 140-3 genl family (ret=%d, family_id=%d)!!!\n",
++	MT_DEBUG_INFO("register FIPS 140-3 genl family (ret=%d, family_id=%d)!!!\n",
+ 		ret, fips_140_3_genl_family.id);
+ 
+ 	return ret;
+@@ -206,7 +210,7 @@
+ 		return ret;
+ 	}
+ 
+-	MT_DEBUG_ERROR("unregister FIPS 140-3 genl family(ret=%d)!!!\n", ret);
++	MT_DEBUG_INFO("unregister FIPS 140-3 genl family(ret=%d)!!!\n", ret);
+ 
+ 	return ret;
+ }
+@@ -215,13 +219,19 @@
+ {
+ 	MT_DEBUG_TRACE("loaded");
+ 
++#ifdef CONFIG_MTK_WIFI_OSAL_FIPS_SUPPORT
+ 	return mtk_cmm_genl_register();
++#else
++	return 0;
++#endif
+ }
+ sub_module_init(mt_osal_genl_init);
+ 
+ DECLARE_SUB_MODULE_EXIT(mt_osal_genl_exit)
+ {
+ 	MT_DEBUG_TRACE("unloaded");
++#ifdef CONFIG_MTK_WIFI_OSAL_FIPS_SUPPORT
+ 	mtk_cmm_genl_unregister();
++#endif
+ }
+ sub_module_exit(mt_osal_genl_exit);

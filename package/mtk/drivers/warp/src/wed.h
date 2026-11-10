@@ -463,6 +463,8 @@ void wed_token_buf_reduce(struct wed_entry *entry, u32 grp_num);
 u32 wed_get_entry_num(void);
 u8 wed_get_slot_map(u32 idx);
 void wed_ser_dump(struct wed_entry *wed);
+int wed_ser_init(struct wed_entry *wed);
+void wed_ser_exit(struct wed_entry *wed);
 void wed_procinfo_dump(struct wed_entry *wed, struct seq_file *seq, int idx);
 int wed_fdesc_init(struct wed_entry *wed, struct wed_pkt_info *info);
 int wed_acquire_rx_token(struct wed_entry *wed, struct warp_dma_cb *cb, u32 *token_id);

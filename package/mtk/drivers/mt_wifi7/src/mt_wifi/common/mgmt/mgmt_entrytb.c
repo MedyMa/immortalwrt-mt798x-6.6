@@ -912,7 +912,8 @@ INT MacTableResetEntry(RTMP_ADAPTER *pAd, MAC_TABLE_ENTRY *pEntry, BOOLEAN clean
 #endif /* CONFIG_LINUX_CRYPTO */
 #endif /* SW_CONNECT_SUPPORT */
 
-	NdisZeroMemory(&pEntry->EntryType, sizeof(MAC_TABLE_ENTRY)-sizeof(STA_TR_ENTRY));
+	NdisZeroMemory((UCHAR *)pEntry + offsetof(MAC_TABLE_ENTRY, EntryType),
+		sizeof(MAC_TABLE_ENTRY) - offsetof(MAC_TABLE_ENTRY, EntryType));
 
 	if (clean == TRUE) {
 		pEntry->MaxSupportedRate = RATE_11;
@@ -2407,9 +2408,9 @@ VOID mac_entry_delete(
 	MTWF_DBG(ad, DBG_CAT_MLME, CATMLME_WTBL, DBG_LVL_NOTICE,
 		"(caller:%pS): wcid %d ==("MACSTR") del State=%d\n", OS_TRACE,
 		entry->wcid, MAC2STR(entry->Addr), entry->EntryDelState);
-	physical_device_workq_add_job(
-		ad, NULL, MAIN_WORKQ_DEL_MAC_ENTRY_TAG, buf, sizeof(buf), rm_now);
-	entry->EntryDelState = ENTRY_STATE_SYNC;
+	if (physical_device_workq_add_job(
+		ad, NULL, MAIN_WORKQ_DEL_MAC_ENTRY_TAG, buf, sizeof(buf), rm_now))
+		entry->EntryDelState = ENTRY_STATE_SYNC;
 	NdisReleaseSpinLock(ad->MacTabLock);
 }
 

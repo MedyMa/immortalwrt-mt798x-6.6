@@ -748,7 +748,7 @@ mtk_wsys_mld_sta_entry_alloc(struct mtk_hw_dev *dev, u32 mld_sta_idx,
 	else
 		memcpy(entry, old_entry, sizeof(struct mtk_mld_sta_entry));
 
-	if (entry->sys_idx->idx != mld_sta_idx) {
+	if (!entry->sys_idx || entry->sys_idx->idx != mld_sta_idx) {
 		ret = -ENXIO;
 		goto err2;
 	}

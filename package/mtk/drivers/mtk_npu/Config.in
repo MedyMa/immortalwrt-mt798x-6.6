@@ -22,7 +22,7 @@ config MTK_NPU_24_10_TUNNEL_BACKEND
 	bool "Enable 24.10 TOPS/HNAT tunnel backend"
 	depends on !MTK_NPU_24_10_DPDK_BACKEND
 	depends on !MTK_NPU_24_10_FLOW_BACKEND
-	default y
+	default n
 	help
 	  Integrated HNAT backend for basic IPv4 GRETAP, VXLAN, L2TPv2 and PPTP.
 	  Unsupported packets keep software forwarding. Requires matching kernel,
@@ -32,7 +32,7 @@ config MTK_NPU_24_10_MCAST_BACKEND
 	bool "Enable 24.10 TOPS/HNAT multicast backend"
 	depends on !MTK_NPU_24_10_DPDK_BACKEND
 	depends on !MTK_NPU_24_10_FLOW_BACKEND
-	default y
+	default n
 	help
 	  Replicate IPv4/IPv6 ASM bridge groups through the NPU using kernel
 	  MDB membership. Unsupported clients, source filters and VLAN groups

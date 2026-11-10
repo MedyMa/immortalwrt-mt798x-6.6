@@ -1332,7 +1332,7 @@ static VOID sync_fsm_scan_timeout_action(struct _RTMP_ADAPTER *pAd, MLME_QUEUE_E
 			UpdateChannelInfo(pAd, pAd->ApCfg.current_channel_index, pAd->ApCfg.AutoChannelAlg, wdev);
 #ifdef ZERO_PKT_LOSS_SUPPORT
 			read_channel_stats(pAd, BandIdx, &(ScanCtrl->OffCannelScanStopStats));
-			pAd->ScanCtrl.ScanTimeEndMibEvent = ktime_get();
+			pAd->ScanCtrl.ScanTimeEndMibEvent = mt_ktime_get();
 			pAd->ScanCtrl.ScanTimeDiff =
 				ktime_to_ms(ktime_sub(pAd->ScanCtrl.ScanTimeEndMibEvent,
 				pAd->ScanCtrl.ScanTimeStartMibEvent)) + 1;
@@ -2209,7 +2209,7 @@ static VOID sync_fsm_peer_request_idle_action(struct _RTMP_ADAPTER *pAd, MLME_QU
 
 	NdisZeroMemory(ProbeReqParam, sizeof(PEER_PROBE_REQ_PARAM));
 	if (PeerProbeReqSanity(pAd, Elem->Msg, Elem->MsgLen, ProbeReqParam) == FALSE) {
-		MTWF_DBG(pAd, DBG_CAT_MLME, CATMLME_SYNC, DBG_LVL_ERROR,
+		MTWF_DBG(pAd, DBG_CAT_MLME, CATMLME_SYNC, DBG_LVL_WARN,
 			"PeerProbeReqSanity failed!\n");
 		os_free_mem(ProbeReqParam);
 		return;

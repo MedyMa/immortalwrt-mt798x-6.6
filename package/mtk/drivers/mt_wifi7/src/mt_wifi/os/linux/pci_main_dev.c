@@ -509,7 +509,9 @@ static VOID DEVEXIT rt_pci_remove(struct pci_dev *pci_dev)
 		pci_release_regions(pci_dev);
 	} else {
 		/* Unregister network device */
-		RtmpOSNetDevDetach(net_dev);
+		RtmpOSNetDevProtect(1);
+		RtmpOSNetDevDetachRTNL(net_dev);
+		RtmpOSNetDevProtect(0);
 		/* Unmap CSR base address */
 		iounmap((char *)(net_dev->base_addr));
 		/* release memory region */

@@ -493,33 +493,34 @@ VOID RTMPFreeNdisPacketIRQ(VOID *pReserved, PNDIS_PACKET pPacket)
 
 PNDIS_PACKET ClonePacket(BOOLEAN MonitorOn, PNET_DEV ndev, PNDIS_PACKET pkt, UCHAR *buf, ULONG sz)
 {
-	struct sk_buff *pRxPkt, *pClonedPkt;
+	struct sk_buff *source = RTPKT_TO_OSPKT(pkt), *clone;
+	unsigned long linear;
 
-	if (pkt == NULL) {
-		MTWF_DBG(NULL, DBG_CAT_CFG, CATCFG_TX, DBG_LVL_ERROR, "Error! pkt is NULL\n");
-		ASSERT(pkt);
+	if (!source || !buf || (unsigned long)buf < (unsigned long)source->head ||
+	    (unsigned long)buf > (unsigned long)skb_tail_pointer(source))
+		return NULL;
+	linear = skb_tail_pointer(source) - buf;
+	if (linear > UINT_MAX - source->data_len || sz > linear + source->data_len)
+		return NULL;
+
+	clone = skb_clone(source, MEM_ALLOC_FLAG);
+	if (!clone)
+		return NULL;
+	/* Keep data_len, fragments and tail consistent when selecting an MSDU. */
+	clone->data = buf;
+	clone->len = linear + clone->data_len;
+	/* The selected view no longer covers the parent's checksum bytes. */
+	if (clone->ip_summed == CHECKSUM_COMPLETE || clone->ip_summed == CHECKSUM_PARTIAL) {
+		clone->ip_summed = CHECKSUM_NONE;
+		clone->csum = 0;
+		clone->csum_valid = 0;
+	}
+	if (pskb_trim(clone, sz)) {
+		kfree_skb(clone);
 		return NULL;
 	}
-
-#ifdef SNIFFER_SUPPORT
-	if (!MonitorOn)
-#endif /* SNIFFER_SUPPORT */
-		ASSERT(sz < RX_DATA_BUFFER_SIZE);
-
-	pRxPkt = RTPKT_TO_OSPKT(pkt);
-	/* clone the packet */
-	pClonedPkt = skb_clone(pRxPkt, MEM_ALLOC_FLAG);
-
-	if (pClonedPkt) {
-		/* set the correct dataptr and data len */
-		MEM_DBG_PKT_ALLOC_INC(pClonedPkt);
-		pClonedPkt->dev = pRxPkt->dev;
-		pClonedPkt->data = buf;
-		pClonedPkt->len = sz;
-		SET_OS_PKT_DATATAIL(pClonedPkt, pClonedPkt->len);
-	}
-
-	return pClonedPkt;
+	MEM_DBG_PKT_ALLOC_INC(clone);
+	return clone;
 }
 
 
@@ -965,20 +966,17 @@ static inline NDIS_STATUS __RtmpOSTaskKill(OS_TASK *pTask)
 {
 	int ret = NDIS_STATUS_FAILURE;
 #ifdef KTHREAD_SUPPORT
+	struct task_struct *task = xchg(&pTask->kthread_task, NULL);
+	int exit_code;
 
-	if (pTask->kthread_task) {
-		if (kthread_stop(pTask->kthread_task) == 0) {
-			pTask->kthread_task = NULL;
-			ret = NDIS_STATUS_SUCCESS;
-		} else {
-			MTWF_DBG(NULL, DBG_CAT_INIT, CATINIT_TASK, DBG_LVL_WARN,
-				"kthread_task %s stop failed\n",
-				pTask->taskName);
-		}
-	} else
-		MTWF_DBG(NULL, DBG_CAT_INIT, CATINIT_TASK, DBG_LVL_WARN,
-				"null kthread_task %s\n",
-				pTask->taskName);
+	if (!IS_ERR_OR_NULL(task)) {
+		/* The return value is the thread's exit code, not a stop failure. */
+		exit_code = kthread_stop(task);
+		WRITE_ONCE(pTask->task_killed, 1);
+		ret = NDIS_STATUS_SUCCESS;
+		MTWF_DBG(NULL, DBG_CAT_INIT, CATINIT_TASK, DBG_LVL_INFO,
+			"task %s stopped with status %d\n", pTask->taskName, exit_code);
+	}
 
 #else
 	if (CHECK_PID_LEGALITY(pTask->taskPID)) {
@@ -1056,6 +1054,13 @@ static inline void __RtmpOSTaskCustomize(OS_TASK *pTask)
 #endif
 }
 
+static int RtmpOSTaskThread(void *data)
+{
+	OS_TASK *pTask = data;
+
+	return pTask->kthread_fn(pTask->kthread_arg);
+}
+
 
 static inline NDIS_STATUS __RtmpOSTaskAttach(
 	IN OS_TASK *pTask,
@@ -1079,8 +1084,10 @@ static inline NDIS_STATUS __RtmpOSTaskAttach(
 	}
 
 RETRY:
-	pTask->kthread_task = kthread_run((cast_fn)fn, (void *)arg,
-									  pTask->taskName);
+	pTask->kthread_fn = fn;
+	pTask->kthread_arg = arg;
+	pTask->kthread_task = kthread_run(RtmpOSTaskThread, pTask,
+						       "%s", pTask->taskName);
 
 	if (IS_ERR(pTask->kthread_task)) {
 		MTWF_DBG(NULL, DBG_CAT_INIT, CATINIT_TASK, DBG_LVL_ERROR,
@@ -1088,7 +1095,7 @@ RETRY:
 				pTask->taskName, PTR_ERR(pTask->kthread_task));
 
 		/* just an interrupted system call */
-		if ((PTR_ERR(pTask->kthread_task) == EINTR) && (retry < 5)) {
+		if ((PTR_ERR(pTask->kthread_task) == -EINTR) && (retry < 5)) {
 			retry++;
 			mdelay(1);
 			goto RETRY;
@@ -1127,15 +1134,12 @@ static inline NDIS_STATUS __RtmpOSTaskInit(
 	IN VOID *pPriv,
 	IN LIST_HEADER *pSemList)
 {
-	int len;
-
-	ASSERT(pTask);
+	if (!pTask || !pTaskName)
+		return NDIS_STATUS_FAILURE;
 #ifndef KTHREAD_SUPPORT
 	os_zero_mem((PUCHAR) (pTask), sizeof(OS_TASK));
 #endif
-	len = strlen(pTaskName);
-	len = len > (RTMP_OS_TASK_NAME_LEN - 1) ? (RTMP_OS_TASK_NAME_LEN - 1) : len;
-	os_move_mem(&pTask->taskName[0], pTaskName, len);
+	strscpy(pTask->taskName, pTaskName, sizeof(pTask->taskName));
 	pTask->priv = pPriv;
 #ifndef KTHREAD_SUPPORT
 	RTMP_SEM_EVENT_INIT_LOCKED(&(pTask->taskSema), pSemList);
@@ -1143,6 +1147,9 @@ static inline NDIS_STATUS __RtmpOSTaskInit(
 	init_completion(&pTask->taskComplete);
 #endif
 #ifdef KTHREAD_SUPPORT
+	pTask->kthread_task = NULL;
+	pTask->kthread_running = false;
+	pTask->task_killed = 0;
 	init_waitqueue_head(&(pTask->kthread_q));
 #endif /* KTHREAD_SUPPORT */
 	return NDIS_STATUS_SUCCESS;
@@ -1645,7 +1652,15 @@ void RtmpOSNetDevFree(PNET_DEV pNetDev)
 
 #if (KERNEL_VERSION(2, 5, 0) <= LINUX_VERSION_CODE)
 #if (KERNEL_VERSION(2, 6, 31) <= LINUX_VERSION_CODE)
-	tmp_ptr = (void *)pNetDev->netdev_ops;
+	if (pNetDev->priv_destructor == RtmpOSNetDevOpsFree) {
+		/* The unregister path owns ops, including a deferred free under RTNL.
+		 * An attach failure before registration still needs manual cleanup.
+		 */
+		if (pNetDev->reg_state == NETREG_UNINITIALIZED)
+			RtmpOSNetDevOpsFree(pNetDev);
+		tmp_ptr = NULL;
+	} else
+		tmp_ptr = (void *)pNetDev->netdev_ops;
 #endif
 	free_netdev(pNetDev);
 #if (KERNEL_VERSION(2, 6, 31) <= LINUX_VERSION_CODE)
@@ -1679,6 +1694,7 @@ void RtmpOSNetDevOpsFree(PNET_DEV pNetDev)
 	}
 
 	pNetDevOps = (void *)pNetDev->netdev_ops;
+	pNetDev->netdev_ops = NULL;
 	if (pNetDevOps)
 		vfree(pNetDevOps);
 }
@@ -1775,17 +1791,47 @@ INT RtmpOSNetDevDestory(VOID *pReserved, PNET_DEV pNetDev)
 }
 
 
+/* Caller holds RTNL and, for a cfg80211 device, its wiphy lock. */
 void RtmpOSNetDevDetach(PNET_DEV pNetDev)
 {
-#if defined(CCN34_SPLIT_MAC_SUPPORT) && defined(ACTION_MONITOR_SUPPORT)
-	/* ccn34 action monitor is not support cfg80211 interface for now */
-	unregister_netdevice(pNetDev);
-	return;
-#endif
+	if (!pNetDev || pNetDev->reg_state != NETREG_REGISTERED)
+		return;
 #if defined(RT_CFG80211_SUPPORT) && defined(BACKPORT_NOSTDINC)
-	cfg80211_unregister_netdevice(pNetDev);
-#else
-	unregister_netdevice(pNetDev);
+	if (pNetDev->ieee80211_ptr)
+		cfg80211_unregister_netdevice(pNetDev);
+	else
+#endif
+		unregister_netdevice(pNetDev);
+}
+
+/* Module teardown holds RTNL but has not acquired a wiphy lock. */
+void RtmpOSNetDevDetachRTNL(PNET_DEV pNetDev)
+{
+#if defined(RT_CFG80211_SUPPORT) && defined(BACKPORT_NOSTDINC)
+	struct wireless_dev *wdev;
+#endif
+
+	ASSERT_RTNL();
+	if (!pNetDev || pNetDev->reg_state != NETREG_REGISTERED)
+		return;
+#if defined(RT_CFG80211_SUPPORT) && defined(BACKPORT_NOSTDINC)
+	wdev = pNetDev->ieee80211_ptr;
+	if (wdev)
+		wiphy_lock(wdev->wiphy);
+#endif
+#if defined(RT_CFG80211_SUPPORT) && (defined(IWCOMMAND_CFG80211_SUPPORT) || defined(HOSTAPD_MBSS_SUPPORT))
+	{
+		PRTMP_ADAPTER ad = NULL;
+
+		GET_PAD_FROM_NET_DEV(ad, pNetDev);
+		if (ad)
+			RTMP_CFG80211_RemoveVifEntry(ad, pNetDev);
+	}
+#endif
+	RtmpOSNetDevDetach(pNetDev);
+#if defined(RT_CFG80211_SUPPORT) && defined(BACKPORT_NOSTDINC)
+	if (wdev)
+		wiphy_unlock(wdev->wiphy);
 #endif
 }
 
@@ -1826,9 +1872,19 @@ int RtmpOSNetDevAttach(
 {
 	int ret, rtnl_locked = FALSE;
 #if (KERNEL_VERSION(2, 6, 31) <= LINUX_VERSION_CODE)
-	struct net_device_ops *pNetDevOps = (struct net_device_ops *)pNetDev->netdev_ops;
+	struct net_device_ops *pNetDevOps;
 #endif
 	PRTMP_ADAPTER pAd = NULL;
+#ifdef RT_CFG80211_SUPPORT
+	BOOLEAN cfg_created = FALSE;
+#endif
+
+	if (!pNetDev || !pDevOpHook || !pNetDev->netdev_ops ||
+	    pNetDev->reg_state != NETREG_UNINITIALIZED)
+		return NDIS_STATUS_FAILURE;
+#if (KERNEL_VERSION(2, 6, 31) <= LINUX_VERSION_CODE)
+	pNetDevOps = (struct net_device_ops *)pNetDev->netdev_ops;
+#endif
 
 	MTWF_DBG(NULL, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_INFO, "--->\n");
 
@@ -1874,7 +1930,13 @@ int RtmpOSNetDevAttach(
 		}
 
 #ifdef RT_CFG80211_SUPPORT
-		RTMP_DRIVER_CFG80211_REGISTER(pNetDev);
+		/* Only the bootstrap netdevice creates a radio. VIFs borrow its wiphy. */
+		if (pAd->net_dev == pNetDev && !pNetDev->ieee80211_ptr) {
+			if (pDevOpHook->needProtcted ||
+			    !CFG80211_Register(pAd, rtmp_get_dev(pAd), pNetDev))
+				return NDIS_STATUS_FAILURE;
+			cfg_created = TRUE;
+		}
 #endif /* RT_CFG80211_SUPPORT */
 #if (KERNEL_VERSION(2, 6, 31) <= LINUX_VERSION_CODE)
 		pNetDevOps->ndo_open = pDevOpHook->open;
@@ -1943,6 +2005,8 @@ int RtmpOSNetDevAttach(
 #if (KERNEL_VERSION(2, 6, 24) <= LINUX_VERSION_CODE)
 #if (KERNEL_VERSION(2, 6, 31) <= LINUX_VERSION_CODE)
 	pNetDevOps->ndo_validate_addr = NULL;
+	pNetDev->priv_destructor = RtmpOSNetDevOpsFree;
+	pNetDev->needs_free_netdev = false;
 	/*pNetDev->netdev_ops = ops; */
 #else
 	pNetDev->validate_addr = NULL;
@@ -1965,13 +2029,20 @@ int RtmpOSNetDevAttach(
 #endif
 
 #if	defined(RT_CFG80211_SUPPORT) && defined(BACKPORT_NOSTDINC)
-	netdev_set_priv_destructor(pNetDev, RtmpOSNetDevOpsFree);
+	if (!pNetDev->ieee80211_ptr)
+		return NDIS_STATUS_FAILURE;
+	pNetDev->priv_destructor = RtmpOSNetDevOpsFree;
 	if (rtnl_locked) {
 		ret = cfg80211_register_netdevice(pNetDev);
 	} else {
-		if (rtnl_lock_killable())
+		if (rtnl_lock_killable()) {
+			if (cfg_created)
+				CFG80211_UnRegister(pAd, pNetDev);
 			return -EINTR;
+		}
+		wiphy_lock(pNetDev->ieee80211_ptr->wiphy);
 		ret = cfg80211_register_netdevice(pNetDev);
+		wiphy_unlock(pNetDev->ieee80211_ptr->wiphy);
 		rtnl_unlock();
 	}
 #else
@@ -1985,6 +2056,10 @@ int RtmpOSNetDevAttach(
 	MTWF_DBG(NULL, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_INFO,
 		"<---ret=%d\n", ret);
 
+#ifdef RT_CFG80211_SUPPORT
+	if (ret && cfg_created)
+		CFG80211_UnRegister(pAd, pNetDev);
+#endif
 	if (ret == 0)
 		return NDIS_STATUS_SUCCESS;
 	else
@@ -2604,15 +2679,9 @@ UINT32 RtmpOsCsumAdd(UINT32 csum, UINT32 addend)
 
 VOID RtmpOsSkbPullRcsum(struct sk_buff *skb, unsigned int len)
 {
-	if (len > skb->len)
+	if (!skb || !pskb_may_pull(skb, len))
 		return;
-
-	skb_pull(skb, len);
-	if (skb->ip_summed == CHECKSUM_COMPLETE)
-		skb->csum = RtmpOsCsumAdd(skb->csum, ~csum_partial(skb->data, len, 0));
-	else if (skb->ip_summed == CHECKSUM_PARTIAL &&
-		 (skb->csum_start - (skb->data - skb->head)) < 0)
-		skb->ip_summed = CHECKSUM_NONE;
+	mt_skb_pull_rcsum(skb, len);
 }
 
 VOID RtmpOsSkbResetMacHeader(struct sk_buff *skb)
@@ -2715,7 +2784,8 @@ VOID RtmpOsPktNatMagicTag(PNDIS_PACKET pNetPkt)
 {
 	struct sk_buff *pRxPkt = RTPKT_TO_OSPKT(pNetPkt);
 
-	FOE_MAGIC_TAG(pRxPkt) = FOE_MAGIC_WLAN;
+	if (IS_SPACE_AVAILABLE_HEAD(pRxPkt))
+		FOE_MAGIC_TAG(pRxPkt) = FOE_MAGIC_WLAN;
 }
 #endif /*CONFIG_FAST_NAT_SUPPORT*/
 
@@ -2724,7 +2794,8 @@ VOID RtmpOsPktNatMagicTagInvalid(PNDIS_PACKET pNetPkt)
 {
 	struct sk_buff *pRxPkt = RTPKT_TO_OSPKT(pNetPkt);
 
-	FOE_TAG_PROTECT(pRxPkt) = 0;
+	if (IS_SPACE_AVAILABLE_HEAD(pRxPkt))
+		FOE_TAG_PROTECT(pRxPkt) = 0;
 }
 #endif
 /*
@@ -4125,4 +4196,7 @@ VOID os_module_exit(VOID)
 	physical_device_exit();
 
 	rt_profile_deinit();
+
+	/* All callback producers are stopped. Their code belongs to mt_wifi. */
+	mt_rcu_barrier();
 }

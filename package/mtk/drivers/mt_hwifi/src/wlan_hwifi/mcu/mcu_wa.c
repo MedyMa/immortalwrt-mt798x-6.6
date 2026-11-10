@@ -195,7 +195,7 @@ mcu_wa_load_ram(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
 		if (ret)
 			goto end;
 
-		if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
+		if (!fw || !mcu_fw_layout_valid(fw->data, fw->size)) {
 			dev_err(dev->dev, "Invalid firmware\n");
 			ret = -EINVAL;
 			goto out;
@@ -206,8 +206,14 @@ mcu_wa_load_ram(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
 		data_ptr = fw->data;
 	} else {
 		data_ptr = mcu_entry->fw_ram[mcu_entry->fw_mode];
-		if (!data_ptr) {
+		if (!data_ptr || mcu_entry->fw_ram_hdr_len[mcu_entry->fw_mode] < sizeof(*hdr)) {
 			dev_err(dev->dev, "Invalid firmware\n");
+			ret = -EINVAL;
+			goto out;
+		}
+		if (!mcu_fw_layout_valid(data_ptr,
+			mcu_entry->fw_ram_hdr_len[mcu_entry->fw_mode])) {
+			dev_err(dev->dev, "Invalid firmware region layout\n");
 			ret = -EINVAL;
 			goto out;
 		}
@@ -303,7 +309,11 @@ static int
 mcu_wa_rx_prepare(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry, struct sk_buff *skb,
 	struct mtk_mcu_resp *rx_info)
 {
-	struct mcu_rxd *rxd = (struct mcu_rxd *)skb->data;
+	struct mcu_rxd *rxd;
+
+	if (!pskb_may_pull(skb, max_t(unsigned int, sizeof(*rxd), mcu_entry->mcu_rxd_sz)))
+		return -EBADMSG;
+	rxd = (struct mcu_rxd *)skb->data;
 
 	skb_pull(skb, mcu_entry->mcu_rxd_sz);
 	rx_info->seq = rxd->seq;
@@ -341,14 +351,15 @@ mcu_wa_get_fw_info(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry, char
 	char *key = "t-neptune";
 	const char *ram_ver;
 	const char *data_ptr = NULL;
-	u32 data_size;
+	size_t data_size, tail_len;
+
 
 	if (mcu_entry->applied_method == BIN_METHOD) {
 		ret = request_firmware(&fw, mcu_entry->fw_ram[mcu_entry->fw_mode], dev->dev);
 		if (ret)
 			return;
 
-		if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
+		if (!fw || !mcu_fw_layout_valid(fw->data, fw->size)) {
 			dev_err(dev->dev, "Invalid firmware\n");
 			release_firmware(fw);
 			return;
@@ -359,9 +370,14 @@ mcu_wa_get_fw_info(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry, char
 		data_size = fw->size;
 	} else {
 		data_ptr = mcu_entry->fw_ram[mcu_entry->fw_mode];
-		if (!data_ptr) {
+		if (!data_ptr || mcu_entry->fw_ram_hdr_len[mcu_entry->fw_mode] < sizeof(*hdr)) {
 			dev_err(dev->dev, "Invalid firmware\n");
 			ret = -EINVAL;
+			return;
+		}
+		if (!mcu_fw_layout_valid(data_ptr,
+			mcu_entry->fw_ram_hdr_len[mcu_entry->fw_mode])) {
+			dev_err(dev->dev, "Invalid firmware region layout\n");
 			return;
 		}
 		hdr = (const struct mcu_fw_trailer *)
@@ -369,21 +385,22 @@ mcu_wa_get_fw_info(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry, char
 		data_size = mcu_entry->fw_ram_hdr_len[mcu_entry->fw_mode];
 	}
 
-	ret = snprintf(fw_ver, 10, "%s", hdr->fw_ver);
+	ret = snprintf(fw_ver, 10, "%.10s", hdr->fw_ver);
 	if (ret < 0) {
 		dev_err(dev->dev, "%s(): fw_ver parse error\n", __func__);
 		fw_ver[0] = '\0';
 	}
-	ret = snprintf(build_date, 15, "%s", hdr->build_date);
+	ret = snprintf(build_date, 15, "%.15s", hdr->build_date);
 	if (ret < 0) {
 		dev_err(dev->dev, "%s(): build_date parse error\n", __func__);
 		build_date[0] = '\0';
 	}
 
-	memcpy(tmpbuf, data_ptr + data_size - sizeof(tmpbuf), sizeof(tmpbuf));
-	ram_ver = mtk_mcu_mem_find(tmpbuf, sizeof(tmpbuf), key, strlen(key));
+	tail_len = min_t(size_t, data_size, sizeof(tmpbuf) - 1);
+	memcpy(tmpbuf, data_ptr + data_size - tail_len, tail_len);
+	ram_ver = mtk_mcu_mem_find(tmpbuf, tail_len, key, strlen(key));
 	if (ram_ver) {
-		ret = snprintf(fw_ver_long, strlen(ram_ver), "%s", ram_ver);
+		ret = snprintf(fw_ver_long, 128, "%s", ram_ver);
 		if (ret < 0) {
 			dev_err(dev->dev, "%s(): fw_ver_long parse error\n", __func__);
 			fw_ver_long[0] = '\0';

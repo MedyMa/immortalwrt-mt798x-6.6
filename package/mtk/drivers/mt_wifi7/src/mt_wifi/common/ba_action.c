@@ -1431,7 +1431,7 @@ void ba_flush_reordering_timeout_mpdus(PRTMP_ADAPTER pAd, struct BA_REC_ENTRY *p
 		}
 		skb = RTPKT_TO_OSPKT(mpdu_blk->pPacket);
 #ifdef PROPRIETARY_DRIVER_SUPPORT
-		ktime_get_real_ts64(&kts64);
+		mt_ktime_get_real_ts64(&kts64);
 		kts = timespec64_to_ktime(kts64);
 		TimeDelta = ktime_to_ms(ktime_sub(kts, skb->tstamp));
 #else
@@ -1490,7 +1490,7 @@ void ba_flush_reordering_timeout_mpdus(PRTMP_ADAPTER pAd, struct BA_REC_ENTRY *p
 
 		skb = RTPKT_TO_OSPKT(mpdu_blk->pPacket);
 #ifdef PROPRIETARY_DRIVER_SUPPORT
-		ktime_get_real_ts64(&kts64);
+		mt_ktime_get_real_ts64(&kts64);
 		kts = timespec64_to_ktime(kts64);
 		TimeDelta = ktime_to_ms(ktime_sub(kts, skb->tstamp));
 #else
@@ -2345,7 +2345,7 @@ BOOLEAN ba_resrc_rec_add(
 
 		if ((ba_ctl->dbg_flag & SN_HISTORY) && (ba_ctl->numAsRecipient < 5)) {
 			if (pBAEntry->ba_rec_dbg != NULL) {
-				MTWF_DBG(pAd, DBG_CAT_PROTO, CATPROTO_BA, DBG_LVL_ERROR,
+				MTWF_DBG(pAd, DBG_CAT_PROTO, CATPROTO_BA, DBG_LVL_DEBUG,
 					"Freeing previous Debug BA Rec %p\n",
 					pBAEntry->ba_rec_dbg);
 				os_free_mem(pBAEntry->ba_rec_dbg);
@@ -3270,7 +3270,7 @@ static VOID ba_enqueue_reordering_packet(
 		msdu_blk->pPacket = pRxBlk->pRxPacket;
 
 #ifdef PROPRIETARY_DRIVER_SUPPORT
-		ktime_get_real_ts64(&kts64);
+		mt_ktime_get_real_ts64(&kts64);
 		RTPKT_TO_OSPKT(msdu_blk->pPacket)->tstamp = timespec64_to_ktime(kts64);
 #else
 		__net_timestamp(RTPKT_TO_OSPKT(msdu_blk->pPacket));
@@ -3381,7 +3381,7 @@ static VOID ba_enqueue_reordering_packet(
 		msdu_blk->pPacket = pRxBlk->pRxPacket;
 
 #ifdef PROPRIETARY_DRIVER_SUPPORT
-		ktime_get_real_ts64(&kts64);
+		mt_ktime_get_real_ts64(&kts64);
 		RTPKT_TO_OSPKT(msdu_blk->pPacket)->tstamp = timespec64_to_ktime(kts64);
 #else
 		__net_timestamp(RTPKT_TO_OSPKT(msdu_blk->pPacket));

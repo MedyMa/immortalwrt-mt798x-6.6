@@ -1,0 +1,56 @@
+From: medyma <medyma@users.noreply.github.com>
+Subject: [PATCH] wifi_osal: expose the shared PMKSA ABI independently of cfg80211
+
+The WEXT station handler also uses these command IDs and request fields.
+Keep their original values and layout in a standalone header so including
+mt_osal.h without CFG80211_SUPPORT does not hide the shared declarations.
+
+--- a/inc/mt_osal_cfg80211.h
++++ b/inc/mt_osal_cfg80211.h
+@@ -2,6 +2,8 @@
+ /* Copyright (C) 2024 MediaTek Inc. */
+ #ifndef __MT_OSAL_CFG80211_H_
+ #define __MT_OSAL_CFG80211_H_
++
++#include "mt_osal_pmksa.h"
+ 
+ #ifdef CFG80211_SUPPORT
+ #include <linux/version.h>
+@@ -540,15 +542,6 @@
+ 	int akmp;	/* AKM protocol */
+ };
+ 
+-#define MTK_CMD_STA_IOCTL_PMA_SA_FLUSH		0x01
+-#define MTK_CMD_STA_IOCTL_PMA_SA_REMOVE		0x02
+-#define MTK_CMD_STA_IOCTL_PMA_SA_ADD		0x03
+-struct mt_priv_pmksa_info {
+-	u32 Cmd;
+-	u8 *pBssid;
+-	u8 *pPmkid;
+-	void *pNetDev;
+-};
+ 
+ enum nl80211_band mt_cfg80211_get_nl80211_band(unsigned short phy_mode);
+ enum nl80211_chan_width mt_phy_bw_2_nl_bw(int mtk_width);
+--- /dev/null
++++ b/inc/mt_osal_pmksa.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
++/* Copyright (C) 2024 MediaTek Inc. */
++#ifndef __MT_OSAL_PMKSA_H_
++#define __MT_OSAL_PMKSA_H_
++
++#include <linux/types.h>
++
++/* Shared with the WEXT driver even when legacy cfg80211 is disabled. */
++#define MTK_CMD_STA_IOCTL_PMA_SA_FLUSH		0x01
++#define MTK_CMD_STA_IOCTL_PMA_SA_REMOVE		0x02
++#define MTK_CMD_STA_IOCTL_PMA_SA_ADD		0x03
++struct mt_priv_pmksa_info {
++	u32 Cmd;
++	u8 *pBssid;
++	u8 *pPmkid;
++	void *pNetDev;
++};
++
++#endif /* __MT_OSAL_PMKSA_H_ */

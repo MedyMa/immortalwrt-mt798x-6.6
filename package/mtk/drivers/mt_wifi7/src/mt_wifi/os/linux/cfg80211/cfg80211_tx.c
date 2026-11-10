@@ -284,6 +284,7 @@ VOID CFG80211_AssocRespHandler(RTMP_ADAPTER *pAd, VOID *pData, ULONG Data)
 
 #endif /* HOSTAPD_11R_SUPPORT */
 
+#ifdef CONFIG_DOT11V_WNM
 NDIS_STATUS CFG80211_LEGACY_BtmReqHandler(RTMP_ADAPTER *pAd, VOID *pData, ULONG Data)
 {
 	struct BSS_TM_REQ *pPayload = NULL;
@@ -1028,14 +1029,16 @@ NDIS_STATUS CFG80211_MLO_BtmReqHandler(RTMP_ADAPTER *pAd, VOID *pData, ULONG Dat
 
 	return NDIS_STATUS_SUCCESS;
 }
-#endif
-
+#endif /* DOT11_EHT_BE */
+#endif /* CONFIG_DOT11V_WNM */
 
 INT CFG80211_SendMgmtFrame(RTMP_ADAPTER *pAd, VOID *pData, ULONG Data_len)
 {
 	UCHAR	*pBuf = NULL;
 	ULONG Data = Data_len;
+#ifdef CONFIG_DOT11V_WNM
 	struct BSS_TM_REQ *pPayload = NULL;
+#endif /* CONFIG_DOT11V_WNM */
 
 	if (Data > MAX_MGMT_PKT_LEN) {
 		MTWF_DBG(pAd, DBG_CAT_TX, CATTX_MGMT, DBG_LVL_ERROR,
@@ -1120,6 +1123,8 @@ INT CFG80211_SendMgmtFrame(RTMP_ADAPTER *pAd, VOID *pData, ULONG Data_len)
 		}
 #endif
 
+#ifdef CONFIG_DOT11V_WNM
+
 		if (ieee80211_is_action(mgmt->frame_control)) {
 
 			pPayload = (struct BSS_TM_REQ *)(&mgmt->u);
@@ -1171,6 +1176,8 @@ INT CFG80211_SendMgmtFrame(RTMP_ADAPTER *pAd, VOID *pData, ULONG Data_len)
 				}
 			}
 		}
+
+#endif /* CONFIG_DOT11V_WNM */
 
 #ifdef CUSTOMISED_MGMT_TRANS_SUPPORT
 		if (ieee80211_is_deauth(mgmt->frame_control)) {

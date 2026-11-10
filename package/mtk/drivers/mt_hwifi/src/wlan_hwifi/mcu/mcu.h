@@ -191,7 +191,7 @@ struct uni_event_cmd_result {
  * struct mtk_mcu_resp - MCU response format
  *
  * @param rx_data: point to rx response data buffer
- * @param rx_len: length of rx response data
+ * @param rx_len: buffer capacity on input, received data length on success
  * @param seq: sequence number for related to tx command
  */
 struct mtk_mcu_resp {
@@ -495,7 +495,7 @@ mtk_mcu_mem_find(const char *src, size_t src_len, const char *target, size_t tar
  * @mcu_type: type of mcu, ex: wa, wm, wo....
  * @fw_ver: fw version
  * @build_date: fw build date
- * @fw_ver_long: fw version built by server, ex:t-neptune.......
+ * @fw_ver_long: 128-byte buffer for the server build version
  *
  * Return: No need to return
  */

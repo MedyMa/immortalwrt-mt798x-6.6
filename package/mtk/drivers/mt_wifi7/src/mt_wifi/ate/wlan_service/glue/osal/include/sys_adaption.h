@@ -83,6 +83,8 @@ typedef struct serv_os_task {
 	struct task_struct *kthread_task;
 	wait_queue_head_t kthread_q;
 	boolean kthread_running;
+	s_int32 (*kthread_fn)(u_long);
+	u_long kthread_arg;
 } SERV_OS_TASK;
 typedef s_int32(*SERV_OS_TASK_CALLBACK) (u_long);
 

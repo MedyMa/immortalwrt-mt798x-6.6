@@ -9,7 +9,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=crypto-eip
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_FILE_DEPENDS:=$(CURDIR)/src/ $(CURDIR)/firmware/
 PKG_BUILD_DEPENDS:=pce
 PKG_CONFIG_DEPENDS:= \
@@ -49,7 +49,7 @@ define Build/Compile
 		$(KERNEL_MAKE_FLAGS) \
 		M="$(PKG_BUILD_DIR)" \
 		EXTRA_CFLAGS="$(EXTRA_CFLAGS)" \
-		KBUILD_EXTRA_SYMBOLS="$(KERNEL_BUILD_DIR)/pce/Module.symvers" \
+		KBUILD_EXTRA_SYMBOLS="$(PKG_SYMVERS_DIR)/pce.symvers" \
 		$(EXTRA_KCONFIG) \
 		modules
 endef

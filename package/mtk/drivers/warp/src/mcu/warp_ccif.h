@@ -34,4 +34,16 @@ struct ccif_entry {
 };
 
 /* exported API*/
+
+struct warp_bus_ring;
+void warp_ccif_tx_ring_get_hw(void *hw, struct warp_bus_ring *ring);
+void warp_ccif_rx_ring_get_hw(void *hw, struct warp_bus_ring *ring);
+void warp_ccif_kickout(void *hw);
+void warp_ccif_isr_ctrl(void *hw, bool enable);
+void warp_ccif_set_ack(void *hw);
+u32 warp_ccif_get_rxchnum(void *hw);
+void warp_ccif_clear_int(void *hw);
+
+struct woif_bus;
+void ccif_bus_register(struct woif_bus *bus);
 #endif /* __WARP_CCIF_H__ */

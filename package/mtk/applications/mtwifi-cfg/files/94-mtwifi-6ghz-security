@@ -1,0 +1,25 @@
+#!/bin/sh
+. /lib/functions.sh
+changed=0
+failed=0
+fix_6ghz_default() {
+	local section="$1" device band mode encryption ssid
+	config_get device "$section" device
+	config_get band "$device" band
+	[ "$band" = 6g ] || return 0
+	config_get mode "$section" mode ap
+	[ "$mode" = ap ] || return 0
+	config_get encryption "$section" encryption none
+	# Migrate only the old generated open default; retain explicit security.
+	[ "$encryption" = none ] || return 0
+	config_get ssid "$section" ssid
+	[ "$ssid" = ImmortalWrt-6G ] || return 0
+	uci -q set "wireless.$section.encryption=owe" || { failed=1; return 1; }
+	uci -q set "wireless.$section.ieee80211w=2" || { failed=1; return 1; }
+	changed=1
+}
+config_load wireless
+config_foreach fix_6ghz_default wifi-iface
+[ "$failed" -eq 0 ] || exit 1
+[ "$changed" -eq 0 ] || uci -q commit wireless || exit 1
+exit 0

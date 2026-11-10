@@ -1,0 +1,34 @@
+Subject: osal: preserve ID lookups and allocate safely under the container lock
+
+--- a/mt_osal_util.c
++++ b/mt_osal_util.c
+@@ -117,7 +117,7 @@
+ 
+ 	spin_lock_bh(&id_ctx->lock);
+ 	ret = idr_alloc(&id_ctx->id, data, id_ctx->low, id_ctx->high+1,
+-		allow_suspend? GFP_KERNEL: GFP_ATOMIC);
++		GFP_ATOMIC); /* id_ctx->lock forbids sleeping, even if permitted by the caller */
+ 	if (ret < 0) {
+ 		goto err;
+ 	}
+@@ -148,7 +148,7 @@
+ 
+ 
+ 	spin_lock_bh(&id_ctx->lock);
+-	data = idr_remove(&id_ctx->id, id);
++	data = idr_find(&id_ctx->id, id);
+ 	spin_unlock_bh(&id_ctx->lock);
+ 
+ 	return data;
+@@ -197,8 +197,9 @@
+ 	mt_os_dynamic_id_t *id_ctx = (mt_os_dynamic_id_t *)ctx;
+ 
+ 	spin_lock_bh(&id_ctx->lock);
+-	ret = ida_alloc_range(&id_ctx->id, id_ctx->low, id_ctx->high+1,
+-		allow_suspend? GFP_KERNEL: GFP_ATOMIC);
++	/* ida_alloc_range() has an inclusive upper bound, unlike idr_alloc(). */
++	ret = ida_alloc_range(&id_ctx->id, id_ctx->low, id_ctx->high,
++		GFP_ATOMIC); /* the enclosing spinlock forbids sleeping */
+ 	if (ret < 0) {
+ 		goto err;
+ 	}

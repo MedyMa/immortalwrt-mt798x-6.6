@@ -196,7 +196,7 @@ wed_rx_bm_ring_init(
 	return ret;
 }
 
-int
+static int __maybe_unused
 wed_rx_bm_token_deinit(
 	struct wed_entry *wed,
 	struct warp_rx_ring *ring,
@@ -233,7 +233,7 @@ wed_rx_bm_token_deinit(
 	return ret;
 }
 
-int
+static int
 wed_rx_bm_token_init(
 	struct wed_entry *wed,
 	u8 ring_idx,

@@ -1,0 +1,86 @@
+Subject: osal: complete the WiFi compatibility ABI and expose callback drainage
+
+--- a/mt_osal_wifi_compat.c
++++ b/mt_osal_wifi_compat.c
+@@ -6,6 +6,9 @@
+  * that mt_wifi itself does not import GPL-only kernel symbols.
+  */
+ #include <linux/ktime.h>
++#include <linux/oom.h>
++#include <linux/slab.h>
++#include <linux/firmware.h>
+ #include <linux/timekeeping.h>
+ #include <linux/workqueue.h>
+ #include <linux/skbuff.h>
+@@ -52,3 +55,46 @@
+ }
+ EXPORT_SYMBOL(mt_cfg80211_vendor_cmd_reply);
+ #endif
++
++void mt_rcu_barrier(void)
++{
++	rcu_barrier();
++}
++EXPORT_SYMBOL(mt_rcu_barrier);
++
++ktime_t mt_ktime_get_with_offset(enum tk_offsets offs)
++{
++	return ktime_get_with_offset(offs);
++}
++EXPORT_SYMBOL(mt_ktime_get_with_offset);
++
++int mt_register_oom_notifier(struct notifier_block *nb)
++{
++	return register_oom_notifier(nb);
++}
++EXPORT_SYMBOL(mt_register_oom_notifier);
++
++int mt_unregister_oom_notifier(struct notifier_block *nb)
++{
++	return unregister_oom_notifier(nb);
++}
++EXPORT_SYMBOL(mt_unregister_oom_notifier);
++
++void *mt_devm_kmalloc(struct device *dev, size_t size, gfp_t gfp)
++{
++	return devm_kmalloc(dev, size, gfp);
++}
++EXPORT_SYMBOL(mt_devm_kmalloc);
++
++void *mt_devm_kzalloc(struct device *dev, size_t size, gfp_t gfp)
++{
++	return devm_kzalloc(dev, size, gfp);
++}
++EXPORT_SYMBOL(mt_devm_kzalloc);
++
++int mt_firmware_request_nowarn(const struct firmware **firmware,
++			       const char *name, struct device *dev)
++{
++	return firmware_request_nowarn(firmware, name, dev);
++}
++EXPORT_SYMBOL(mt_firmware_request_nowarn);
+--- a/inc/mt_osal.h
++++ b/inc/mt_osal.h
+@@ -11,6 +11,7 @@
+ 
+ #include <linux/version.h>
+ #include <linux/rcupdate.h>
++#include <linux/oom.h>
+ #include <linux/timekeeping.h>
+ #include <net/cfg80211.h>
+ #include <linux/debugfs.h>
+@@ -47,6 +48,14 @@
+ #include "mt_osal_genl.h"
+ 
+ /* Compatibility ABI used by the proprietary MTK WiFi driver. */
++void mt_rcu_barrier(void);
++ktime_t mt_ktime_get_with_offset(enum tk_offsets offs);
++int mt_register_oom_notifier(struct notifier_block *nb);
++int mt_unregister_oom_notifier(struct notifier_block *nb);
++void *mt_devm_kmalloc(struct device *dev, size_t size, gfp_t gfp);
++void *mt_devm_kzalloc(struct device *dev, size_t size, gfp_t gfp);
++int mt_firmware_request_nowarn(const struct firmware **firmware,
++			       const char *name, struct device *dev);
+ struct workqueue_struct *mt_create_workqueue(const char *name);
+ void mt_init_delayed_work(struct delayed_work *work, work_func_t func);
+ void mt_flush_workqueue(struct workqueue_struct *wq);

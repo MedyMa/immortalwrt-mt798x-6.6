@@ -247,7 +247,7 @@ void diag_frame_cache(struct _DIAG_FRAME_INFO *info, struct _DIAG_CTRL *pCtrl)
 		return;
 	}
 	memset(entry, 0, sizeof(struct _DIAG_LOG_ENTRY));
-	ktime_get_real_ts64(&txc);
+	mt_ktime_get_real_ts64(&txc);
 	entry->tm = rtc_ktime_to_tm(txc.tv_sec);
 
 	entry->isTX = info->isTX;
@@ -1084,7 +1084,7 @@ void diag_conn_error(PRTMP_ADAPTER pAd, UCHAR apidx, UCHAR *addr,
 	}
 	memset(entry, 0, sizeof(struct DIAG_ASSOC_ERROR_ENTRY));
 	/*collect error info*/
-	ktime_get_real_ts64(&txc);
+	mt_ktime_get_real_ts64(&txc);
 	entry->tm = rtc_ktime_to_tm(txc.tv_sec);
 	memcpy(entry->StaAddr, addr, 6);
 	if (pAd->ApCfg.MBSSID[apidx].SsidLen > 0 && pAd->ApCfg.MBSSID[apidx].SsidLen <= 32)

@@ -1799,7 +1799,7 @@ UINT32 hc_get_asic_cap(void *hdev_ctrl)
 /*
 *
 */
-VOID hc_set_mac_cap(void *hdev_ctrl, UINT32 caps)
+VOID hc_set_mac_cap(void *hdev_ctrl, enum MAC_CAP caps)
 {
 	struct hdev_ctrl *ctrl = hdev_ctrl;
 	struct _RTMP_ADAPTER *ad = hc_get_hdev_privdata(ctrl);
@@ -1811,7 +1811,7 @@ VOID hc_set_mac_cap(void *hdev_ctrl, UINT32 caps)
 /*
 *
 */
-VOID hc_set_phy_cap(void *hdev_ctrl, UINT32 caps)
+VOID hc_set_phy_cap(void *hdev_ctrl, enum PHY_CAP caps)
 {
 	struct hdev_ctrl *ctrl = hdev_ctrl;
 	struct _RTMP_ADAPTER *ad = hc_get_hdev_privdata(ctrl);

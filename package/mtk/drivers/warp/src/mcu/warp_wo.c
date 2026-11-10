@@ -581,12 +581,12 @@ err:
 	return ret;
 }
 
-void wo_log_handle(char *msg, u16 msg_len, void *user_data)
+static void wo_log_handle(char *msg, u16 msg_len, void *user_data)
 {
 	warp_dbg(WARP_DBG_OFF, " [WO LOG]: %s(): %s\n", __func__, msg);
 }
 
-void wo_profiling_statistic(struct profiling_statistic_t *record, u32 value, u8 lvl_bound)
+static void wo_profiling_statistic(struct profiling_statistic_t *record, u32 value, u8 lvl_bound)
 {
 	u8 lvl = 0;
 
@@ -599,7 +599,7 @@ void wo_profiling_statistic(struct profiling_statistic_t *record, u32 value, u8 
 	}
 }
 
-void wo_profiling_dump_clr(struct profiling_statistic_t *report, u8 count)
+static void wo_profiling_dump_clr(struct profiling_statistic_t *report, u8 count)
 {
 	u8 loop = 0;
 
@@ -619,7 +619,7 @@ void wo_profiling_dump_clr(struct profiling_statistic_t *report, u8 count)
 	}
 }
 
-void wo_profiling_handle(char *msg, u16 msg_len, void *user_data)
+static void wo_profiling_handle(char *msg, u16 msg_len, void *user_data)
 {
 	u8 report_cnt = 0, loop = 0;
 	struct latency_record_t *record = NULL;
@@ -668,7 +668,7 @@ void wo_rxcnt_update_handle(char *msg, u16 msg_len, void *user_data)
 
 }
 
-void wo_log_event_register(struct warp_entry *warp)
+static void wo_log_event_register(struct warp_entry *warp)
 {
 	warp_dbg(WARP_DBG_INF, "%s(): wo_log_event_register: idx is %d\n", __func__, warp->idx);
 	register_wo_event_handler(warp->idx, WO_EVT_LOG_DUMP, wo_log_handle, warp);

@@ -355,7 +355,7 @@ err:
 }
 #endif
 
-int
+static int
 wdma_ring_init(struct wdma_entry *wdma)
 {
 	struct wdma_res_ctrl *res = &wdma->res_ctrl;
@@ -400,7 +400,7 @@ wdma_ring_init(struct wdma_entry *wdma)
 	return ret;
 }
 
-void
+static void
 wdma_ring_exit(struct wdma_entry *wdma)
 {
 	struct wdma_res_ctrl *res = &wdma->res_ctrl;

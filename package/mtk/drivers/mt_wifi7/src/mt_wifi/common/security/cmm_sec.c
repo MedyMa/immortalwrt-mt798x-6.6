@@ -1887,37 +1887,39 @@ VOID store_pmkid_cache_in_sec_config(
 	if (cache_idx == INVALID_PMKID_IDX) {
 		pEntry->SecConfig.pmkid = NULL;
 		pEntry->SecConfig.pmk_cache = NULL;
-	} else {
-		if (IS_ENTRY_CLIENT(pEntry)) {
+		return;
+	}
+
 #ifdef CONFIG_AP_SUPPORT
-			if ((cache_idx < 0) || (cache_idx >= MAX_PMKID_COUNT)) {
-				MTWF_DBG(pAd, DBG_CAT_SEC, CATSEC_PMK, DBG_LVL_ERROR,
-					"cache idx(%d) error\n", cache_idx);
-				return;
-			}
-			pEntry->SecConfig.pmkid =
-				PD_GET_PMKID_PTR(pAd->physical_dev)->BSSIDInfo[cache_idx].PMKID;
-			pEntry->SecConfig.pmk_cache =
-				PD_GET_PMKID_PTR(pAd->physical_dev)->BSSIDInfo[cache_idx].PMK;
+	if (IS_ENTRY_CLIENT(pEntry)) {
+		if ((cache_idx < 0) || (cache_idx >= MAX_PMKID_COUNT)) {
+			MTWF_DBG(pAd, DBG_CAT_SEC, CATSEC_PMK, DBG_LVL_ERROR,
+				"cache idx(%d) error\n", cache_idx);
+			return;
+		}
+		pEntry->SecConfig.pmkid =
+			PD_GET_PMKID_PTR(pAd->physical_dev)->BSSIDInfo[cache_idx].PMKID;
+		pEntry->SecConfig.pmk_cache =
+			PD_GET_PMKID_PTR(pAd->physical_dev)->BSSIDInfo[cache_idx].PMK;
+	}
 #endif
 #ifdef CONFIG_STA_SUPPORT
-			{
-				PSTA_ADMIN_CONFIG pStaCfg = GetStaCfgByWdev(pAd, pEntry->wdev);
-				if ((cache_idx < 0) || (cache_idx >= PMKID_NO)) {
-					MTWF_DBG(pAd, DBG_CAT_SEC, CATSEC_PMK, DBG_LVL_ERROR,
-						"cache idx(%d) error\n", cache_idx);
-					return;
-				}
-				if (pStaCfg) {
-					pEntry->SecConfig.pmkid = pStaCfg->SavedPMK[cache_idx].PMKID;
-					pEntry->SecConfig.pmk_cache = pStaCfg->SavedPMK[cache_idx].PMK;
-				} else
-					MTWF_DBG(pAd, DBG_CAT_SEC, CATSEC_PMK, DBG_LVL_ERROR,
-							"pStaCfg is null\n");
-			}
-#endif
+	if (IS_ENTRY_PEER_AP(pEntry)) {
+		PSTA_ADMIN_CONFIG pStaCfg = GetStaCfgByWdev(pAd, pEntry->wdev);
+
+		if ((cache_idx < 0) || (cache_idx >= PMKID_NO)) {
+			MTWF_DBG(pAd, DBG_CAT_SEC, CATSEC_PMK, DBG_LVL_ERROR,
+				"cache idx(%d) error\n", cache_idx);
+			return;
 		}
+		if (pStaCfg) {
+			pEntry->SecConfig.pmkid = pStaCfg->SavedPMK[cache_idx].PMKID;
+			pEntry->SecConfig.pmk_cache = pStaCfg->SavedPMK[cache_idx].PMK;
+		} else
+			MTWF_DBG(pAd, DBG_CAT_SEC, CATSEC_PMK, DBG_LVL_ERROR,
+				"pStaCfg is null\n");
 	}
+#endif
 }
 
 UCHAR is_pmkid_cache_in_sec_config(

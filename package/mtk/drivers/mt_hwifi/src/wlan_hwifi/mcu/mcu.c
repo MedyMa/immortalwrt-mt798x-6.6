@@ -30,6 +30,7 @@
 
 #include <linux/kernel.h>
 #include <linux/firmware.h>
+#include <asm/unaligned.h>
 #include "mcu.h"
 #include "core.h"
 
@@ -61,9 +62,16 @@ static int
 mcu_write_back_resp(struct mtk_mcu_resp *rx_info, struct mtk_mcu_resp *resp)
 {
 	if (resp && resp->rx_data) {
+		/* rx_len is the destination capacity until a response is copied. */
+		if (rx_info->rx_len < 0 || resp->rx_len < 0 ||
+		    rx_info->rx_len > resp->rx_len)
+			return -EMSGSIZE;
+		if (rx_info->rx_len && !rx_info->rx_data)
+			return -EBADMSG;
+		if (rx_info->rx_len)
+			memcpy(resp->rx_data, rx_info->rx_data, rx_info->rx_len);
 		resp->rx_len = rx_info->rx_len;
 		resp->seq = rx_info->seq;
-		memcpy(resp->rx_data, rx_info->rx_data, rx_info->rx_len);
 	}
 	return 0;
 }
@@ -78,6 +86,8 @@ mcu_parse_response(struct mtk_hw_dev *dev,
 
 	if (!mcu_entry->ops->rx_prepare)
 		return -EOPNOTSUPP;
+	if (skb_linearize(skb))
+		return -ENOMEM;
 
 	/*handle specific mcu header*/
 	ret = mcu_entry->ops->rx_prepare(dev, mcu_entry, skb, &rx_info);
@@ -90,18 +100,16 @@ mcu_parse_response(struct mtk_hw_dev *dev,
 	if (mcu_txblk->seq != rx_info.seq)
 		return -EAGAIN;
 
-	result = (struct uni_event_cmd_result *)rx_info.rx_data;
-	if (result &&
-		mcu_txblk->uni_cmd &&
-		mcu_txblk->action == MCU_ACT_SET &&
-		mcu_txblk->ack &&
-		mcu_txblk->cmd != result->cid)
-		return -EAGAIN;
+	if (mcu_txblk->uni_cmd && mcu_txblk->action == MCU_ACT_SET &&
+	    mcu_txblk->ack) {
+		result = rx_info.rx_data;
+		if (!result || rx_info.rx_len < sizeof(*result))
+			return -EBADMSG;
+		if (mcu_txblk->cmd != get_unaligned_le16(&result->cid))
+			return -EAGAIN;
+	}
 
-	if (mcu_write_back_resp(&rx_info, mcu_txblk->resp))
-		return -EINVAL;
-
-	return ret;
+	return mcu_write_back_resp(&rx_info, mcu_txblk->resp);
 }
 
 static int
@@ -589,7 +597,7 @@ mtk_mcu_mem_find(const char *src, size_t src_len, const char *target, size_t tar
 	if (target == NULL)
 		return NULL;
 
-	if (target_len <= 1)
+	if (target_len <= 1 || target_len > src_len)
 		return NULL;
 
 	last = src + src_len - target_len;
@@ -607,7 +615,16 @@ mtk_mcu_get_fw_info(struct mtk_hw_dev *dev, int mcu_type, char *fw_ver, char *bu
 			char *fw_ver_long)
 {
 	struct mtk_mcu_ctrl *mcu_ctrl = &dev->mcu_ctrl;
-	struct mtk_mcu_entry *mcu_entry = &mcu_ctrl->entries[mcu_type];
+	struct mtk_mcu_entry *mcu_entry;
+
+	if (!fw_ver || !build_date || !fw_ver_long)
+		return;
+	fw_ver[0] = '\0';
+	build_date[0] = '\0';
+	fw_ver_long[0] = '\0';
+	if (mcu_type < 0 || mcu_type >= MCU_MAX)
+		return;
+	mcu_entry = &mcu_ctrl->entries[mcu_type];
 
 	if (!mcu_entry->ops || !mcu_entry->ops->get_fw_info)
 		return;

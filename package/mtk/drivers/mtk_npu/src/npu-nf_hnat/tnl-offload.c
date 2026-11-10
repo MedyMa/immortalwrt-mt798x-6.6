@@ -34,6 +34,7 @@
 
 #include "npu-nf_hnat/internal.h"
 #include "npu-nf_hnat/tnl-offload.h"
+#include "npu-nf_hnat/candidate.h"
 
 static int mtk_npu_nf_hnat_tnl_info_cls_setup(struct npu_tnl_info *tnl_info);
 static void mtk_npu_nf_hnat_tnl_info_cls_destroy(struct npu_tnl_info *tnl_info);
@@ -428,6 +429,10 @@ static bool mtk_npu_tnl_decap_offloadable(struct sk_buff *skb)
 	u32 offload_tnl_type_num;
 	u32 cnt;
 	u32 i;
+
+	/* Ignore ordinary traffic before protocol checks and shared counters. */
+	if (!mtk_npu_tunnel_candidate(skb))
+		return false;
 
 	if (!mtk_npu_is_ready() || dev_net(skb->dev) != &init_net)
 		return (hnat_diag_note(skb, HNAT_DIAG_NPU_NOT_READY, 0, 0, -1, 0, -1), false);
@@ -945,6 +950,7 @@ void mtk_npu_nf_hnat_tnl_offload_deinit(void)
 void mtk_npu_nf_hnat_statistic_show(struct seq_file *s)
 {
 	seq_puts(s, "unit=host_eligibility_and_setup_events; not_hardware_bytes_or_forwarding_proof\n");
+	seq_puts(s, "decap_scope=ipv4_gre_or_supported_udp_candidate; ordinary_non_tunnel_packets_excluded\n");
 	seq_printf(s, "decap offloadable|success: %lld|fail: %lld|\n",
 		   atomic64_read(&hnat_ts.decap_offloadable.success),
 		   atomic64_read(&hnat_ts.decap_offloadable.fail));

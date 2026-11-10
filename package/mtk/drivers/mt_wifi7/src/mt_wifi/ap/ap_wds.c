@@ -1488,12 +1488,11 @@ VOID WDS_Remove(RTMP_ADAPTER *pAd)
 
 		if (wdev->if_dev) {
 			RtmpOSNetDevProtect(1);
-			RtmpOSNetDevDetach(wdev->if_dev);
+			RtmpOSNetDevDetachRTNL(wdev->if_dev);
 			RtmpOSNetDevProtect(0);
 			wdev_deinit(pAd, wdev);
-#ifndef RT_CFG80211_SUPPORT
-			RtmpOSNetDevFree(wdev->if_dev);
-#endif /* !RT_CFG80211_SUPPORT */
+			if (wdev->if_dev != pAd->net_dev)
+				RtmpOSNetDevFree(wdev->if_dev);
 			/* Clear it as NULL to prevent latter access error. */
 			WDS_ENTRY_CLEAR_FLAG(pAd->WdsTab.WdsEntry[index].flag);
 			wdev->if_dev = NULL;

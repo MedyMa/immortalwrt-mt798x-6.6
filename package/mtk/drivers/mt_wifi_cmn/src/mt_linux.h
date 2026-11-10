@@ -58,7 +58,10 @@ void mt_pci_walk_bus(struct pci_bus *top,
 unsigned long mt_kallsyms_lookup_name(const char *name);
 void mt_call_rcu(struct rcu_head *head, rcu_callback_t func);
 void mt_synchronize_rcu(void);
+void mt_rcu_barrier(void);
+void *mt_skb_pull_rcsum(struct sk_buff *skb, unsigned int len);
 ktime_t mt_ktime_get(void);
+void mt_ktime_get_real_ts64(struct timespec64 *ts);
 ktime_t mt_ktime_get_with_offset(enum tk_offsets offs);
 u64 mt_ktime_get_boottime_ns(void);
 int mt_register_oom_notifier(struct notifier_block *nb);
@@ -114,7 +117,10 @@ int mt_cfg80211_vendor_cmd_reply(struct sk_buff *skb);
 #define mt_rcu_read_unlock() rcu_read_unlock()
 #define mt_call_rcu(head, func) call_rcu(head, func)
 #define mt_synchronize_rcu() synchronize_rcu()
+#define mt_rcu_barrier() rcu_barrier()
+#define mt_skb_pull_rcsum(skb, len) skb_pull_rcsum(skb, len)
 #define mt_ktime_get() ktime_get()
+#define mt_ktime_get_real_ts64(ts) ktime_get_real_ts64(ts)
 #define mt_ktime_get_with_offset(offs) ktime_get_with_offset(offs)
 #define mt_ktime_get_boottime_ns() ktime_get_boottime_ns()
 #define mt_register_oom_notifier(nb) register_oom_notifier(nb)

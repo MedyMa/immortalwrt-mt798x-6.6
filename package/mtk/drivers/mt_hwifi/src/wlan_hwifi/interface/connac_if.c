@@ -257,7 +257,7 @@ connac_to_mcu_txblk(struct mtk_mcu_txblk *mcu_txblk, struct mtk_mac_mcu_msg *mcu
 	mcu_txblk->frag_total_num = mcu_msg->frag_total_num;
 	mcu_txblk->timeout = mcu_msg->timeout;
 	resp->rx_data = mcu_msg->rx_data;
-	resp->rx_len = 0;
+	resp->rx_len = mcu_msg->rx_len;
 	ret = connac_to_mcu_dest(mcu_msg->dest, &mcu_txblk->dest);
 	if (ret)
 		goto err;
@@ -295,7 +295,7 @@ connac_if_mcu_tx(struct mtk_mac_hw *hw, struct mtk_mac_mcu_msg *mcu_msg)
 	int ret;
 	struct mtk_hw_phy *hw_phy = hw->priv;
 	struct mtk_hw_dev *hw_dev = hw_phy->hw_dev;
-	struct mtk_mcu_resp resp;
+	struct mtk_mcu_resp resp = {};
 	struct mtk_mcu_txblk mcu_txblk = {0};
 
 	ret = connac_to_mcu_txblk(&mcu_txblk, mcu_msg, &resp);
@@ -319,8 +319,8 @@ connac_if_mcu_tx(struct mtk_mac_hw *hw, struct mtk_mac_mcu_msg *mcu_msg)
 
 	mtk_dbg(MTK_MCU, "%s(): resp %p, res_len :%d, ret: %d\n",
 		__func__, resp.rx_data, resp.rx_len, ret);
-	mcu_msg->rx_len = resp.rx_len;
 out:
+	mcu_msg->rx_len = !ret && mcu_txblk.wait_resp ? resp.rx_len : 0;
 	return ret;
 }
 

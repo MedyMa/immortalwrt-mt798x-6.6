@@ -19,6 +19,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include "warp.h"
+#include "warp_proc.h"
 #include "warp_hw.h"
 #include "wed.h"
 #include "warp_bm.h"
@@ -39,6 +40,8 @@ extern void warp_entry_proc_exit(struct warp_ctrl *warp_ctrl,
 				 struct warp_entry *warp);
 extern int warp_ctrl_proc_init(struct warp_ctrl *warp_ctrl);
 extern void warp_ctrl_proc_exit(struct warp_ctrl *warp_ctrl);
+extern void warp_ctrl_proc_quiesce(struct warp_ctrl *warp_ctrl);
+extern void warp_entry_proc_quiesce(struct warp_entry *warp);
 extern int wed_entry_proc_init(struct warp_entry *warp, struct wed_entry *wed);
 extern void wed_entry_proc_exit(struct warp_entry *warp, struct wed_entry *wed);
 extern int wdma_entry_proc_init(struct warp_entry *warp,
@@ -549,7 +552,7 @@ warp_remove(struct platform_device *pdev)
 	if (warp == NULL) {
 		warp_dbg(WARP_DBG_ERR, "%s(): remove faild since can't find warp entry!\n",
 			 __func__);
-		return -1;
+		return -ENODEV;
 	}
 
 	wed = &warp->wed;
@@ -557,6 +560,8 @@ warp_remove(struct platform_device *pdev)
 	wifi = &warp->wifi;
 	hw = &wifi->hw;
 
+	/* Drain diagnostic readers while their WED/WDMA storage is still live. */
+	warp_entry_proc_quiesce(warp);
 	/* Stop the monitor before clearing IRQ, Wi-Fi or WDMA resources. */
 	wed_ser_exit(wed);
 	warp->initialized = false;
@@ -847,11 +852,11 @@ warp_ctrl_init(struct warp_ctrl *warp_ctrl)
 	warp_ctrl->warp_num = wed_get_entry_num();
 	warp_ctrl->bus.warp_num = warp_ctrl->warp_num;
 
-	if (warp_ctrl->warp_num > WED_MAX_NUM ||
+	if (!warp_ctrl->warp_num || warp_ctrl->warp_num > WED_MAX_NUM ||
 	    warp_ctrl->warp_num > warp_platform_wed_count()) {
 		warp_dbg(WARP_DBG_ERR, "%s(): Unsupported WED count %u (maximum %u)\n", __func__,
 			 warp_ctrl->warp_num, min_t(u32, WED_MAX_NUM, warp_platform_wed_count()));
-		return -1;
+		return -EINVAL;
 	}
 
 	warp_ctrl->warp_driver_idx = 0;
@@ -860,7 +865,7 @@ warp_ctrl_init(struct warp_ctrl *warp_ctrl)
 
 	if (!warp_ctrl->entry) {
 		warp_dbg(WARP_DBG_ERR, "%s(): allocate warp control entry faild!\n", __func__);
-		return -1;
+		return -ENOMEM;
 	}
 
 	memset(warp_ctrl->entry, 0, size);
@@ -1172,8 +1177,9 @@ warp_register_client(struct wifi_hw *hw, struct wifi_ops *ops)
 	pdriver->driver.owner = THIS_MODULE;
 	pdriver->driver.probe_type = PROBE_FORCE_SYNCHRONOUS;
 	pdriver->driver.of_match_table = warp_of_ids[warp->idx];
-	warp_entry_proc_init(warp_ctrl, warp);
-	ret = platform_driver_register(pdriver);
+	ret = warp_entry_proc_init(warp_ctrl, warp);
+	if (!ret)
+		ret = platform_driver_register(pdriver);
 	if (!ret && (!warp->pdev || !warp->initialized ||
 		     warp->pdev->dev.driver != &pdriver->driver)) {
 		/* Driver registration alone does not prove its hardware probe ran. */
@@ -1791,6 +1797,7 @@ EXPORT_SYMBOL(warp_mcu_wo_support);
 static int __init warp_module_init(void)
 {
 	struct warp_ctrl *warp_ctrl = warp_ctrl_get();
+	int ret;
 #ifdef WED_RX_D_SUPPORT
 	u32 i = 0;
 #endif
@@ -1803,12 +1810,18 @@ static int __init warp_module_init(void)
 	/*initial global warp control*/
 	memset(warp_ctrl, 0, sizeof(struct warp_ctrl));
 	spin_lock_init(&warp_ctrl->warp_lock);
-	/*register proc*/
-	warp_ctrl_proc_init(warp_ctrl);
 	/*initial warp driver and check */
-	warp_ctrl_init(warp_ctrl);
+	ret = warp_ctrl_init(warp_ctrl);
+	if (ret)
+		goto err_meminfo;
 	/*initial pci cr mirror cfg*/
-	bus_config_init(&warp_ctrl->bus);
+	ret = bus_config_init(&warp_ctrl->bus);
+	if (ret)
+		goto err_ctrl;
+	/* Publish diagnostics only after all referenced arrays are ready. */
+	ret = warp_ctrl_proc_init(warp_ctrl);
+	if (ret)
+		goto err_bus;
 #ifdef WED_RX_D_SUPPORT
 	for (i = 0; i < warp_ctrl->warp_num; i++) {
 		struct warp_entry *entry = &warp_ctrl->entry[i];
@@ -1825,6 +1838,16 @@ static int __init warp_module_init(void)
 	muldf_init();
 #endif /*CONFIG_MULDF_HELPER*/
 	return 0;
+
+err_bus:
+	bus_config_exit(&warp_ctrl->bus);
+err_ctrl:
+	warp_ctrl_exit(warp_ctrl);
+err_meminfo:
+#ifdef WED_MEM_LEAK_DBG
+	MemInfoListExit();
+#endif
+	return ret;
 }
 
 static void __exit warp_module_exit(void)
@@ -1832,13 +1855,15 @@ static void __exit warp_module_exit(void)
 	struct warp_ctrl *warp_ctrl = warp_ctrl_get();
 
 	warp_dbg(WARP_DBG_OFF, "%s(): warp module exist\n", __func__);
+	/* Keep the parent directory until per-client teardown removes its children. */
+	warp_ctrl_proc_quiesce(warp_ctrl);
 #ifdef WED_RX_D_SUPPORT
 #ifdef WED_RX_HW_RRO_2_0
 	warp_wo_exit(warp_ctrl);
 #endif
 #endif
-	bus_config_exit(&warp_ctrl->bus);
 	warp_ctrl_exit(warp_ctrl);
+	bus_config_exit(&warp_ctrl->bus);
 	warp_ctrl_proc_exit(warp_ctrl);
 #ifdef WED_MEM_LEAK_DBG
 	MemInfoListExit();

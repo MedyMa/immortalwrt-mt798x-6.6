@@ -279,11 +279,15 @@ void wext_send_proxy_arp_event(PNET_DEV net_dev,
 		memcpy(arp_entry->target_mac_addr, target_mac_addr, 6);
 
 		if (ip_type == IPV4) {
-			memcpy(arp_entry->ip_addr, source_ip_addr, 4);
-			memcpy(arp_entry->ip_addr + 4, target_ip_addr, 4);
+			UCHAR *ip_addr = (UCHAR *)arp_entry + offsetof(struct proxy_arp_entry, ip_addr);
+
+			memcpy(ip_addr, source_ip_addr, 4);
+			memcpy(ip_addr + 4, target_ip_addr, 4);
 		} else if (ip_type == IPV6) {
-			memcpy(arp_entry->ip_addr, source_ip_addr, 16);
-			memcpy(arp_entry->ip_addr + 16, target_ip_addr, 16);
+			UCHAR *ip_addr = (UCHAR *)arp_entry + offsetof(struct proxy_arp_entry, ip_addr);
+
+			memcpy(ip_addr, source_ip_addr, 16);
+			memcpy(ip_addr + 16, target_ip_addr, 16);
 		} else
 			printk("error not such ip type packet\n");
 
@@ -2995,11 +2999,11 @@ void build_btm_rsp(IN PRTMP_ADAPTER pAd,
 	btm_rsp_len += 1;
 
 	if (target_bssid) {
-		COPY_MAC_ADDR(frame->u.btm_rsp.variable, target_bssid);
+		COPY_MAC_ADDR((UCHAR *)frame + offsetof(struct btm_payload, u.btm_rsp.variable), target_bssid);
 		pos += MAC_ADDR_LEN;
 		btm_rsp_len += MAC_ADDR_LEN;
 	} else {
-		COPY_MAC_ADDR(frame->u.btm_rsp.variable, "\0\0\0\0\0\0");
+		COPY_MAC_ADDR((UCHAR *)frame + offsetof(struct btm_payload, u.btm_rsp.variable), "\0\0\0\0\0\0");
 		pos += MAC_ADDR_LEN;
 		btm_rsp_len += MAC_ADDR_LEN;
 	}
@@ -4111,8 +4115,8 @@ static VOID SendWNMNotifyReq(
 		WNMFrame->u.WNM_NOTIFY_REQ.Variable[4] = 0x9a;
 		WNMFrame->u.WNM_NOTIFY_REQ.Variable[5] = 0x01;
 		if ((VarLen+1) >= 3)
-			NdisMoveMemory(&WNMFrame->u.WNM_NOTIFY_REQ.Variable[6], Event->u.WNM_NOTIFY_REQ_DATA.WNMNotifyReq,
-						   3);
+			NdisMoveMemory((UCHAR *)WNMFrame + offsetof(WNM_FRAME, u.WNM_NOTIFY_REQ.Variable) + 6,
+						   Event->u.WNM_NOTIFY_REQ_DATA.WNMNotifyReq, 3);
 		else
 			MTWF_DBG(pAd, DBG_CAT_PROTO, CATPROTO_WNM, DBG_LVL_ERROR,
 				"Not have enough buffer size for WNMFrame->u.WNM_NOTIFY_REQ.Variable!\n");

@@ -1307,7 +1307,8 @@ hwifi_mcu_tx(struct _RTMP_ADAPTER *ad, struct cmd_msg *msg)
 	os_alloc_mem(NULL, (UCHAR **)&buf, 2048);
 	if (buf == NULL) {
 		MTWF_DBG(NULL, DBG_CAT_HIF, CATHIF_HWIFI, DBG_LVL_ERROR,
-			"can not allocate buf[1024]\n");
+			"can not allocate firmware response buffer[2048]\n");
+		ret = NDIS_STATUS_FAILURE;
 		goto err;
 	}
 
@@ -1321,6 +1322,7 @@ hwifi_mcu_tx(struct _RTMP_ADAPTER *ad, struct cmd_msg *msg)
 #endif /* WIFI_UNIFIED_COMMAND */
 
 	mcu_msg.rx_data = buf;
+	mcu_msg.rx_len = 2048;
 
 	ret = mcu_dest_trans(attr->mcu_dest, &mcu_msg.dest);
 
@@ -1347,8 +1349,17 @@ hwifi_mcu_tx(struct _RTMP_ADAPTER *ad, struct cmd_msg *msg)
 		goto err;
 	}
 
-	if (attr->rsp.handler && mcu_msg.rx_data)
-		attr->rsp.handler(msg, mcu_msg.rx_data, mcu_msg.rx_len);
+	if (attr->rsp.handler && mcu_msg.is_wait) {
+		if (mcu_msg.rx_data && mcu_msg.rx_len) {
+			attr->rsp.handler(msg, mcu_msg.rx_data, mcu_msg.rx_len);
+			if (mcu_msg.uni_cmd)
+				ret = msg->cmd_return_status;
+		} else if (mcu_msg.is_wait) {
+			ret = NDIS_STATUS_FAILURE;
+			MTWF_DBG(ad, DBG_CAT_FW, CATFW_DBGINFO, DBG_LVL_WARN,
+				"missing firmware response: cid=0x%x\n", mcu_msg.cmd);
+		}
+	}
 
 	if (buf)
 		os_free_mem(buf);
@@ -1879,11 +1890,14 @@ hwifi_tx_mgmt(struct _RTMP_ADAPTER *ad, UCHAR *tmac_info,
 	struct mtk_mac_txq *txq;
 	int ret;
 
-	if (!entry || !entry->mac_sta)
-		entry = tr_entry_get(ad, wdev->tr_tb_idx);
-
 	mt_rcu_read_lock();
-	sta = entry->mac_sta;
+	if (!wdev)
+		goto err;
+	if (!entry || !READ_ONCE(entry->mac_sta))
+		entry = tr_entry_get(ad, wdev->tr_tb_idx);
+	if (!entry)
+		goto err;
+	sta = READ_ONCE(entry->mac_sta);
 	if (!sta)
 		goto err;
 
@@ -1891,6 +1905,8 @@ hwifi_tx_mgmt(struct _RTMP_ADAPTER *ad, UCHAR *tmac_info,
 	if (!txq)
 		goto err;
 
+	if (!pskb_may_pull(skb, cap->tx_hw_hdr_len))
+		goto err;
 	skb_pull(skb, cap->tx_hw_hdr_len);
 
 	/*should apply rcu lock*/
@@ -1961,12 +1977,11 @@ hwifi_tx_data(struct _RTMP_ADAPTER *ad, struct _TX_BLK *tx_blk)
 	struct mtk_mac_txq *txq;
 	int ret;
 
+	mt_rcu_read_lock();
 	if (!wdev || !entry)
 		goto err;
-
-	mt_rcu_read_lock();
-	bss = wdev->pHObj;
-	sta = entry->mac_sta;
+	bss = READ_ONCE(wdev->pHObj);
+	sta = READ_ONCE(entry->mac_sta);
 
 	if (!sta || !bss)
 		goto err;
@@ -2722,9 +2737,7 @@ mtk_mac_hw_unregister(struct mtk_mac_hw *hw)
 #endif /* CFG_MTK_SUPPORT_ANDROID_WMT */
 
 	RtmpPhyNetDevExit(ad, net_dev);
-#ifndef RT_CFG80211_SUPPORT
 	RtmpOSNetDevFree(net_dev);
-#endif
 }
 EXPORT_SYMBOL(mtk_mac_hw_unregister);
 

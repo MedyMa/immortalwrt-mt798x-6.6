@@ -1,0 +1,27 @@
+Subject: net: mediatek: publish MTU limits before registering MAC devices
+
+DSA needs room for its tag while the conduit is still down. Leaving the
+ethernet default max_mtu of 1500 until ndo_open rejects the initial tagged
+conduit MTU and propagates ERANGE to switch user ports. Initialize the limits
+from the declared PHY mode before register_netdev.
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -6909,6 +6909,17 @@
+ 	eth->netdev[id]->irq = eth->irq_fe[0];
+ 	eth->netdev[id]->dev.of_node = np;
+ 
++	/* DSA sets the conduit MTU before ndo_open() runs. */
++	eth->netdev[id]->min_mtu = ETH_MIN_MTU;
++	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_RX_9K) &&
++	    MTK_MAX_RX_LENGTH >= MTK_MAX_RX_LENGTH_9K &&
++	    mtk_interface_mode_is_xgmii(phy_mode))
++		eth->netdev[id]->max_mtu = MTK_MAX_RX_LENGTH_9K - MTK_RX_ETH_HLEN;
++	else if (MTK_MAX_RX_LENGTH >= MTK_MAX_RX_LENGTH_2K)
++		eth->netdev[id]->max_mtu = MTK_MAX_RX_LENGTH_2K - MTK_RX_ETH_HLEN;
++	else
++		eth->netdev[id]->max_mtu = MTK_MAX_RX_LENGTH - MTK_RX_ETH_HLEN;
++
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA)) {
+ 		mac->device_notifier.notifier_call = mtk_device_event;
+ 		err = register_netdevice_notifier(&mac->device_notifier);

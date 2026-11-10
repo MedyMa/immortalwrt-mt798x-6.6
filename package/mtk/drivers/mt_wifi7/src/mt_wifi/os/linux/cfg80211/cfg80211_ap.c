@@ -2574,6 +2574,7 @@ INT CFG80211_ApStaDelSendEvent(PRTMP_ADAPTER pAd, const PUCHAR mac_addr, IN PNET
 
 int cfg80211_set_acl_policy(PRTMP_ADAPTER pAd, UINT ifIndex, u8 mode)
 {
+#ifdef CONFIG_MAP_SUPPORT
 	struct wifi_dev *wdev = &pAd->ApCfg.MBSSID[ifIndex].wdev;
 
 	if (wdev && (IS_MAP_TURNKEY_ENABLE(pAd)) &&
@@ -2583,6 +2584,7 @@ int cfg80211_set_acl_policy(PRTMP_ADAPTER pAd, UINT ifIndex, u8 mode)
 				"disallowing ACL for Backhaul BSS, DevOwnRole=%u\n", wdev->MAPCfg.DevOwnRole);
 		return FALSE;
 	}
+#endif /* CONFIG_MAP_SUPPORT */
 
 #ifdef ACL_BLK_COUNT_SUPPORT
 	if (mode != 2) {

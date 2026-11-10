@@ -671,7 +671,7 @@ wed_rx_rro_data_ring_exit(struct wed_entry *entry, struct wed_rx_ctrl *rx_ctrl)
 	memset(ring_ctrl, 0, sizeof(*ring_ctrl));
 }
 
-int
+static int
 wed_rx_rro_data_ring_init(struct wed_entry *entry,
 				struct wed_rx_ctrl *rx_ctrl)
 {
@@ -791,7 +791,7 @@ wed_rx_rro_page_ring_exit(struct wed_entry *entry, struct wed_rx_ctrl *rx_ctrl)
 	memset(ring_ctrl, 0, sizeof(*ring_ctrl));
 }
 
-int
+static int
 wed_rx_rro_page_ring_init(struct wed_entry *entry,
 				struct wed_rx_ctrl *rx_ctrl)
 {
@@ -891,7 +891,7 @@ wed_rx_rro_ind_cmd_ring_exit(struct wed_entry *entry, struct wed_rx_ctrl *rx_ctr
 	memset(ring_ctrl, 0, sizeof(*ring_ctrl));
 }
 
-int
+static int
 wed_rx_rro_ind_cmd_ring_init(struct wed_entry *entry,
 				struct wed_rx_ctrl *rx_ctrl)
 {
@@ -1418,7 +1418,7 @@ wed_get_slot_map(unsigned int idx)
 /*
 *
 */
-void
+static void
 dump_wed_basic(struct wed_entry *wed)
 {
 	warp_dbg(WARP_DBG_OFF, "virtual addr\t: 0x%lx\n", wed->base_addr);
@@ -1453,7 +1453,7 @@ dump_tx_ring_raw(struct wed_entry *wed, u8 ring_id, u32 idx)
 /*
 *  Debug purpose: dump ser debug cnt
 */
-void
+static void
 dump_wed_ser_dbg_cnt(struct wed_entry *wed)
 {
 	struct wed_ser_ctrl *ser_ctrl = &wed->ser_ctrl;

@@ -1191,7 +1191,7 @@ VOID Monitor_Remove(RTMP_ADAPTER *pAd)
 
 	if (wdev->if_dev) {
 		RtmpOSNetDevProtect(1);
-		RtmpOSNetDevDetach(wdev->if_dev);
+		RtmpOSNetDevDetachRTNL(wdev->if_dev);
 		RtmpOSNetDevProtect(0);
 		wdev_idx_unreg(pAd, wdev);
 		RtmpOSNetDevFree(wdev->if_dev);

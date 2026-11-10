@@ -1,0 +1,283 @@
+Subject: osal: preserve fragmented packet views and use the correct RX context
+
+--- a/mt_osal_packet.c
++++ b/mt_osal_packet.c
+@@ -22,6 +22,9 @@
+ #include <linux/wireless.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
++#include <linux/if_vlan.h>
++#include <linux/ip.h>
++#include <linux/math64.h>
+ #include <linux/version.h>
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+ #include <linux/unaligned.h>
+@@ -45,6 +48,8 @@
+ PNDIS_PACKET mt_os_net_pkt_alloc(void *dummy, int size)
+ {
+ 	struct sk_buff *skb;
++	if (size < 0 || size > INT_MAX - 2)
++		return NULL;
+ 	/* Add 2 more bytes for ip header alignment */
+ 	OS_DEV_ALLOC_SKB(skb, (size + 2));
+ 	return (PNDIS_PACKET) skb;
+@@ -62,6 +67,8 @@
+ {
+ 	struct sk_buff *pkt;
+ 
++	if (len > INT_MAX)
++		return NULL;
+ 	OS_DEV_ALLOC_SKB(pkt, len);
+ 
+ 	if (pkt == NULL) {
+@@ -76,7 +83,8 @@
+ {
+ 	struct sk_buff *rx_pkt = (struct sk_buff *)net_pkt;
+ 
+-	rx_pkt->protocol = eth_type_trans(rx_pkt, rx_pkt->dev);
++	if (rx_pkt && rx_pkt->dev && pskb_may_pull(rx_pkt, ETH_HLEN))
++		rx_pkt->protocol = eth_type_trans(rx_pkt, rx_pkt->dev);
+ }
+ EXPORT_SYMBOL(mt_os_pkt_protocol_assign);
+ 
+@@ -84,7 +92,7 @@
+ {
+ 	struct sk_buff *skb = (struct sk_buff *)skb_;
+ 
+-	if (len > skb->len)
++	if (!skb || !pskb_may_pull(skb, len))
+ 		return;
+ 
+ 	skb_pull_rcsum(skb, len);
+@@ -131,31 +139,32 @@
+ 
+ PNDIS_PACKET mt_os_clone_pkt_by_data(unsigned char MonitorOn, void *pkt, unsigned char *buf, unsigned long sz)
+ {
+-	struct sk_buff *pClonedPkt, *pkt_ = (struct sk_buff *)pkt;
+-
+-	if (pkt == NULL) {
+-		MT_DEBUG_ERROR("pkt is NULL\n");
+-		return NULL;
+-	}
+-
+-	if (!MonitorOn && sz >= MAX_RX_DATA_BUFFER_SIZE ) {
+-		MT_DEBUG_TRACE("pkt sz is too large %d\n", sz);
+-		return NULL;
+-	}
+-
+-
+-	/* clone the packet */
+-	pClonedPkt = skb_clone((struct sk_buff *)pkt, GFP_ATOMIC);
+-
+-	if (pClonedPkt) {
+-		/* set the correct dataptr and data len */
+-		pClonedPkt->dev = pkt_->dev;
+-		pClonedPkt->data = buf;
+-		pClonedPkt->len = sz;
+-		SET_OS_PKT_DATA_TAIL(pClonedPkt, pClonedPkt->len);
+-	}
+-
+-	return (PNDIS_PACKET)pClonedPkt;
++	struct sk_buff *source = pkt, *clone;
++	unsigned long linear;
++
++	if (!source || !buf || (!MonitorOn && sz >= MAX_RX_DATA_BUFFER_SIZE) ||
++	    (unsigned long)buf < (unsigned long)source->head ||
++	    (unsigned long)buf > (unsigned long)skb_tail_pointer(source))
++		return NULL;
++	linear = skb_tail_pointer(source) - buf;
++	if (linear > UINT_MAX - source->data_len || sz > linear + source->data_len)
++		return NULL;
++	clone = skb_clone(source, GFP_ATOMIC);
++	if (!clone)
++		return NULL;
++	clone->data = buf;
++	clone->len = linear + clone->data_len;
++	/* The selected view no longer covers the parent's checksum bytes. */
++	if (clone->ip_summed == CHECKSUM_COMPLETE || clone->ip_summed == CHECKSUM_PARTIAL) {
++		clone->ip_summed = CHECKSUM_NONE;
++		clone->csum = 0;
++		clone->csum_valid = 0;
++	}
++	if (pskb_trim(clone, sz)) {
++		kfree_skb(clone);
++		return NULL;
++	}
++	return clone;
+ }
+ EXPORT_SYMBOL(mt_os_clone_pkt_by_data);
+ 
+@@ -180,11 +189,11 @@
+ 		memcpy(pData, pHeader802_3, OS_LENGTH_802_3_NO_TYPE);
+ 		/* copy VLAN tag (4B) */
+ 		/* do NOT use memcpy to speed up */
+-		*(unsigned short *) (pData + OS_LENGTH_802_3_NO_TYPE) = *(unsigned short *) TPID;
++		memcpy(pData + OS_LENGTH_802_3_NO_TYPE, TPID, 2);
+ 		put_unaligned_be16(TCI, pData + OS_LENGTH_802_3_NO_TYPE + 2);
+ 		/* copy type/len (2B) */
+-		*(unsigned short *) (pData + OS_LENGTH_802_3_NO_TYPE + OS_LENGTH_802_1Q) =
+-			*(unsigned short *) &pHeader802_3[OS_LENGTH_802_3 - OS_LENGTH_802_3_TYPE];
++		memcpy(pData + OS_LENGTH_802_3_NO_TYPE + OS_LENGTH_802_1Q,
++		       pHeader802_3 + OS_LENGTH_802_3 - OS_LENGTH_802_3_TYPE, 2);
+ 
+ 		/* copy tail if exist */
+ 		if (HdrLen > OS_LENGTH_802_3)
+@@ -210,7 +219,13 @@
+ {
+ 	struct sk_buff *skb;
+ 	unsigned short VLAN_Size = 0;
+-	int skb_len = HdrLen + DataSize + 2;
++	unsigned int skb_len;
++
++	if (!pHeader802_3 || HdrLen < ETH_HLEN || (DataSize && !pData) ||
++	    (VLAN_VID && !TPID) || DataSize > INT_MAX - 2 - VLAN_HLEN ||
++	    HdrLen > INT_MAX - 2 - VLAN_HLEN - DataSize)
++		return NULL;
++	skb_len = HdrLen + DataSize + 2;
+ 
+ 	if (VLAN_VID != 0)
+ 		skb_len += OS_LENGTH_802_1Q;
+@@ -226,7 +241,8 @@
+ 										  TPID);
+ 		skb_put(skb, HdrLen + VLAN_Size);
+ 		/* copy data body */
+-		memcpy(GET_OS_PKT_DATA_TAIL(skb), pData, DataSize);
++		if (DataSize)
++			memcpy(GET_OS_PKT_DATA_TAIL(skb), pData, DataSize);
+ 
+ 		skb_put(skb, DataSize);
+ 		skb->dev = pNetDev;
+@@ -351,43 +367,48 @@
+ 	struct sk_buff *skb = (struct sk_buff *)skb_;
+ 	struct net_device *net_dev = skb->dev;
+ 
+-	if (net_dev->features & NETIF_F_HW_CSUM) {
++	if (net_dev->features & NETIF_F_RXCSUM) {
+ 		if (ip_summed)
+ 			skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 		else
+ 			skb->ip_summed = CHECKSUM_NONE;
+-	}
++	} else
++		skb->ip_summed = CHECKSUM_NONE;
+ }
+ EXPORT_SYMBOL(mt_os_pkt_set_ip_summed);
+ 
+-unsigned int cpu_idx[] = { 0x10000000, 0xF0000000, 0x80000000, 0x40000000};
+-
+ bool mt_os_pkt_set_rps_hash(void *skb_, int rps_per_round)
+ {
+-	struct sk_buff *skb = (struct sk_buff *)skb_;
+-	struct net_device *net_dev = skb->dev;
+-	struct netdev_rx_queue *rxqueue = net_dev->_rx;
++#ifdef CONFIG_RPS
++	struct sk_buff *skb = skb_;
+ 	struct rps_map *map;
+-	static int g_accnt = 0, change_idx = 0;
+-	u8 *pSrcBuf = skb->data;
+-
+-	map = rcu_dereference(rxqueue->rps_map);
+-	if (!map || map->len >= 4 || map->len == 0)
++	struct iphdr buffer;
++	const struct iphdr *iph;
++	static atomic_t sequence = ATOMIC_INIT(0);
++	u32 count, index, hash;
++
++	if (!skb || !skb->dev || !skb->dev->_rx || rps_per_round < 0)
+ 		return false;
+-	if (map->len == 1) {
+-		skb->sw_hash = 1;
+-		skb->hash = cpu_idx[0];
+-	} else if (pSrcBuf[0] == 0x45 && pSrcBuf[1] == 0x0 && pSrcBuf[9] == 0x11) {
+-		if (g_accnt++ > rps_per_round) {
+-			g_accnt = 0;
+-			if (change_idx++ >= map->len)
+-				change_idx = 0;
+-		}
+-		skb->sw_hash = 1;
+-		skb->hash = cpu_idx[change_idx];
+-	}
+-
++	rcu_read_lock();
++	map = rcu_dereference(skb->dev->_rx->rps_map);
++	count = map ? map->len : 0;
++	rcu_read_unlock();
++	if (!count || count > 4)
++		return false;
++	if (count > 1) {
++		iph = skb_header_pointer(skb, 0, sizeof(buffer), &buffer);
++		if (!iph || iph->version != 4 || iph->ihl < 5 || iph->protocol != IPPROTO_UDP)
++			return false;
++		index = ((u32)atomic_inc_return(&sequence) / ((u32)rps_per_round + 1)) % count;
++	} else
++		index = 0;
++	/* reciprocal_scale(hash, count) selects exactly index, including count=3/4. */
++	hash = div_u64(((u64)index * 2 + 1) << 31, count);
++	skb_set_hash(skb, hash, PKT_HASH_TYPE_L3);
+ 	return true;
++#else
++	return false;
++#endif
+ }
+ EXPORT_SYMBOL(mt_os_pkt_set_rps_hash);
+ 
+@@ -409,14 +430,10 @@
+ 		send = 0;
+ 	} else {
+ #ifdef CONFIG_NETIF_RX_DISPATCH
+-		if (in_interrupt())
++		if (in_serving_softirq())
++			netif_receive_skb(skb);
++		else
+ 			netif_rx(skb);
+-		else
+-#if (KERNEL_VERSION(5, 18, 0) <= LINUX_VERSION_CODE)
+-			netif_receive_skb(skb);
+-#else
+-			netif_rx_ni(skb);
+-#endif /* (KERNEL_VERSION(5, 18, 0) <= LINUX_VERSION_CODE) */
+ #else
+ 		netif_rx(skb);
+ #endif /* CONFIG_NETIF_RX_DISPATCH */
+@@ -444,11 +461,10 @@
+ 	pOSPkt->pkt_type = PACKET_OTHERHOST;
+ 	pOSPkt->ip_summed = CHECKSUM_NONE;
+ 
+-#if (KERNEL_VERSION(5, 18, 0) <= LINUX_VERSION_CODE)
+-	netif_receive_skb(pOSPkt);
+-#else
+-	netif_rx_ni(pOSPkt);
+-#endif
++	if (in_serving_softirq())
++		netif_receive_skb(pOSPkt);
++	else
++		netif_rx(pOSPkt);
+ }
+ EXPORT_SYMBOL(mt_os_802_11_radiotap_packet);
+ 
+--- a/inc/mt_osal_packet.h
++++ b/inc/mt_osal_packet.h
+@@ -81,6 +81,7 @@
+ 	unsigned char *pData,
+ 	unsigned long DataSize,
+ 	unsigned char *TPID);
++/* Conversion views require a linear, writable skb and space for the Ethernet/VLAN header. */
+ void wlan_802_11_to_802_3_packet_ap(
+ 	void *pNetDev,
+ 	unsigned short VLAN_VID,
+@@ -96,6 +97,7 @@
+ 		unsigned char *pHeader802_3,
+ 		unsigned char *pData,
+ 		unsigned long DataSize);
++/* Consumes the old skb if expansion is needed, including on allocation failure. */
+ PNDIS_PACKET mt_os_expand_pkt(
+ 	PNDIS_PACKET pPacket,
+ 	unsigned int ext_head_len,
+@@ -118,6 +120,7 @@
+ bool mt_os_pkt_set_rps_hash(void *skb_, int rps_per_round);
+ 
+ void mt_os_pkt_clear_info(void *skb_);
++/* Consumes skb on every path; napi belongs to the current poll when supplied. */
+ void mt_os_pkt_send(void *skb_, void *napi, int *pSend);
+ void *mt_os_pkt_get_wdev(void *skb_);
+ void *mt_os_pkt_get_netdev(void *skb_);

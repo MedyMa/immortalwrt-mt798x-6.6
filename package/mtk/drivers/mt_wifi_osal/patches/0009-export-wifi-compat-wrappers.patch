@@ -1,0 +1,91 @@
+Subject: mt_wifi_osal: export WiFi compatibility wrappers
+
+Provide the six wrappers referenced by the proprietary mt_wifi driver when it
+uses the OSAL package. This keeps GPL-only kernel APIs behind the GPL-licensed
+OSAL module and avoids requiring the mutually exclusive mt_wifi_cmn package.
+--- a/Makefile
++++ b/Makefile
+@@ -36,6 +36,7 @@
+ mt_wifi_osal-objs += mt_osal_lock.o
+ mt_wifi_osal-objs += mt_osal_timer.o
+ mt_wifi_osal-objs += mt_osal_task.o
++mt_wifi_osal-objs += mt_osal_wifi_compat.o
+ mt_wifi_osal-objs += mt_osal_net.o
+ mt_wifi_osal-objs += mt_osal_fs.o
+ mt_wifi_osal-objs += mt_osal_wifi.o
+--- a/inc/mt_osal.h
++++ b/inc/mt_osal.h
+@@ -46,4 +46,16 @@
+ #include "mt_osal_proc.h"
+ #include "mt_osal_genl.h"
+ 
++/* Compatibility ABI used by the proprietary MTK WiFi driver. */
++struct workqueue_struct *mt_create_workqueue(const char *name);
++void mt_init_delayed_work(struct delayed_work *work, work_func_t func);
++void mt_flush_workqueue(struct workqueue_struct *wq);
++void mt_queue_delayed_work(struct workqueue_struct *wq,
++			   struct delayed_work *dwork,
++			   unsigned long delay);
++void mt_ktime_get_real_ts64(struct timespec64 *ts);
++#ifdef CFG80211_SUPPORT
++int mt_cfg80211_vendor_cmd_reply(struct sk_buff *skb);
++#endif
++
+ #endif /* __MT_WIFI_OSAL_H_ */
+--- /dev/null
++++ b/mt_osal_wifi_compat.c
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Compatibility wrappers used by the proprietary MTK WiFi driver.
++ *
++ * Keep the kernel-only entry points behind the GPL-licensed OSAL module so
++ * that mt_wifi itself does not import GPL-only kernel symbols.
++ */
++#include <linux/ktime.h>
++#include <linux/timekeeping.h>
++#include <linux/workqueue.h>
++#include <linux/skbuff.h>
++#include <net/cfg80211.h>
++
++#include "mt_osal.h"
++
++struct workqueue_struct *mt_create_workqueue(const char *name)
++{
++	return create_workqueue(name);
++}
++EXPORT_SYMBOL(mt_create_workqueue);
++
++void mt_init_delayed_work(struct delayed_work *work, work_func_t func)
++{
++	INIT_DELAYED_WORK(work, func);
++}
++EXPORT_SYMBOL(mt_init_delayed_work);
++
++void mt_flush_workqueue(struct workqueue_struct *wq)
++{
++	flush_workqueue(wq);
++}
++EXPORT_SYMBOL(mt_flush_workqueue);
++
++void mt_queue_delayed_work(struct workqueue_struct *wq,
++			   struct delayed_work *dwork,
++			   unsigned long delay)
++{
++	queue_delayed_work(wq, dwork, delay);
++}
++EXPORT_SYMBOL(mt_queue_delayed_work);
++
++void mt_ktime_get_real_ts64(struct timespec64 *ts)
++{
++	ktime_get_real_ts64(ts);
++}
++EXPORT_SYMBOL(mt_ktime_get_real_ts64);
++
++#ifdef CFG80211_SUPPORT
++int mt_cfg80211_vendor_cmd_reply(struct sk_buff *skb)
++{
++	return cfg80211_vendor_cmd_reply(skb);
++}
++EXPORT_SYMBOL(mt_cfg80211_vendor_cmd_reply);
++#endif

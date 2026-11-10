@@ -82,11 +82,22 @@ static int mtk_npu_link_supplier(struct platform_device *pdev, const char *name)
 	of_node_put(node);
 	if (!supplier)
 		return -EPROBE_DEFER;
-	if (!platform_get_drvdata(supplier))
+	if (supplier == pdev) {
+		put_device(&supplier->dev);
+		return -EINVAL;
+	}
+
+	/* Serialize provider readiness and link creation with supplier unbind. */
+	device_lock(&supplier->dev);
+	/* Some successful providers do not store platform driver data. */
+	/* device_is_bound() is not exported to modules by Linux 6.6. */
+	if (!supplier->dev.driver ||
+	    supplier->dev.links.status != DL_DEV_DRIVER_BOUND)
 		ret = -EPROBE_DEFER;
 	else if (!device_link_add(&pdev->dev, &supplier->dev,
 				 DL_FLAG_AUTOREMOVE_CONSUMER))
 		ret = -ENOMEM;
+	device_unlock(&supplier->dev);
 	put_device(&supplier->dev);
 	return ret;
 }
@@ -250,7 +261,7 @@ static int mtk_npu_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "PCE supplier not ready\n");
 
-#if IS_ENABLED(CONFIG_MTK_NPU_HNAT)
+#if IS_ENABLED(CONFIG_MTK_NPU_HNAT) || IS_ENABLED(CONFIG_MTK_NPU_MCAST)
 	ret = mtk_npu_link_supplier(pdev, "hnat");
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "HNAT supplier not ready\n");

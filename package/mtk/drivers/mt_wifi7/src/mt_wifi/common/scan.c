@@ -783,7 +783,7 @@ static BOOLEAN scan_type_stay_time_checker(
 		ScanCtrl->ScanTimeActualStart = mt_ktime_get();
 #ifdef ZERO_PKT_LOSS_SUPPORT
 		/*read channel stats initial reading*/
-		pAd->ScanCtrl.ScanTimeStartMibEvent = ktime_get();
+		pAd->ScanCtrl.ScanTimeStartMibEvent = mt_ktime_get();
 		read_channel_stats(pAd, band_idx, &(ScanCtrl->OffCannelScanStartStats));
 #endif
 		pAutoChCtrl->AutoChSelCtrl.pre_cca_nav_tx_time = AsicGetCCACnt(pAd, band_idx);

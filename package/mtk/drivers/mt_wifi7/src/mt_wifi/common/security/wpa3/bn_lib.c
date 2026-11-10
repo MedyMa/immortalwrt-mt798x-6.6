@@ -315,15 +315,15 @@ static BN_ULONG *bn_expand_internal(const BIGNUM *b, int words)
 		case 3:
 			A[2] = B[2];
 
-		/* fall thru */
+			fallthrough;
 		case 2:
 			A[1] = B[1];
 
-		/* fall thru */
+			fallthrough;
 		case 1:
 			A[0] = B[0];
 
-		/* fall thru */
+			fallthrough;
 		case 0:
 			/* Without the "case 0" some old optimizers got this wrong. */
 			;
@@ -432,15 +432,15 @@ BIGNUM *BN_copy(BIGNUM *a, const BIGNUM *b)
 	case 3:
 		A[2] = B[2];
 
-	/* fall thru */
+		fallthrough;
 	case 2:
 		A[1] = B[1];
 
-	/* fall thru */
+		fallthrough;
 	case 1:
 		A[0] = B[0];
 
-	/* fall thru */
+		fallthrough;
 	case 0:
 		;
 	}
@@ -955,33 +955,42 @@ void BN_consttime_swap(BN_ULONG condition, BIGNUM *a, BIGNUM *b, int nwords)
 		for (i = 10; i < nwords; i++)
 			BN_CONSTTIME_SWAP(i);
 
-	/* Fallthrough */
+		fallthrough;
 	case 10:
-		BN_CONSTTIME_SWAP(9);   /* Fallthrough */
+		BN_CONSTTIME_SWAP(9);
+		fallthrough;
 
 	case 9:
-		BN_CONSTTIME_SWAP(8);   /* Fallthrough */
+		BN_CONSTTIME_SWAP(8);
+		fallthrough;
 
 	case 8:
-		BN_CONSTTIME_SWAP(7);   /* Fallthrough */
+		BN_CONSTTIME_SWAP(7);
+		fallthrough;
 
 	case 7:
-		BN_CONSTTIME_SWAP(6);   /* Fallthrough */
+		BN_CONSTTIME_SWAP(6);
+		fallthrough;
 
 	case 6:
-		BN_CONSTTIME_SWAP(5);   /* Fallthrough */
+		BN_CONSTTIME_SWAP(5);
+		fallthrough;
 
 	case 5:
-		BN_CONSTTIME_SWAP(4);   /* Fallthrough */
+		BN_CONSTTIME_SWAP(4);
+		fallthrough;
 
 	case 4:
-		BN_CONSTTIME_SWAP(3);   /* Fallthrough */
+		BN_CONSTTIME_SWAP(3);
+		fallthrough;
 
 	case 3:
-		BN_CONSTTIME_SWAP(2);   /* Fallthrough */
+		BN_CONSTTIME_SWAP(2);
+		fallthrough;
 
 	case 2:
-		BN_CONSTTIME_SWAP(1);   /* Fallthrough */
+		BN_CONSTTIME_SWAP(1);
+		fallthrough;
 
 	case 1:
 		BN_CONSTTIME_SWAP(0);

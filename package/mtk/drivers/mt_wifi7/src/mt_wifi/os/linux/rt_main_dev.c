@@ -612,40 +612,19 @@ PNET_DEV RtmpPhyNetDevInit(VOID *pAd, RTMP_OS_NETDEV_OP_HOOK *pNetDevHook)
 }
 
 
+/* Called from the transmit path while RTNL or an RCU read lock protects devices. */
 VOID *RtmpNetEthConvertDevSearch(VOID *net_dev_, UCHAR *pData)
 {
-	struct net_device *pNetDev;
-#if (KERNEL_VERSION(2, 6, 24) <= LINUX_VERSION_CODE)
-#if (KERNEL_VERSION(2, 6, 26) <= LINUX_VERSION_CODE)
-	struct net_device *net_dev = (struct net_device *)net_dev_;
-	struct net *net;
+	struct net_device *dev = net_dev_, *candidate;
 
-	net = dev_net(net_dev);
-	BUG_ON(!net);
-	for_each_netdev(net, pNetDev)
-#else
-	struct net *net;
-	struct net_device *net_dev = (struct net_device *)net_dev_;
-
-	BUG_ON(!net_dev->nd_net);
-	net = net_dev->nd_net;
-	for_each_netdev(net, pNetDev)
-#endif
-#else
-#if (KERNEL_VERSION(2, 6, 22) <= LINUX_VERSION_CODE)
-	for_each_netdev(pNetDev)
-#else
-
-	for (pNetDev = dev_base; pNetDev; pNetDev = pNetDev->next)
-#endif
-#endif
-	{
-		if ((pNetDev->type == ARPHRD_ETHER)
-			&& ether_addr_equal(pNetDev->dev_addr, &pData[6]))
-			break;
+	if (!dev || !pData)
+		return NULL;
+	for_each_netdev_rcu(dev_net(dev), candidate) {
+		if (candidate->type == ARPHRD_ETHER && candidate->addr_len == ETH_ALEN &&
+		    ether_addr_equal_unaligned(candidate->dev_addr, pData + ETH_ALEN))
+			return candidate;
 	}
-
-	return (VOID *)pNetDev;
+	return NULL;
 }
 
 
@@ -942,9 +921,9 @@ BOOLEAN RtmpPhyNetDevExit(VOID *pAd, PNET_DEV net_dev)
 	/* Unregister network device */
 	if (net_dev != NULL) {
 		MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_DOWN, DBG_LVL_ERROR,
-				 "RtmpOSNetDevDetach(): RtmpOSNetDeviceDetach(), dev->name=%s!\n", net_dev->name);
+				 "RtmpOSNetDevDetachRTNL(): RtmpOSNetDeviceDetach(), dev->name=%s!\n", net_dev->name);
 		RtmpOSNetDevProtect(1);
-		RtmpOSNetDevDetach(net_dev);
+		RtmpOSNetDevDetachRTNL(net_dev);
 		RtmpOSNetDevProtect(0);
 #ifdef RT_CFG80211_SUPPORT
 		RTMP_DRIVER_80211_UNREGISTER(pAd, net_dev);

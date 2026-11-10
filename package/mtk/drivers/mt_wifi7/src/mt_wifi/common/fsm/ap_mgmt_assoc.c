@@ -1557,6 +1557,14 @@ BOOLEAN PeerAssocReqCmmSanity
 #endif /* DOT11_EHT_BE */
 
 			switch (*extension_id) {
+#ifdef DOT11_EHT_BE
+			case EID_EXT_EHT_CAPS:
+			case EID_EXT_EHT_OP:
+			case EID_EXT_EHT_MULTI_LINK:
+			case IE_EXTENSION_ID_NON_INHERITANCE:
+				/* Already parsed by eht_get_ies(). */
+				break;
+#endif
 			case IE_EXTENSION_ID_ECDH:
 #if defined(CONFIG_OWE_SUPPORT) || defined(HOSTAPD_OWE_SUPPORT)
 			{
@@ -1590,8 +1598,8 @@ BOOLEAN PeerAssocReqCmmSanity
 				break;
 #endif
 			default:
-				MTWF_DBG(pAd, DBG_CAT_MLME, CATMLME_ASSOC, DBG_LVL_ERROR,
-					"IE_WLAN_EXTENSION: no handler for extension_id:%d\n", *extension_id);
+				MTWF_DBG(pAd, DBG_CAT_MLME, CATMLME_ASSOC, DBG_LVL_DEBUG,
+					"IE_WLAN_EXTENSION: ignoring extension_id:%d\n", *extension_id);
 				break;
 			}
 		}
@@ -1816,7 +1824,9 @@ static VOID ap_cmm_peer_assoc_req_action(
 	}
 #endif /* DOT11R_FT_SUPPORT */
 
+#ifdef DOT11R_FT_SUPPORT
 	NdisZeroMemory(rsnxe_ie, MAX_LEN_OF_RSNXEIE);
+#endif
 
 	/* disallow new association */
 	if (pAd->ApCfg.BANClass3Data == TRUE) {

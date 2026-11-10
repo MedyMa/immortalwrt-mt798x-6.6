@@ -9321,6 +9321,7 @@ INT RTMPAPQueryInformation(
 		BSS_STRUCT *pMbss = NULL;
 		PUINT8 p_cap = NULL;
 		UINT16 TotalLen = 0;
+		UINT i;
 
 		if (!VALID_MBSS(pAd, apidx))
 			return -EFAULT;
@@ -9373,10 +9374,14 @@ INT RTMPAPQueryInformation(
 		}
 		/*check for btm capablility*/
 		p_cap = (UINT8 *)(p_rrm_query_data+MAC_ADDR_LEN);
-		memset(p_cap, 0, 8);
+		for (i = 0; i < 8; i++)
+			p_cap[i] = 0;
 
 		if (p_rrm_command->command_id == OID_802_11_RRM_CMD_QUERY_CAP) {
-			memcpy(p_cap, (PUCHAR)&(pEntry->RrmEnCap), sizeof(pEntry->RrmEnCap));
+			UCHAR *rrm_cap = (UCHAR *)&pEntry->RrmEnCap;
+
+			for (i = 0; i < sizeof(pEntry->RrmEnCap); i++)
+				p_cap[i] = rrm_cap[i];
 		} else {
 			MTWF_DBG(pAd, DBG_CAT_PROTO, CATPROTO_RRM,  DBG_LVL_ERROR,
 				"RT_QUERY_WNM_CAPABILITY: only check rrm cap now\n");
@@ -25770,7 +25775,7 @@ INT Send_WNM_Notify_Req(
 		}
 
 		NdisZeroMemory(WNMNotifyPeerEntry, sizeof(*WNMNotifyPeerEntry));
-		WNMNotifyPeerEntry->CurrentState = WNM_NOTIFY_REQ;
+		WNMNotifyPeerEntry->CurrentState = WAIT_WNM_NOTIFY_REQ;
 		WNMNotifyPeerEntry->ControlIndex = APIndex;
 		NdisMoveMemory(WNMNotifyPeerEntry->PeerMACAddr, PeerMACAddr, MAC_ADDR_LEN);
 		WNMNotifyPeerEntry->DialogToken = 1;
@@ -29860,4 +29865,3 @@ INT Show_StationKeepAlive(
 
 	return TRUE;
 }
-

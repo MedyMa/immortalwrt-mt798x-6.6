@@ -1028,6 +1028,13 @@ function mtwifi_cfg_setup(argv)
                 set_dat(dats, apidx, "PMFSHA256", 0)
             end
 
+            if cfg.config.band == "6g" then
+                -- SAE hash-to-element and PMF are required on 6 GHz.
+                set_dat(dats, apidx, "PweMethod", 2)
+                set_dat(dats, apidx, "PMFMFPC", 1)
+                set_dat(dats, apidx, "PMFMFPR", 1)
+            end
+
             if not (authmode == "OPEN" or authmode == "OWE") then
                 set_dat(dats, apidx, "RekeyMethod", "TIME")
             end

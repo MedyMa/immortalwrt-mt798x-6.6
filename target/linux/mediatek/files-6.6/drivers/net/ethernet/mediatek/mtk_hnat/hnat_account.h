@@ -11,6 +11,9 @@ void hnat_account_cleanup(struct mtk_hnat *h);
 bool hnat_account_enabled(struct mtk_hnat *h);
 int hnat_account_drain(struct mtk_hnat *h, u32 ppe, u32 slot,
 		       struct hnat_accounting *total, struct hnat_accounting *delta);
+int hnat_account_update_metadata(struct mtk_hnat *h, u32 ppe, u32 slot,
+				 const struct foe_entry *before,
+				 const struct foe_entry *updated);
 bool hnat_account_entry_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 				 struct foe_entry *entry, u64 *generation);
 bool hnat_account_generation_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,

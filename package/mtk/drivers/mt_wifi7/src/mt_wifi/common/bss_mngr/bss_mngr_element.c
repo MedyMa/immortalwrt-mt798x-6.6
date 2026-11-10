@@ -532,7 +532,7 @@ u8 *build_rnr_ie(struct bmgr_entry *repting_entry, struct bmgr_entry *repted_ent
 	if (eid) {
 		/* EID per-reported bss */
 		eid->Eid = EID_REDUCED_NEIGHBOR_REPORT;
-		pos = &eid->Octet[0];
+		pos = (u8 *)eid + offsetof(EID_STRUCT, Octet);
 
 		/* NAP Info: TBTT Information Header */
 		SET_DOT11_RNR_TBTT_INFO_HDR_TYPE(tbtt_info_hdr, 0);

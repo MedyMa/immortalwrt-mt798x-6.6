@@ -40,7 +40,7 @@ void physical_device_workq_init(
 	void *physical_dev);
 void physical_device_workq_exit(
 	void *physical_dev);
-void physical_device_workq_add_job(
+BOOLEAN physical_device_workq_add_job(
 	struct _RTMP_ADAPTER *mac_ad,
 	struct wifi_dev *wdev,
 	u32 tag_id,

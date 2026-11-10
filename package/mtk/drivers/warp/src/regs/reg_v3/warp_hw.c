@@ -5630,7 +5630,7 @@ warp_wdma_rx_ring_get_idx(struct wdma_entry *wdma, u32 idx,
 	warp_io_read32(wdma, WDMA_RX_DRX_IDX_0 + offset, didx);
 }
 
-void
+static void
 warp_wifi_tx_ring_get_idx(struct wifi_entry *wifi, u32 idx,
 	u32 *base, u32 *tcnt, u32 *cidx, u32 *didx)
 {

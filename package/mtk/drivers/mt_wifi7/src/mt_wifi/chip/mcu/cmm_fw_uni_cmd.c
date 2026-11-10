@@ -11085,7 +11085,8 @@ INT32 UniCmdSetRadarThresParam(
 
 	u4ComCmdSize = sizeof(UniCmdRDD);
 	os_zero_mem(&cmd_radar_thres_update, sizeof(struct RDM_RDR_THRES_UPDATE_T));
-	NdisCopyMemory(&cmd_radar_thres_update.tag, p_radar_threshold, sizeof(CMD_RDM_RADAR_THRESHOLD_UPDATE_T));
+	NdisCopyMemory((UCHAR *)&cmd_radar_thres_update + offsetof(struct RDM_RDR_THRES_UPDATE_T, tag),
+		p_radar_threshold, sizeof(CMD_RDM_RADAR_THRESHOLD_UPDATE_T));
 	cmd_radar_thres_update.tag = ENUM_RDM_RADAR_THRESHOLD_UPDATE;
 #ifdef CFG_BIG_ENDIAN
 	cmd_radar_thres_update.tag
@@ -14668,7 +14669,8 @@ static INT32 UniCmdSetFixedRate(IN PRTMP_ADAPTER pAd, IN RTMP_STRING * arg, VOID
 		} while (0);
 	}
 
-	memcpy(&(prRaSetFixedRate->aucBuffer[0]), &RaFixedRateV1, sizeof(struct _UNI_CMD_RA_SET_FIXED_RATE_V1));
+	memcpy((UCHAR *)prRaSetFixedRate + offsetof(struct _UNI_CMD_RA_SET_FIXED_RATE_T, aucBuffer),
+		&RaFixedRateV1, sizeof(struct _UNI_CMD_RA_SET_FIXED_RATE_V1));
 
 	if (fgStatus == FALSE)
 		Ret = NDIS_STATUS_FAILURE;
@@ -14740,7 +14742,8 @@ static INT32 UniCmdSetFixedRateUl(IN PRTMP_ADAPTER pAd, IN RTMP_STRING * arg, VO
 #ifdef CFG_BIG_ENDIAN
 			RaFixedRateUlV1.u2WlanIdx = cpu2le16(RaFixedRateUlV1.u2WlanIdx);
 #endif
-			memcpy(&(prRaSetFixedRateUl->aucBuffer[0]), &RaFixedRateUlV1, sizeof(struct _UNI_CMD_RA_SET_FIXED_RATE_UL_TRIG_V1));
+			memcpy((UCHAR *)prRaSetFixedRateUl + offsetof(struct _UNI_CMD_RA_SET_FIXED_RATE_UL_TRIG_T, aucBuffer),
+				&RaFixedRateUlV1, sizeof(struct _UNI_CMD_RA_SET_FIXED_RATE_UL_TRIG_V1));
 
 			RTMP_SEM_EVENT_UP(&pAd->AutoRateLock);
 		} while (0);
@@ -20491,6 +20494,12 @@ INT32 UniCmdPPCapCtrl(
 
 			/* Send out CMD */
 			Ret = chip_cmd_tx(pAd, msg);
+			if (Ret != NDIS_STATUS_SUCCESS) {
+				MTWF_DBG(pAd, DBG_CAT_HW, CATHW_PHY, DBG_LVL_WARN,
+					"PP update failed: subcmd=%u status=0x%x\n",
+					pp_cmd_cap->cmd_sub_id, Ret);
+				goto error;
+			}
 
 			/* Process next remaining payload */
 			u4RemainingPayloadSize -= u4SendBufSize;
@@ -31625,6 +31634,15 @@ INT32 UniCmdVOWUpdate(
 			/* Send out CMD */
 			call_fw_cmd_notifieriers(WO_CMD_DEV_INFO, pAd, msg->net_pkt);
 			Ret = chip_cmd_tx(pAd, msg);
+			if (Ret != NDIS_STATUS_SUCCESS) {
+				for (i = 0; i < UNI_CMD_VOW_MAX_NUM; i++) {
+					if (pVOWParam->VOWTagValid[i])
+						MTWF_DBG(pAd, DBG_CAT_AP, CATAP_VOW, DBG_LVL_WARN,
+							"VOW update failed: tag=0x%llx set=%u status=0x%x\n",
+							UniCmdVowTab[i].u8CmdFeature, isSet, Ret);
+				}
+				goto error;
+			}
 
 			/* Process next remaining payload */
 			u4RemainingPayloadSize -= u4SendBufSize;

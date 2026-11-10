@@ -17,6 +17,7 @@
 #ifndef _WARP_UTILITY_H_
 #define _WARP_UTILITY_H_
 
+#include <linux/vmalloc.h>
 #include <linux/list.h>
 #include <linux/file.h>
 #include <linux/platform_device.h>

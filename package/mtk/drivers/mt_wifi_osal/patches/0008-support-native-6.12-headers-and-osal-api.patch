@@ -1,0 +1,164 @@
+--- a/mt_osal_csi.c
++++ b/mt_osal_csi.c
+@@ -3,7 +3,12 @@
+ #include <linux/netdevice.h>
+ #include <linux/types.h>
+ #include <linux/proc_fs.h>
++#include <linux/version.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++#include <linux/unaligned.h>
++#else
+ #include <asm/unaligned.h>
++#endif
+ 
+ #define SUBMODULE "mt_osal_csi"
+ #include <mt_osal_debug.h>
+--- a/mt_osal_util.c
++++ b/mt_osal_util.c
+@@ -88,6 +88,13 @@
+ }
+ EXPORT_SYMBOL(mt_os_dynamic_idr_init);
+ 
++int mt_os_dynamic_idr_init_range(void *ctx, int low, int high, void *data,
++	mt_os_dynamic_idr_data_free_t free_fn)
++{
++	return mt_os_dynamic_idr_init(ctx, low, high, data, free_fn);
++}
++EXPORT_SYMBOL(mt_os_dynamic_idr_init_range);
++
+ void mt_os_dynamic_idr_exit(void* ctx)
+ {
+ 	mt_os_dynamic_idr_t *id_ctx = (mt_os_dynamic_idr_t *)ctx;
+@@ -166,6 +173,12 @@
+ }
+ EXPORT_SYMBOL(mt_os_dynamic_id_init);
+ 
++int mt_os_dynamic_id_init_range(void *ctx, int low, int high)
++{
++	return mt_os_dynamic_id_init(ctx, low, high);
++}
++EXPORT_SYMBOL(mt_os_dynamic_id_init_range);
++
+ void mt_os_dynamic_id_exit(void* ctx)
+ {
+ 	mt_os_dynamic_id_t *id_ctx = (mt_os_dynamic_id_t *)ctx;
+--- a/inc/mt_osal_util.h
++++ b/inc/mt_osal_util.h
+@@ -49,6 +49,12 @@
+ 	void *data;
+ } mt_os_dynamic_idr_t;
+ 
++int mt_os_dynamic_idr_init(void *ctx,
++			int low,
++			int high,
++			void* data,
++			mt_os_dynamic_idr_data_free_t free_fn);
++
+ int mt_os_dynamic_idr_init_range(void *ctx,
+ 			int low,
+ 			int high,
+@@ -83,6 +89,10 @@
+ 	int low;
+ } mt_os_dynamic_id_t;
+ 
++int mt_os_dynamic_id_init(void *ctx,
++			int low,
++			int high);
++
+ int mt_os_dynamic_id_init_range(void *ctx,
+ 			int low,
+ 			int high);
+--- a/inc/mt_osal_timer.h
++++ b/inc/mt_osal_timer.h
+@@ -73,6 +73,7 @@
+ void mt_os_get_time64(mt_os_time64_t *ts);
+ 
+ u64 mt_os_get_boottime64_ns(void);
++u64 mt_ktime_get_boottime_ns(void);
+ 
+ #define ms_os_time64_to_ms(_ts64) (timespec64_to_ns(_ts64) / NSEC_PER_MSEC)
+ 
+--- a/mt_osal_genl.c
++++ b/mt_osal_genl.c
+@@ -4,7 +4,12 @@
+ #include <linux/netdevice.h>
+ #include <linux/types.h>
+ #include <linux/proc_fs.h>
++#include <linux/version.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++#include <linux/unaligned.h>
++#else
+ #include <asm/unaligned.h>
++#endif
+ 
+ #define SUBMODULE "mt_osal_genl"
+ #include <mt_osal_debug.h>
+--- a/mt_osal_proc.c
++++ b/mt_osal_proc.c
+@@ -4,6 +4,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/types.h>
+ #include <linux/proc_fs.h>
++#include <linux/version.h>
+ 
+ #define SUBMODULE "mt_osal_proc"
+ #include <mt_osal_debug.h>
+--- a/mt_osal_cfg80211.c
++++ b/mt_osal_cfg80211.c
+@@ -38,7 +38,6 @@
+ 
+ #define MSEC_TO_SEC(_msec)		((_msec) / MSEC_PER_SEC)
+ 
+-unsigned char mt_zero_mac_addr[MT_MAC_ADDR_LEN]  = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+ 
+ static u16 mtk_vht_high_rate_bw80[3][4] = {
+ 	{292, 585, 877, 1170},
+--- a/mt_osal_type.c
++++ b/mt_osal_type.c
+@@ -19,6 +19,8 @@
+ #define SUBMODULE "mt_osal_type"
+ #include <mt_osal_debug.h>
+ #include <mt_osal_type.h>
++
++unsigned char mt_zero_mac_addr[MT_MAC_ADDR_LEN];
+ #include <mt_osal_module.h>
+ 
+ 
+--- a/mt_osal_diag.c
++++ b/mt_osal_diag.c
+@@ -784,7 +784,7 @@
+ 	}
+ }
+ 
+-void mt_diag_frame_cache(
++static void mt_diag_frame_cache(
+ 	u8 device_idx,
+ 	u8 band_idx,
+ 	struct mt_diag_frame_info *info)
+@@ -861,7 +861,7 @@
+ 	kfree(entry);
+ }
+ 
+-void mt_diag_conn_error(
++static void mt_diag_conn_error(
+ 	u8 device_idx,
+ 	u8 band_idx,
+ 	u8 *ssid,
+@@ -921,7 +921,7 @@
+ 		MT_DEBUG_TRACE("diag_ctrl not init\n");
+ }
+ 
+-void mt_diag_conn_error_write(u8 device_idx, u8 band_idx)
++static void mt_diag_conn_error_write(u8 device_idx, u8 band_idx)
+ {
+ 	MT_OS_FD fd = NULL;
+ 	MT_OS_FS_INFO osFSInfo;
+@@ -1045,7 +1045,7 @@
+ 	}
+ }
+ 
+-void mt_diag_log_file_write(u8 device_idx, u8 band_idx)
++static void mt_diag_log_file_write(u8 device_idx, u8 band_idx)
+ {
+ 	MT_OS_FD fd = NULL;
+ 	MT_OS_FS_INFO osFSInfo;

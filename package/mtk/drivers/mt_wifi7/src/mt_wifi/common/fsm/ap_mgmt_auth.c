@@ -713,7 +713,9 @@ VOID ap_peer_auth_req_at_idle_action(RTMP_ADAPTER *pAd, MLME_QUEUE_ELEM *Elem)
 			MTWF_DBG(pAd, DBG_CAT_MLME, CATMLME_AUTH, DBG_LVL_ERROR,
 				"Fail: mld conn request (bss:%s, setup addr:%pM)\n",
 				RtmpOsGetNetDevName(wdev->if_dev), pAuth_info->addr2);
+#ifdef WAPP_SUPPORT
 			wapp_auth_fail = BSSID_IF_NOT_READY;
+#endif
 			goto auth_failure;
 		}
 	}

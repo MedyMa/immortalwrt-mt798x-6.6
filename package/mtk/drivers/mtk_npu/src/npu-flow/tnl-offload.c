@@ -227,6 +227,7 @@ static int flow_prepare(const struct net_device_path *path,
 	struct npu_tnl_input input = { .kind = NPU_TNL_INPUT_FLOW };
 	struct npu_tnl_params params = {};
 	struct npu_tnl_type *type;
+	int ret;
 
 	if (!path || !path->dev || dev_net(path->dev) != &init_net ||
 	    !netif_running(path->dev) || !flow_supported(path->type) ||
@@ -236,7 +237,9 @@ static int flow_prepare(const struct net_device_path *path,
 	type = mtk_npu_tnl_type_get_by_path_type(path->type);
 	if (IS_ERR(type))
 		return PTR_ERR(type);
-	type->tnl_flow_param_setup(path, &params.params);
+	ret = type->tnl_flow_param_setup(path, &params.params);
+	if (ret)
+		return ret;
 	params.npu_entry_proto = type->tnl_proto_type;
 	input.flow.path = path;
 	input.flow.token = token;

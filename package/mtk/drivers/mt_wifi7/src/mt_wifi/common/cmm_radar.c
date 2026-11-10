@@ -808,14 +808,14 @@ NTSTATUS Dot11HCntDownTimeoutAction(PRTMP_ADAPTER pAd, PCmdQElmt CMDQelmt)
 		}
 #ifdef ZERO_PKT_LOSS_SUPPORT
 		pAd->chan_switch_time[4] = jiffies_to_msecs(jiffies);
-		chnl_switch_init = ktime_get();
+		chnl_switch_init = mt_ktime_get();
 #endif /*#ZERO_PKT_LOSS_SUPPORT*/
 
 		/* Update channel of wdev as new channel */
 		ap_phy_rrm_init_byRf(pAd, wdev);
 
 #ifdef ZERO_PKT_LOSS_SUPPORT
-		chnl_switch_exit = ktime_get();
+		chnl_switch_exit = mt_ktime_get();
 
 		if (pAd->Zero_Loss_Enable) {
 			/*set ChnlSwitchState = ASIC_CHANNEL_SWITCH_COMMAND_ISSUED*/

@@ -58,6 +58,7 @@ define KernelPackage/npu
 	@(TARGET_mediatek_filogic||TARGET_mediatek_filogic_a73||TARGET_mediatek_mt7988) \
 	+kmod-pce \
 	+kmod-ppp \
+	+MTK_NPU_FLOW:kmod-nf-flow \
 	+@KERNEL_RELAY \
 	+@MTK_NPU \
 	+MTK_NPU_REBB_SUPPORT:npu-rebb-fw \

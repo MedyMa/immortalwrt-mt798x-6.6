@@ -258,7 +258,7 @@ static void physical_device_main_timer(
 			"enter\n");
 		ph_dev->periodic_round++;
 		OS_SEM_LOCK(&ph_dev->ph_dev_wq_lock);
-		if (ph_dev->ph_dev_work_list.size)
+		if (ph_dev->ph_dev_wq && ph_dev->ph_dev_work_list.size)
 			mt_queue_delayed_work(ph_dev->ph_dev_wq, &ph_dev->ph_dev_work, timeout);
 		OS_SEM_UNLOCK(&ph_dev->ph_dev_wq_lock);
 		RTCMDUp(PD_GET_DEVICE_TASK_PTR(ph_dev));

@@ -1,0 +1,303 @@
+Subject: osal: validate netdevice registration and retain ops until unregister completes
+
+--- a/mt_osal_net.c
++++ b/mt_osal_net.c
+@@ -144,7 +144,6 @@
+ 	}
+ }
+ 
+-#ifdef BACKPORT_NOSTDINC
+ static void mt_os_net_dev_ops_free(struct net_device *net_dev)
+ {
+ 	void *net_dev_ops = NULL;
+@@ -159,7 +158,6 @@
+ 	if (net_dev_ops)
+ 		vfree(net_dev_ops);
+ }
+-#endif /* BACKPORT_NOSTDINC */
+ 
+ static int mt_os_net_dev_main_if_open(
+ 	struct net_device *net_dev)
+@@ -172,11 +170,14 @@
+ 		return -1;
+ 	if (!priv_info->init)
+ 		return -1;
++	if (!try_module_get(THIS_MODULE))
++		return -ENODEV;
+ 	ret = priv_info->init(net_dev);
+-	if (ret)
+-		return -1;
+-
+-	MT_MOD_INC_USE_COUNT();
++	if (ret) {
++		module_put(THIS_MODULE);
++		return ret < 0 ? ret : -EIO;
++	}
++
+ 	netif_start_queue(net_dev);
+ 	netif_carrier_on(net_dev);
+ 	netif_wake_queue(net_dev);
+@@ -205,7 +206,7 @@
+ 	struct net_device_stats *pStats = &net_dev->stats;
+ 	struct mt_net_dev_priv *priv_info = NULL;
+ 	struct mt_os_net_dev_stats DrvStats, *pDrvStats = &DrvStats;
+-	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig, *pIoctlConfig = &IoctlConfig;
++	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig = {}, *pIoctlConfig = &IoctlConfig;
+ 
+ 	priv_info = (struct mt_net_dev_priv *)netdev_priv((struct net_device *)net_dev);
+ 	if (!priv_info)
+@@ -213,6 +214,7 @@
+ 	if (!priv_info->ioctl)
+ 		return pStats;
+ 
++	pIoctlConfig->net_dev = net_dev;
+ 	pIoctlConfig->priv_flags = mt_os_net_dev_get_priv_flags(net_dev);
+ 	pIoctlConfig->data = (void *)pDrvStats;
+ 	pIoctlConfig->data_len = sizeof(*pDrvStats);
+@@ -232,7 +234,7 @@
+ 	pStats->collisions = pDrvStats->collisions;
+ 	pStats->rx_length_errors = 0;
+ 	pStats->rx_over_errors = pDrvStats->rx_over_errors;
+-	pStats->rx_crc_errors = 0;
++	pStats->rx_crc_errors = pDrvStats->rx_crc_errors;
+ 	pStats->rx_frame_errors = pDrvStats->rx_frame_errors;
+ 	pStats->rx_fifo_errors = pDrvStats->rx_fifo_errors;
+ 	pStats->rx_missed_errors = 0;
+@@ -356,10 +358,13 @@
+ 	struct sockaddr *sa = addr;
+ 	int ret = 0;
+ 
+-	if (addr_str)
++	if (!dev || !sa)
++		return -EINVAL;
++	if (addr_str) {
+ 		ret = snprintf(addr_str, 18, "%pM", sa->sa_data);
+-	if (ret != 17)
+-		return -17;
++		if (ret != 17)
++			return -EINVAL;
++	}
+ 
+ 	ret = eth_prepare_mac_addr_change(dev, addr);
+ 	if (ret < 0)
+@@ -456,8 +461,12 @@
+ unsigned long mt_os_net_dev_get_qstate(void *net_dev, unsigned int q_idx)
+ {
+ #if (KERNEL_VERSION(3, 8, 0) <= LINUX_VERSION_CODE)
+-	struct netdev_queue *que = netdev_get_tx_queue((struct net_device *)net_dev, q_idx);
+-
++	struct net_device *dev = net_dev;
++	struct netdev_queue *que;
++
++	if (!dev || q_idx >= dev->num_tx_queues)
++		return ~0UL;
++	que = netdev_get_tx_queue(dev, q_idx);
+ 	if (que)
+ 		return que->state;
+ 	else
+@@ -496,13 +505,11 @@
+ 	}
+ 
+ 	tmp_ptr = NULL;
+-#ifdef BACKPORT_NOSTDINC
+ 	if (dev->priv_destructor == mt_os_net_dev_ops_free) {
+ 		/* A device which never registered still owns its ops. */
+ 		if (dev->reg_state == NETREG_UNINITIALIZED)
+ 			mt_os_net_dev_ops_free(dev);
+ 	} else
+-#endif
+ 		tmp_ptr = (void *)dev->netdev_ops;
+ 	free_netdev(dev);
+ 	if (tmp_ptr)
+@@ -510,20 +517,21 @@
+ }
+ EXPORT_SYMBOL(mt_os_net_dev_free);
+ 
++/* Borrowed result: the caller keeps RTNL or its RCU read lock held. */
+ void *mt_os_net_dev_eth_convert_search(void *net_dev_, unsigned char *data)
+ {
+-	struct net_device *net_dev = (struct net_device *)net_dev_;
+-	struct net *net;
+-
+-	net = dev_net(net_dev);
+-	BUG_ON(!net);
+-	for_each_netdev(net, net_dev) {
+-		if ((net_dev->type == ARPHRD_ETHER)
+-			&& (!memcmp(net_dev->dev_addr, &data[6], net_dev->addr_len)))
+-			break;
+-	}
+-
+-	return (void *)net_dev;
++	struct net_device *dev = net_dev_, *candidate;
++
++	if (!dev || !data)
++		return NULL;
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held() && !lockdep_rtnl_is_held(),
++			"OSAL netdevice lookup requires RTNL or RCU");
++	for_each_netdev_rcu(dev_net(dev), candidate) {
++		if (candidate->type == ARPHRD_ETHER && candidate->addr_len == ETH_ALEN &&
++		    ether_addr_equal_unaligned(candidate->dev_addr, data + ETH_ALEN))
++			return candidate;
++	}
++	return NULL;
+ }
+ EXPORT_SYMBOL(mt_os_net_dev_eth_convert_search);
+ 
+@@ -541,6 +549,12 @@
+ 	struct net_device *net_dev = NULL;
+ 	bool status;
+ 
++	if (!name_prefix || !*name_prefix ||
++	    strnlen(name_prefix, IFNAMSIZ) >= IFNAMSIZ || priv_mem_size < 0 ||
++	    (add_suffix && (!ioctl_if || dev_num < 0 || dev_num >= 32)))
++		return NULL;
++	/* All accessors use mt_net_dev_priv, even for a zero-size request. */
++	priv_mem_size = max_t(int, priv_mem_size, sizeof(struct mt_net_dev_priv));
+ 	/* allocate a new network device */
+ 	mt_os_net_dev_alloc(&net_dev, priv_mem_size);
+ 	if (!net_dev) {
+@@ -556,11 +570,13 @@
+ 	}
+ 	MT_DEBUG_TRACE("Allocate net device ops success!\n");
+ 	net_dev->netdev_ops = net_dev_ops;
++	net_dev->priv_destructor = mt_os_net_dev_ops_free;
++	net_dev->needs_free_netdev = false;
+ 
+ 	/* find a available interface name, max 32 interfaces */
+ 	if (!add_suffix) {
+ 		memset(&net_dev->name[0], 0, IFNAMSIZ);
+-		strncpy(&net_dev->name[0], name_prefix, sizeof(net_dev->name));
++		strscpy(net_dev->name, name_prefix, sizeof(net_dev->name));
+ 	} else {
+ 		status = mt_os_net_dev_request_name(
+ 			mc_row_id, ioctl_if, net_dev, name_prefix, dev_num, auto_suffix);
+@@ -572,6 +588,10 @@
+ 			mt_os_net_dev_free(net_dev);
+ 			return NULL;
+ 		}
++	}
++	if (!dev_valid_name(net_dev->name)) {
++		mt_os_net_dev_free(net_dev);
++		return NULL;
+ 	}
+ 	MT_DEBUG_TRACE("The name of the new %s interface is %s\n",
+ 			 name_prefix, net_dev->name);
+@@ -619,11 +639,28 @@
+ 	unsigned char backport)
+ {
+ 	struct net_device *net_dev = (struct net_device *)net_dev_;
+-	struct net_device_ops *net_dev_ops = (struct net_device_ops *)net_dev->netdev_ops;
++	struct net_device_ops *net_dev_ops;
+ 	int ret = 0, rtnl_locked = false;
+ 	struct mt_net_dev_priv *priv_info = NULL;
+ 	struct wireless_dev *wdev;
+-
++#ifdef CFG80211_SUPPORT
++	bool created_wiphy = false;
++#endif
++
++	if (!net_dev || !net_dev_op_hook || !net_dev->netdev_ops || !net_dev_op_hook->xmit ||
++	    (!!net_dev_op_hook->open != !!net_dev_op_hook->stop))
++		return -EINVAL;
++	if (net_dev_op_hook->reg_cfg80211 && net_dev_op_hook->needProtcted)
++		return -EINVAL;
++#ifndef BACKPORT_NOSTDINC
++	if (backport)
++		return -EOPNOTSUPP;
++#endif
++#ifndef CFG80211_SUPPORT
++	if (net_dev_op_hook->reg_cfg80211)
++		return -EOPNOTSUPP;
++#endif
++	net_dev_ops = (struct net_device_ops *)net_dev->netdev_ops;
+ 	priv_info = (struct mt_net_dev_priv *)netdev_priv((struct net_device *)net_dev);
+ 	priv_info->register_mode = backport;
+ 
+@@ -645,7 +682,8 @@
+ 		net_dev_ops->ndo_do_ioctl = mt_os_wifi_ioctl;
+ 		if (net_dev_op_hook->set_mac_addr)
+ 			net_dev_ops->ndo_set_mac_address = net_dev_op_hook->set_mac_addr;
+-		net_dev_ops->ndo_get_stats = mt_os_net_dev_get_ether_stats;
++		net_dev_ops->ndo_get_stats = net_dev_op_hook->get_stats ?
++			net_dev_op_hook->get_stats : mt_os_net_dev_get_ether_stats;
+ 		/* copy the net device mac address to the net_device structure. */
+ #if (KERNEL_VERSION(5, 4, 251) <= LINUX_VERSION_CODE)
+ 		dev_addr_set(net_dev, net_dev_op_hook->devAddr);
+@@ -659,17 +697,22 @@
+ 		mt_os_iw_reg_handlers(net_dev);
+ #endif /* CONFIG_WIRELESS_EXT */
+ #ifdef CFG80211_SUPPORT
+-		if (net_dev_op_hook->reg_cfg80211)
+-			mt_cfg80211_register(net_dev_op_hook->dev, net_dev, net_dev_op_hook);
++		if (net_dev_op_hook->reg_cfg80211) {
++			if (!mt_cfg80211_register(net_dev_op_hook->dev, net_dev, net_dev_op_hook))
++				return -EIO;
++			created_wiphy = true;
++		}
+ #endif /* CFG80211_SUPPORT */
+ 	}
+ 
+ 	net_dev_ops->ndo_validate_addr = NULL;
+ 
+ 	if (backport) {
+-		wdev = net_dev->ieee80211_ptr;   
+-        if (!wdev)
+-      		return -EPERM;
++		wdev = net_dev->ieee80211_ptr;
++		if (!wdev) {
++			ret = -ENODEV;
++			goto out;
++		}
+ #ifdef BACKPORT_NOSTDINC
+ 		/* detach unregisters; mt_os_net_dev_free() releases the allocation. */
+ 		net_dev->needs_free_netdev = false;
+@@ -677,8 +720,10 @@
+ 		if (rtnl_locked) {
+ 			ret = cfg80211_register_netdevice(net_dev);
+ 		} else {
+-			if (rtnl_lock_killable())
+-				return -EINTR;
++			if (rtnl_lock_killable()) {
++				ret = -EINTR;
++				goto out;
++			}
+ 			wiphy_lock(wdev->wiphy);
+ 			ret = cfg80211_register_netdevice(net_dev);
+ 			wiphy_unlock(wdev->wiphy);
+@@ -694,7 +739,13 @@
+ 			ret = register_netdev(net_dev);
+ 	}
+ 
+-	netif_stop_queue(net_dev);
++out:
++#ifdef CFG80211_SUPPORT
++	if (ret && created_wiphy)
++		mt_cfg80211_unregister(net_dev);
++#endif
++	if (!ret)
++		netif_stop_queue(net_dev);
+ 	MT_DEBUG_TRACE("ret=%d\n", ret);
+ 
+ 	return ret;
+--- a/inc/mt_osal_net.h
++++ b/inc/mt_osal_net.h
+@@ -105,6 +105,7 @@
+ int mt_os_net_dev_get_if_idx(void *net_dev);
+ /* Caller owns the allocation and calls this once after detach (or attach failure). */
+ void mt_os_net_dev_free(void *net_dev);
++/* Borrowed result, or NULL; caller holds RTNL or RCU throughout use. */
+ void *mt_os_net_dev_eth_convert_search(void *net_dev_, unsigned char *data);
+ void *mt_os_net_dev_create(
+ 	int mc_row_id,
+@@ -115,9 +116,10 @@
+ 	char *name_prefix,
+ 	unsigned char add_suffix,
+ 	unsigned char auto_suffix);
+-/* Caller holds RTNL; unregisters the device without freeing its allocation. */
++/* Caller holds RTNL (and the wiphy lock for cfg80211); allocation stays caller-owned. */
+ void mt_os_net_dev_detach(void *net_dev_, enum net_dev_mode unused);
+ void mt_os_net_dev_protect(bool lock_it);
++/* reg_cfg80211 creates a radio: process context without RTNL already held. */
+ int mt_os_net_dev_register(
+ 	void *net_dev_,
+ 	struct mt_os_net_dev_op_hook *net_dev_op_hook,

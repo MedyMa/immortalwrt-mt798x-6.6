@@ -3813,7 +3813,7 @@ INT set_time_sync_trigger(RTMP_ADAPTER *pAd, RTMP_STRING *arg)
 		MTWF_PRINT("Format: iwpriv ra0 set time_sync=[second]-[usecond]\n");
 
 #if (KERNEL_VERSION(5, 0, 0) <= LINUX_VERSION_CODE)
-		ktime_get_real_ts64(&time);
+		mt_ktime_get_real_ts64(&time);
 		second = (unsigned int)time.tv_sec;
 		usecond = (unsigned int)time.tv_nsec/1000;
 #else

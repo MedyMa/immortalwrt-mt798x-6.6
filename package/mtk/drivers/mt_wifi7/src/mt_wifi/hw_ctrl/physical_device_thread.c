@@ -102,7 +102,7 @@ static NTSTATUS physical_device_trigger_fw_time_sync(
 #if (KERNEL_VERSION(5, 0, 0) <= LINUX_VERSION_CODE)
 	struct timespec64 time;
 
-	ktime_get_real_ts64(&time);
+	mt_ktime_get_real_ts64(&time);
 	second = (unsigned int)time.tv_sec;
 	usecond = (unsigned int)time.tv_nsec/1000;
 #else

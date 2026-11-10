@@ -16,6 +16,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/delay.h>
 #include <linux/if.h>
+#include <linux/log2.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
@@ -29,6 +30,7 @@
 
 #include "nf_hnat_mtk.h"
 #include "hnat.h"
+#include "hnat_api.h"
 
 struct mtk_hnat *hnat_priv;
 static struct socket *_hnat_roam_sock;
@@ -694,16 +696,23 @@ static int hnat_start(u32 ppe_id)
 	if (ppe_id >= CFG_PPE_NUM)
 		return -EINVAL;
 
-	/* mapp the FOE table */
-	for (etry_num_cfg = DEF_ETRY_NUM_CFG ; etry_num_cfg >= 0 ;
+	/* All PPEs share one entry count. Derive each hardware size code from
+	 * the selected count, and let only PPE0 reduce that count on allocation
+	 * pressure. Later PPEs must use the same size or fail probe.
+	 */
+	for (etry_num_cfg = ilog2(hnat_priv->foe_etry_num) - 10;
+	     etry_num_cfg >= 0;
 	     etry_num_cfg--, hnat_priv->foe_etry_num /= 2) {
 		foe_table_sz = hnat_priv->foe_etry_num * sizeof(struct foe_entry);
 		hnat_priv->foe_table_cpu[ppe_id] = dma_alloc_coherent(
 				hnat_priv->dev, foe_table_sz,
 				&hnat_priv->foe_table_dev[ppe_id], GFP_KERNEL);
 
-		if (!hnat_priv->foe_table_cpu[ppe_id])
+		if (!hnat_priv->foe_table_cpu[ppe_id]) {
+			if (ppe_id)
+				return -ENOMEM;
 			continue;
+		}
 
 		if (hnat_priv->data->whnat && !hnat_priv->foe_flow[ppe_id]) {
 			foe_flow_sz = (hnat_priv->foe_etry_num / 4) *
@@ -723,7 +732,7 @@ static int hnat_start(u32 ppe_id)
 
 	if (!hnat_priv->foe_table_cpu[ppe_id] ||
 	    (hnat_priv->data->whnat && !hnat_priv->foe_flow[ppe_id]))
-		return -1;
+		return -ENOMEM;
 	dev_info(hnat_priv->dev, "PPE%d entry number = %d\n",
 		 ppe_id, hnat_priv->foe_etry_num);
 
@@ -742,7 +751,7 @@ static int hnat_start(u32 ppe_id)
 			dma_alloc_coherent(hnat_priv->dev, foe_mib_tb_sz,
 					   &hnat_priv->foe_mib_dev[ppe_id], GFP_KERNEL);
 		if (!hnat_priv->foe_mib_cpu[ppe_id])
-			return -1;
+			return -ENOMEM;
 		writel(hnat_priv->foe_mib_dev[ppe_id],
 		       hnat_priv->ppe_base[ppe_id] + PPE_MIB_TB_BASE);
 		memset(hnat_priv->foe_mib_cpu[ppe_id], 0, foe_mib_tb_sz);
@@ -751,7 +760,7 @@ static int hnat_start(u32 ppe_id)
 			kzalloc(hnat_priv->foe_etry_num * sizeof(struct hnat_accounting),
 				GFP_KERNEL);
 		if (!hnat_priv->acct[ppe_id])
-			return -1;
+			return -ENOMEM;
 	}
 
 	hnat_priv->etry_num_cfg = etry_num_cfg;
@@ -1240,6 +1249,9 @@ static int hnat_probe(struct platform_device *pdev)
 	err = hnat_account_init(hnat_priv);
 	if (err)
 		goto err_out;
+	err = hnat_api_init();
+	if (err)
+		goto err_out;
 
 	if (hnat_priv->data->whnat) {
 		err = whnat_adjust_nf_hooks();
@@ -1289,6 +1301,7 @@ static int hnat_probe(struct platform_device *pdev)
 
 err_out:
 	hnat_deinit_debugfs(hnat_priv);
+	hnat_api_deinit();
 	if (hnat_netdevice_registered) {
 		unregister_netdevice_notifier(&nf_hnat_netdevice_nb);
 		hnat_netdevice_registered = false;
@@ -1326,6 +1339,7 @@ static int hnat_remove(struct platform_device *pdev)
 	platform_set_drvdata(pdev, NULL);
 
 	hnat_deinit_debugfs(hnat_priv);
+	hnat_api_deinit();
 	hnat_roaming_disable();
 	if (hnat_netdevice_registered) {
 		unregister_netdevice_notifier(&nf_hnat_netdevice_nb);

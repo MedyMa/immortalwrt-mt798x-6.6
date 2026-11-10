@@ -1,0 +1,60 @@
+Subject: osal: wait for running timers and report calendar and boot times correctly
+
+--- a/mt_osal_timer.c
++++ b/mt_osal_timer.c
+@@ -94,9 +94,9 @@
+ 	OS_TIMER *pTimer,
+ 	unsigned char *pCancelled)
+ {
+-	if (timer_pending(pTimer))
+-		*pCancelled = del_timer_sync(pTimer);
+-	else
++	/* A running callback is not necessarily timer_pending(). */
++	del_timer_sync(pTimer);
++	if (pCancelled)
+ 		*pCancelled = true;
+ }
+ EXPORT_SYMBOL(mt_os_del_timer);
+@@ -164,17 +164,7 @@
+ 
+ u64 mt_os_get_boottime64_ns(void)
+ {
+-	mt_os_time64_t ts;
+-	u64 ns;
+-
+-        MT_DEBUG_TRACE_IN("");
+-
+-	getboottime64(&ts);
+-	ns = timespec64_to_ns(&ts);
+-
+-        MT_DEBUG_TRACE_OUT("");
+-
+-	return (u64)ns;
++	return ktime_get_boottime_ns();
+ }
+ EXPORT_SYMBOL(mt_os_get_boottime64_ns);
+ 
+@@ -195,10 +185,11 @@
+ 		return;
+ 	}
+ 	ktime_get_real_ts64(&txc);
+-	tm = rtc_ktime_to_tm(txc.tv_sec);
++	rtc_time64_to_tm(txc.tv_sec, &tm);
+ 	tm_info->year = tm.tm_year + 1900;
+ 	tm_info->month = tm.tm_mon + 1;
+-	tm_info->day = tm.tm_hour;
++	tm_info->day = tm.tm_mday;
++	tm_info->hour = tm.tm_hour;
+ 	tm_info->min = tm.tm_min;
+ 	tm_info->sec = tm.tm_sec;
+ }
+--- a/inc/mt_osal_timer.h
++++ b/inc/mt_osal_timer.h
+@@ -40,6 +40,7 @@
+ void mt_os_mod_timer(
+ 	OS_TIMER *pTimer,
+ 	unsigned long timeout);
++/* Process context; caller prevents concurrent rearming while releasing storage. */
+ void mt_os_del_timer(
+ 	OS_TIMER *pTimer,
+ 	unsigned char *pCancelled);

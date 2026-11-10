@@ -12,6 +12,7 @@
 
 */
 #include "warp.h"
+#include "warp_woif.h"
 
 static struct wo_entry wo;
 

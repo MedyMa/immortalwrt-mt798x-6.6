@@ -88,25 +88,23 @@ void mt_synchronize_rcu(void)
 }
 EXPORT_SYMBOL(mt_synchronize_rcu);
 
-
-ktime_t mt_ktime_get(void)
+void *mt_skb_pull_rcsum(struct sk_buff *skb, unsigned int len)
 {
-	return ktime_get();
+	return skb_pull_rcsum(skb, len);
 }
-EXPORT_SYMBOL(mt_ktime_get);
+EXPORT_SYMBOL(mt_skb_pull_rcsum);
 
-
-ktime_t mt_ktime_get_with_offset(enum tk_offsets offs)
+void mt_rcu_barrier(void)
 {
-	return ktime_get_with_offset(offs);
+	rcu_barrier();
 }
-EXPORT_SYMBOL(mt_ktime_get_with_offset);
+EXPORT_SYMBOL(mt_rcu_barrier);
 
-u64 mt_ktime_get_boottime_ns(void)
-{
-	return ktime_get_boottime_ns();
-}
-EXPORT_SYMBOL(mt_ktime_get_boottime_ns);
+/*
+ * mt_ktime_get, mt_ktime_get_with_offset, mt_ktime_get_boottime_ns,
+ * and mt_ktime_get_real_ts64 are provided by kmod-mt_wifi_cmn to avoid
+ * GPL-only symbol exports (ktime_get, etc.) from this proprietary module.
+ */
 
 #ifdef RT_CFG80211_SUPPORT
 int mt_cfg80211_vendor_cmd_reply(struct sk_buff *skb)
@@ -212,7 +210,8 @@ EXPORT_SYMBOL(mt_devm_kzalloc);
 
 int mt_init_dummy_netdev(struct net_device *dev)
 {
-	return init_dummy_netdev(dev);
+	init_dummy_netdev(dev);
+	return 0;
 }
 EXPORT_SYMBOL(mt_init_dummy_netdev);
 

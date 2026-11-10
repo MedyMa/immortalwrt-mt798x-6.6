@@ -538,7 +538,8 @@ static VOID WextMboSendNeighborReportToDaemonEvent(
 		neighbor_list_data = (struct neighbor_list_data *)buf;
 		neighbor_list_data->ifindex = RtmpOsGetNetIfIndex(net_dev);
 		neighbor_list_data->neighbor_list_len	= report_buf_len;
-		memcpy(neighbor_list_data->neighbor_list_req, NeighborRepList, report_buf_len);
+		memcpy((UCHAR *)neighbor_list_data + offsetof(struct neighbor_list_data, neighbor_list_req),
+			NeighborRepList, report_buf_len);
 		RtmpOSWrielessEventSend(net_dev, RT_WLAN_EVENT_CUSTOM,
 						OID_NEIGHBOR_REPORT, NULL, (PUCHAR)buf, buflen);
 #endif

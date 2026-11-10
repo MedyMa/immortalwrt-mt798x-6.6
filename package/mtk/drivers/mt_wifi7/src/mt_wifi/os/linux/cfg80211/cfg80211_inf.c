@@ -33,7 +33,7 @@
 #if defined(IWCOMMAND_CFG80211_SUPPORT) || defined(HOSTAPD_MBSS_SUPPORT)
 extern struct wifi_dev_ops ap_wdev_ops;
 
-VOID RTMP_CFG80211_AddVifEntry(VOID *pAdSrc, PNET_DEV pNewNetDev, UINT32 DevType)
+BOOLEAN RTMP_CFG80211_AddVifEntry(VOID *pAdSrc, PNET_DEV pNewNetDev, UINT32 DevType)
 {
 	PRTMP_ADAPTER pAd = (PRTMP_ADAPTER)pAdSrc;
 	PCFG80211_VIF_DEV pNewVifDev = NULL;
@@ -52,9 +52,11 @@ VOID RTMP_CFG80211_AddVifEntry(VOID *pAdSrc, PNET_DEV pNewNetDev, UINT32 DevType
 		insertTailList(&pAd->cfg80211_ctrl.Cfg80211VifDevSet.vifDevList, (RT_LIST_ENTRY *)pNewVifDev);
 		MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_INFO,
 				"Add CFG80211 VIF Device, Type: %d.\n", pNewVifDev->devType);
+		return TRUE;
 	} else
 		MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_ERROR,
 				"Error in alloc mem in New CFG80211 VIF Function.\n");
+	return FALSE;
 }
 
 static
@@ -91,9 +93,7 @@ VOID RTMP_CFG80211_RemoveVifEntry(VOID *pAdSrc, PNET_DEV pNewNetDev)
 		delEntryList(&pAd->cfg80211_ctrl.Cfg80211VifDevSet.vifDevList, pListEntry);
 		os_free_mem(pListEntry);
 		pListEntry = NULL;
-	} else
-		MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_ERROR,
-			"Error\n");
+	}
 }
 #endif /* IWCOMMAND_CFG80211_SUPPORT */
 
@@ -254,6 +254,8 @@ BOOLEAN RTMP_CFG80211_VirtualIF_Init(
 					break;
 				}
 			}
+			if (IdBss >= MaxNumBss)
+				break;
 			pAd->ApCfg.MBSSID[preIfIndex].wdev.if_dev = NULL;
 			pAd->ApCfg.MBSSID[preIfIndex].wdev.bcn_buf.BeaconPkt = NULL;
 			new_dev_p = RtmpOSNetDevCreate(MC_RowID, &IoctlIF, INT_MBSSID, preIfIndex,
@@ -283,6 +285,7 @@ BOOLEAN RTMP_CFG80211_VirtualIF_Init(
 				MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_ERROR,
 						 "Assign wdev idx for %s failed, free net device!\n",
 						 RTMP_OS_NETDEV_GET_DEVNAME(new_dev_p));
+				wdev->if_dev = NULL;
 				RtmpOSNetDevFree(new_dev_p);
 				break;
 			}
@@ -294,6 +297,8 @@ BOOLEAN RTMP_CFG80211_VirtualIF_Init(
 				MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_ERROR,
 						 "register wdev_ops %s failed, free net device!\n",
 						  RTMP_OS_NETDEV_GET_DEVNAME(new_dev_p));
+				wdev_deinit(pAd, wdev);
+				wdev->if_dev = NULL;
 				RtmpOSNetDevFree(new_dev_p);
 				break;
 			}
@@ -342,11 +347,19 @@ BOOLEAN RTMP_CFG80211_VirtualIF_Init(
 				MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_ERROR,
 					"create IF %d (%s) failed!!\n",
 					apidx, RTMP_OS_NETDEV_GET_DEVNAME(new_dev_p));
+				wdev_deinit(pAd, wdev);
+				wdev->if_dev = NULL;
+				RtmpOSNetDevFree(new_dev_p);
+				break;
+			}
+			if (!RTMP_CFG80211_AddVifEntry(pAd, new_dev_p, DevType)) {
+				RtmpOSNetDevDetach(new_dev_p);
+				wdev_deinit(pAd, wdev);
+				wdev->if_dev = NULL;
 				RtmpOSNetDevFree(new_dev_p);
 				break;
 			}
 			(*ppWdev) = &wdev->cfg80211_wdev;
-			RTMP_CFG80211_AddVifEntry(pAd, new_dev_p, DevType);
 			retval = TRUE;
 		break;
 #ifdef CONFIG_VLAN_GTK_SUPPORT
@@ -504,6 +517,7 @@ BOOLEAN RTMP_CFG80211_VirtualIF_Init(
 			MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_ERROR,
 					"Assign wdev idx for %s failed, free net device!\n",
 					 RTMP_OS_NETDEV_GET_DEVNAME(new_dev_p));
+			wdev->if_dev = NULL;
 			RtmpOSNetDevFree(new_dev_p);
 			break;
 		}
@@ -515,6 +529,8 @@ BOOLEAN RTMP_CFG80211_VirtualIF_Init(
 			MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_ERROR,
 					 "register wdev_ops %s failed, free net device!\n"
 						, RTMP_OS_NETDEV_GET_DEVNAME(new_dev_p));
+			wdev_deinit(pAd, wdev);
+			wdev->if_dev = NULL;
 			RtmpOSNetDevFree(new_dev_p);
 			break;
 		}
@@ -567,9 +583,19 @@ BOOLEAN RTMP_CFG80211_VirtualIF_Init(
 			MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_ERROR,
 					"create IF %d (%s) failed!!\n",
 					apidx, RTMP_OS_NETDEV_GET_DEVNAME(new_dev_p));
+			wdev_deinit(pAd, wdev);
+			wdev->if_dev = NULL;
+			RtmpOSNetDevFree(new_dev_p);
+			break;
 		}
 
-		RTMP_CFG80211_AddVifEntry(pAd, new_dev_p, DevType);
+		if (!RTMP_CFG80211_AddVifEntry(pAd, new_dev_p, DevType)) {
+			RtmpOSNetDevDetach(new_dev_p);
+			wdev_deinit(pAd, wdev);
+			wdev->if_dev = NULL;
+			RtmpOSNetDevFree(new_dev_p);
+			break;
+		}
 		(*ppWdev) = &wdev->cfg80211_wdev;
 		pAd->StaCfg->ApcliInfStat.ApCliInit = TRUE;
 		retval = TRUE;
@@ -617,6 +643,8 @@ VOID RTMP_CFG80211_VirtualIF_Remove(
 #endif
 			wdev_deinit(pAd, wdev);
 			wdev->if_dev = NULL;
+			if (dev_p != pAd->net_dev)
+				RtmpOSNetDevFree(dev_p);
 
 		}
 		OS_SPIN_LOCK_IRQSAVE(&pAd->CfgIfUseCntLock, &flags);
@@ -638,6 +666,8 @@ VOID RTMP_CFG80211_VirtualIF_Remove(
 			RtmpOSNetDevDetach(dev_p);
 			wdev_deinit(pAd, wdev);
 			wdev->if_dev = NULL;
+			if (dev_p != pAd->net_dev)
+				RtmpOSNetDevFree(dev_p);
 
 		}
 		OS_SPIN_LOCK_IRQSAVE(&pAd->CfgIfUseCntLock, &flags);

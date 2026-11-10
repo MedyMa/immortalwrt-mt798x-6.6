@@ -562,10 +562,13 @@ INT QoS_send_action_frame(PRTMP_ADAPTER pAd, struct wifi_dev *wdev, struct actio
 			multi_ie = (UCHAR *)&frm->frm[5];
 
 		if (multi_ie != NULL) {
+			UINT8 i;
+
 			wlan_operate_get_mld_addr(wdev, mld_addr);
-			memcpy(&GET_ACT_FRAME_MLD_ADDR(multi_ie), mld_addr, MAC_ADDR_LEN);
+			for (i = 0; i < MAC_ADDR_LEN; i++)
+				multi_ie[6 + i] = mld_addr[i];
 			if (pEntry)
-				memcpy(&GET_ACT_FRAME_LINK_ID(multi_ie), &pEntry->mlo.link_info.link_id, 1);
+				GET_ACT_FRAME_LINK_ID(multi_ie) = pEntry->mlo.link_info.link_id;
 		}
 		hex_dump_always("EPCS Frame", frm->frm, frm->frm_len);
 	}
@@ -623,7 +626,7 @@ INT receive_qos_action_frame(RTMP_ADAPTER *pAd, struct wifi_dev *wdev,
 	event = (struct wapp_event *)buf;
 	event->ifindex = RtmpOsGetNetIfIndex(wdev->if_dev);
 	event->event_id = WAPP_QOS_ACTION_FRAME_EVENT;
-	req_data = (struct wapp_qos_action_frame *)&(event->data.qos_frm);
+	req_data = (struct wapp_qos_action_frame *)&event->data;
 
 	NdisCopyMemory(req_data->src, peer_mac_addr, 6);
 	req_data->frm_len = frm_len;
@@ -657,7 +660,7 @@ static void indicate_mscs_classifier_parameter(RTMP_ADAPTER *pAd, struct wifi_de
 	event = (struct wapp_event *)buf;
 	event->ifindex = RtmpOsGetNetIfIndex(wdev->if_dev);
 	event->event_id = WAPP_MSCS_CLASSIFIER_PARAM_EVENT;
-	req_data = (struct classifier_parameter *)&(event->data.qos_frm);
+	req_data = (struct classifier_parameter *)&event->data;
 
 	NdisCopyMemory(req_data, classifier_parameter_report, sizeof(*req_data));
 
@@ -1172,7 +1175,7 @@ void indicate_vendor_spec_tclas_elment(RTMP_ADAPTER *pAd, struct wifi_dev *wdev,
 	event = (struct wapp_event *)buf;
 	event->ifindex = RtmpOsGetNetIfIndex(wdev->if_dev);
 	event->event_id = WAPP_VEND_SPEC_UP_TUPLE_EVENT;
-	req_data = (struct wapp_vend_spec_classifier_para_report *)&(event->data.qos_frm);
+	req_data = (struct wapp_vend_spec_classifier_para_report *)&event->data;
 	NdisCopyMemory(req_data, vend_spec_classifier_para_report, sizeof(*req_data));
 	wapp_send_wapp_qry_rsp(pAd, event);
 	os_free_mem(buf);

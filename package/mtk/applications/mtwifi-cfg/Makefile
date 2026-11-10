@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=mtwifi-cfg
 PKG_LICENSE:=GPL-2.0+
 PKG_VERSION:=1
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -16,7 +16,7 @@ define Package/mtwifi-cfg
   CATEGORY:=MTK Properties
   SUBMENU:=Applications
   TITLE:=mtwifi configure scripts for mt798x
-  DEPENDS:=+wireless-tools +iwinfo +wifi-dats +wifi-scripts +lua-cjson +libuci-lua +luci-lib-nixio +datconf-lua @!PACKAGE_luci-app-mtk @!PACKAGE_wifi-profile
+  DEPENDS:=+wireless-tools +iwinfo +wifi-dats +wifi-scripts +lua-cjson +libuci-lua +luci-lib-nixio +datconf-lua @!PACKAGE_wifi-profile
 endef
 
 define Build/Compile
@@ -26,6 +26,8 @@ define Package/mtwifi-cfg/install
 	$(INSTALL_DIR) $(1)/sbin $(1)/usr/sbin $(1)/usr/lib/lua
 	$(INSTALL_DIR) $(1)/lib/netifd/wireless/ $(1)/lib/wifi/
 
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/94-mtwifi-6ghz-security $(1)/etc/uci-defaults/
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/net/ $(1)/etc/init.d $(1)/lib/upgrade/keep.d
 
 	$(INSTALL_BIN) ./files/netifd/mtwifi.sh $(1)/lib/netifd/wireless/

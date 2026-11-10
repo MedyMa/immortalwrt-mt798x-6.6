@@ -2608,8 +2608,9 @@ static int CFG80211_OpsMgmtTx(
 	MTWF_DBG(NULL, DBG_CAT_TX, CATTX_MGMT, DBG_LVL_DEBUG, "80211> Mgmt Channel = %d\n", ChanId);
 
 	/* Send the Frame with basic rate 6 */
-    if (no_cck)
-		; /*pAd->isCfgDeviceInP2p = TRUE; */
+    if (no_cck) {
+		/* pAd->isCfgDeviceInP2p = TRUE; */
+	}
 
 	*pCookie = COOkIE_VALUE;
 #ifndef HOSTAPD_AUTO_CH_SUPPORT
@@ -3915,7 +3916,7 @@ static struct wireless_dev *CFG80211_OpsVirtualInfAdd(
 	struct vif_params *pParams)
 {
 	VOID *pAd;
-	CMD_RTPRIV_IOCTL_80211_VIF_SET vifInfo;
+	CMD_RTPRIV_IOCTL_80211_VIF_SET vifInfo = {};
 	PWIRELESS_DEV pDev = NULL;
 
 	MTWF_DBG(NULL, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_NOTICE, "80211> ==>\n");
@@ -3946,6 +3947,8 @@ static struct wireless_dev *CFG80211_OpsVirtualInfAdd(
 			"Support WIPHY_FLAG_4ADDR_STATION\n");
 
 	vifInfo.flags = pWiphy->flags;
+	if (!pParams || pParams->use_4addr <= 0)
+		vifInfo.flags &= ~WIPHY_FLAG_4ADDR_STATION;
 
 	if (RTMP_DRIVER_80211_VIF_ADD(pAd, &vifInfo) != NDIS_STATUS_SUCCESS) {
 		MTWF_DBG(NULL, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_ERROR,
@@ -3953,7 +3956,7 @@ static struct wireless_dev *CFG80211_OpsVirtualInfAdd(
 		return ERR_PTR(-EINVAL);
 	}
 
-	return vifInfo.pWdev;
+	return vifInfo.pWdev ? vifInfo.pWdev : ERR_PTR(-EIO);
 }
 
 static int CFG80211_OpsVirtualInfDel(
@@ -3965,12 +3968,16 @@ static int CFG80211_OpsVirtualInfDel(
 		struct net_device *dev = NULL;
 
 		dev = pwdev->netdev;
-		if (!dev)
-			return 0;
+		if (!dev || dev->reg_state != NETREG_REGISTERED)
+			return -EINVAL;
 		MTWF_DBG(NULL, DBG_CAT_CFG80211, CATCFG80211_INTF, DBG_LVL_NOTICE,
 			"80211> %s [%d]==>\n", dev->name, dev->ieee80211_ptr->iftype);
 		MAC80211_PAD_GET(pAd, pWiphy);
-		RTMP_DRIVER_80211_VIF_DEL(pAd, dev, dev->ieee80211_ptr->iftype);
+		if (!pAd)
+			return -ENODEV;
+		if (RTMP_DRIVER_80211_VIF_DEL(pAd, dev, dev->ieee80211_ptr->iftype) != NDIS_STATUS_SUCCESS ||
+		    dev->reg_state == NETREG_REGISTERED)
+			return -EIO;
 
 		return 0;
 }
@@ -5701,7 +5708,7 @@ int mtk_cfg80211_vndr_set_action(struct wiphy *wiphy,
 	struct wifi_dev *wdev;
 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SET_ACTION_MAX + 1];
 	int ret;
-	u16 punctured_bitmap = 0;
+	u16 punctured_bitmap __maybe_unused = 0;
 	MAC80211_PAD_GET(pAd, wiphy);
 	MTWF_DBG(pAd, DBG_CAT_CFG, CATCFG_DBGLOG, DBG_LVL_NOTICE,
 			"ifname: %s, iftype: %d\n", pNetDev->name, wl_dev->iftype);
@@ -6203,7 +6210,7 @@ int mtk_cfg80211_vndr_subcmd_dfs(struct wiphy *wiphy,
 }
 
 static const struct
-nla_policy SUBCMD_EASYMESH_POLICY[];
+nla_policy SUBCMD_EASYMESH_POLICY[MTK_NL80211_VENDOR_ATTR_EASYMESH_MAX + 1];
 
 static int mtk_cfg80211_reply_ap_mld(struct wiphy *wiphy, struct bmgr_mlo_dev *mld);
 
@@ -6217,9 +6224,9 @@ int mtk_cfg80211_vndr_subcmd_easymesh(struct wiphy *wiphy,
 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_EASYMESH_MAX + 1];
 	ULONG priv_flags;
 	POS_COOKIE pObj;
-	char *cmd;
-	int ret, cmd_len;
-	UCHAR map_en = 0;
+	char *cmd __maybe_unused;
+	int ret, cmd_len __maybe_unused;
+	UCHAR map_en __maybe_unused = 0;
 
 	MAC80211_PAD_GET(pAd, wiphy);
 	MTWF_DBG(pAd, DBG_CAT_CFG, CATCFG_DBGLOG, DBG_LVL_INFO,
@@ -8021,6 +8028,7 @@ static int mtk_cfg80211_reply_supp_rate(struct wiphy *wiphy,
 #ifdef WSC_INCLUDED
 static int mtk_cfg80211_reply_wapp_wsc_profiles(struct wiphy *wiphy, const void *data, int len)
 {
+#if defined(CONFIG_MAP_SUPPORT) && defined(CONFIG_STA_SUPPORT)
 	PRTMP_ADAPTER pAd;
 	UINT ifIndex = 0;
 	POS_COOKIE pObj;
@@ -8050,6 +8058,9 @@ static int mtk_cfg80211_reply_wapp_wsc_profiles(struct wiphy *wiphy, const void 
 			"mtk_cfg80211_vndr_cmd_reply_msg fail!\n");
 	os_free_mem(wsc_config);
 	return ret;
+#else
+	return -EOPNOTSUPP;
+#endif
 }
 #endif /* WSC_INCLUDED */
 #endif /* WAPP_SUPPORT */
@@ -8329,7 +8340,7 @@ static int mtk_cfg80211_reply_wapp_support_ver(struct wiphy *wiphy, const void *
 	return ret;
 }
 #endif /* WAPP_SUPPORT */
-static int mtk_cfg80211_reply_wifi_ver(struct wiphy *wiphy, const void *data, int len)
+static int __maybe_unused mtk_cfg80211_reply_wifi_ver(struct wiphy *wiphy, const void *data, int len)
 {
 	PRTMP_ADAPTER pAd;
 	RTMP_STRING driver_ver[16];
@@ -8691,7 +8702,9 @@ static int mtk_cfg80211_reply_misc_cap(struct wiphy *wiphy, const void *data, in
 	misc_cap.max_num_of_cli = 64;
 	misc_cap.max_num_of_bss = 32;
 	misc_cap.num_of_bss = pAd->ApCfg.BssidNum;
+#ifdef CONFIG_MAP_SUPPORT
 	misc_cap.max_num_of_block_cli = BLOCK_LIST_NUM;
+#endif
 
 	MTWF_DBG(pAd, DBG_CAT_AP, CATAP_BCN, DBG_LVL_NOTICE,
 		"get MTK_NL80211_VENDOR_ATTR_GET_CAP_INFO_MISC_CAP\n");
@@ -16479,7 +16492,7 @@ static struct wireless_dev *CFG80211_WdevAlloc(
 	ULONG *pPriv;
 	RTMP_ADAPTER *ad = (RTMP_ADAPTER *)pAd;
 #ifdef SEL_DUAL_BAND
-	char phy_name[10];
+	char phy_name[32];
 	int ret = 0;
 #endif
 
@@ -16501,7 +16514,7 @@ static struct wireless_dev *CFG80211_WdevAlloc(
 	os_zero_mem((uint8_t *)pWdev, sizeof(*pWdev));
 
 #ifdef SEL_DUAL_BAND
-	ret = sprintf(phy_name, "phy%d", ad->dev_idx);
+	ret = snprintf(phy_name, sizeof(phy_name), "phy%d", ad->dev_idx);
 	if (ret < 0) {
 		MTWF_DBG(pAd, DBG_CAT_INIT, CATINIT_INTF, DBG_LVL_ERROR,
 		"80211> Sprintf error!\n");
@@ -16551,7 +16564,8 @@ static struct wireless_dev *CFG80211_WdevAlloc(
 #endif /* CONFIG_STA_SUPPORT */
 	 pWdev->wiphy->reg_notifier = CFG80211_RegNotifier;
 	/* init channel information */
-	CFG80211_SupBandInit(pAd, pCfg80211_CB, pBandInfo, prWiphy, NULL, NULL, FALSE);
+	if (!CFG80211_SupBandInit(pAd, pCfg80211_CB, pBandInfo, prWiphy, NULL, NULL, FALSE))
+		goto LabelErrReg;
 
 	/* CFG80211_SIGNAL_TYPE_MBM: signal strength in mBm (100*dBm) */
 	prWiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
@@ -16613,6 +16627,10 @@ static struct wireless_dev *CFG80211_WdevAlloc(
 
 	return pWdev;
 LabelErrReg:
+	os_free_mem(pCfg80211_CB->pCfg80211_Channels);
+	os_free_mem(pCfg80211_CB->pCfg80211_Rates);
+	pCfg80211_CB->pCfg80211_Channels = NULL;
+	pCfg80211_CB->pCfg80211_Rates = NULL;
 	wiphy_free(prWiphy);
 	pWdev->wiphy = NULL;
 LabelErrWiphyNew:
@@ -16647,7 +16665,7 @@ BOOLEAN CFG80211_Register(
 	IN struct net_device *pNetDev)
 {
 	CFG80211_CB *pCfg80211_CB = NULL;
-	CFG80211_BAND BandInfo;
+	CFG80211_BAND BandInfo = {};
 	INT err = 0;
 	UINT32 OpMode;
 	/* allocate Main Device Info structure */
@@ -16661,7 +16679,10 @@ BOOLEAN CFG80211_Register(
 
 	os_zero_mem(pCfg80211_CB, sizeof(CFG80211_CB));
 	/* allocate wireless device */
-	RTMP_DRIVER_80211_BANDINFO_GET(pAd, &BandInfo);
+	if (RTMP_DRIVER_80211_BANDINFO_GET(pAd, &BandInfo) != NDIS_STATUS_SUCCESS) {
+		os_free_mem(pCfg80211_CB);
+		return FALSE;
+	}
 	pCfg80211_CB->pCfg80211_Wdev = CFG80211_WdevAlloc(pCfg80211_CB, &BandInfo, pAd, pDev);
 
 	if (pCfg80211_CB->pCfg80211_Wdev == NULL) {
@@ -16687,12 +16708,12 @@ BOOLEAN CFG80211_Register(
 	pNetDev->ieee80211_ptr = pCfg80211_CB->pCfg80211_Wdev;
 	SET_NETDEV_DEV(pNetDev, wiphy_dev(pCfg80211_CB->pCfg80211_Wdev->wiphy));
 	pCfg80211_CB->pCfg80211_Wdev->netdev = pNetDev;
-#ifdef RFKILL_HW_SUPPORT
-	wiphy_rfkill_start_polling(pCfg80211_CB->pCfg80211_Wdev->wiphy);
-#endif /* RFKILL_HW_SUPPORT */
 	pAd->pCfg80211_CB = pCfg80211_CB;
 	RTMP_DRIVER_80211_RESET(pAd);
 	RTMP_DRIVER_80211_SCAN_STATUS_LOCK_INIT(pAd, TRUE);
+#ifdef RFKILL_HW_SUPPORT
+	wiphy_rfkill_start_polling(pCfg80211_CB->pCfg80211_Wdev->wiphy);
+#endif /* RFKILL_HW_SUPPORT */
 
 	wiphy_ext_feature_set(pCfg80211_CB->pCfg80211_Wdev->wiphy, NL80211_EXT_FEATURE_DFS_OFFLOAD);
 	wiphy_ext_feature_set(pCfg80211_CB->pCfg80211_Wdev->wiphy, NL80211_EXT_FEATURE_BEACON_RATE_LEGACY);
@@ -16703,7 +16724,7 @@ BOOLEAN CFG80211_Register(
 		MTWF_DBG(NULL, DBG_CAT_CFG80211, CATCFG80211_CMM, DBG_LVL_ERROR,
 			"80211> Failed to register notifierl %d\n", err);
 
-	MTWF_DBG(NULL, DBG_CAT_CFG80211, CATCFG80211_CMM, DBG_LVL_ERROR, "80211> end\n");
+	MTWF_DBG(NULL, DBG_CAT_CFG80211, CATCFG80211_CMM, DBG_LVL_INFO, "80211> end\n");
 	return TRUE;
 } /* End of CFG80211_Register */
 

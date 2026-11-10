@@ -221,7 +221,8 @@ VOID WpaMicFailureReportFrame(
 		MTWF_DBG(NULL, DBG_CAT_SEC, CATSEC_KEY, DBG_LVL_DEBUG, "-----\n");
 	}
 
-	NdisMoveMemory(pPacket->KeyDesc.KeyMicAndData, Mic, LEN_KEY_DESC_MIC);
+	NdisMoveMemory((UCHAR *)pPacket + offsetof(EAPOL_PACKET, KeyDesc.KeyMicAndData),
+		Mic, LEN_KEY_DESC_MIC);
 	/* copy frame to Tx ring and send MIC failure report frame to authenticator */
 	RTMPToWirelessSta(pAd, pEntry,
 					  Header802_3, LENGTH_802_3,

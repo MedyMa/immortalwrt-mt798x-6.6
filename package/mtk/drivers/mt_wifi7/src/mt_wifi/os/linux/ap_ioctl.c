@@ -892,12 +892,13 @@ INT rt28xx_ap_ioctl(void *net_dev_obj, void *data_obj, int cmd) /* snowpin for a
                                 wrqin->u.data.length = sizeof(struct iw_range);
                                  if (copy_to_user(wrqin->u.data.pointer, &range, sizeof(struct iw_range)))
                                         Status = RTMP_IO_EFAULT;
-                        } else {
-                                Status = RTMP_IO_E2BIG;
-                        }
+				} else {
+					Status = RTMP_IO_E2BIG;
+				}
 			break;
-		}
-	case SIOCGIWRETRY:	/*get retry limits and lifetime */
+			}
+			break;
+		case SIOCGIWRETRY:	/*get retry limits and lifetime */
 	case SIOCSIWRETRY:	/*set retry limits and lifetime */
 		Status = RTMP_IO_EOPNOTSUPP;
 		break;
@@ -908,7 +909,10 @@ INT rt28xx_ap_ioctl(void *net_dev_obj, void *data_obj, int cmd) /* snowpin for a
 		wdev = pIoctlConfig->wdev;
 		subcmd = wrqin->u.data.flags;
 		if ((wdev != NULL) && (wdev->if_up_down_state == FALSE)
-				&& (subcmd!= OID_802_11_COUNTRYCODE)) {
+#ifdef OID_802_11_COUNTRYCODE
+				&& (subcmd != OID_802_11_COUNTRYCODE)
+#endif
+				) {
 			MTWF_DBG(pAd, DBG_CAT_CFG, CATCFG_CMD, DBG_LVL_ERROR,
 				"interface is down, cmd [%x] return!!!\n", cmd);
 			return -ENETDOWN;

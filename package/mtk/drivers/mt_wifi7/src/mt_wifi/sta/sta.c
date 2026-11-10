@@ -429,12 +429,11 @@ VOID MSTA_Remove(RTMP_ADAPTER *pAd)
 
 			if (wdev->if_dev) {
 				RtmpOSNetDevProtect(1);
-				RtmpOSNetDevDetach(wdev->if_dev);
+				RtmpOSNetDevDetachRTNL(wdev->if_dev);
 				RtmpOSNetDevProtect(0);
 				wdev_deinit(pAd, wdev);
-#ifndef RT_CFG80211_SUPPORT
-				RtmpOSNetDevFree(wdev->if_dev);
-#endif
+				if (wdev->if_dev != pAd->net_dev)
+					RtmpOSNetDevFree(wdev->if_dev);
 				/* Clear it as NULL to prevent latter access error. */
 				pAd->StaCfg[IdSta].ApcliInfStat.ApCliInit = FALSE;
 				wdev->if_dev = NULL;
@@ -447,17 +446,16 @@ VOID MSTA_Remove(RTMP_ADAPTER *pAd)
 			wdev = &pAd->StaCfg[IdSta].wdev;
 			pStaCfg = &pAd->StaCfg[IdSta];
 
-			if (pStaCfg)
+			if (!pStaCfg)
 				return;
 
 			if (wdev->if_dev) {
 				RtmpOSNetDevProtect(1);
-				RtmpOSNetDevDetach(wdev->if_dev);
+				RtmpOSNetDevDetachRTNL(wdev->if_dev);
 				RtmpOSNetDevProtect(0);
 				wdev_deinit(pAd, wdev);
-#ifndef RT_CFG80211_SUPPORT
-				RtmpOSNetDevFree(wdev->if_dev);
-#endif
+				if (wdev->if_dev != pAd->net_dev)
+					RtmpOSNetDevFree(wdev->if_dev);
 				wdev->if_dev = NULL;
 			}
 		}

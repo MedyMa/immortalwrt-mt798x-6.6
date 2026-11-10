@@ -3031,7 +3031,7 @@ VOID CFG80211_UnRegister(
 
 	CFG80211OS_UnRegister(pAd->pCfg80211_CB, pNetDev);
 	RTMP_DRIVER_80211_SCAN_STATUS_LOCK_INIT(pAd, FALSE);
-	unregister_netdevice_notifier(&cfg80211_netdev_notifier);
+	/* CFG80211_Register does not register cfg80211_netdev_notifier. */
 	/* Reset CFG80211 Global Setting Here */
 	MTWF_DBG(NULL, DBG_CAT_CFG, CATCFG_CMD, DBG_LVL_INFO,
 		"==========> TYPE Reset CFG80211 Global Setting Here <==========\n");

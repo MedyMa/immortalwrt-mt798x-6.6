@@ -76,7 +76,7 @@ hif_txd_init_hw(struct wed_entry *wed, struct wifi_entry *wifi)
 	return warp_pao_hif_txd_init_base(wed);
 }
 
-int
+static int
 warp_pao_all_sta_info_init(struct wed_entry *wed, u8 max_amsdu_nums,
 		u32 max_amsdu_len, bool remove_vlan, bool hdrt_mode)
 {

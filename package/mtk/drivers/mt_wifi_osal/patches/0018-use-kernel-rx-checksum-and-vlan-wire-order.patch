@@ -1,0 +1,62 @@
+Subject: osal: use kernel checksum pulling and big-endian VLAN tags
+
+--- a/mt_osal_packet.c
++++ b/mt_osal_packet.c
+@@ -22,6 +22,12 @@
+ #include <linux/wireless.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
++#include <linux/version.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++#include <linux/unaligned.h>
++#else
++#include <asm/unaligned.h>
++#endif
+ #if (KERNEL_VERSION(6, 6, 0) <= LINUX_VERSION_CODE)
+ #include <net/netdev_rx_queue.h>
+ #endif
+@@ -36,15 +42,6 @@
+ #include <mt_osal_module.h>
+ 
+ 
+-static inline unsigned int mt_os_net_pkt_csum_add(
+-	unsigned int csum, unsigned int addend)
+-{
+-	unsigned int res = csum;
+-
+-	res += addend;
+-	return res + (res < addend);
+-}
+-
+ PNDIS_PACKET mt_os_net_pkt_alloc(void *dummy, int size)
+ {
+ 	struct sk_buff *skb;
+@@ -90,12 +87,7 @@
+ 	if (len > skb->len)
+ 		return;
+ 
+-	skb_pull(skb, len);
+-	if (skb->ip_summed == CHECKSUM_COMPLETE)
+-		skb->csum = mt_os_net_pkt_csum_add(skb->csum, ~csum_partial(skb->data, len, 0));
+-	else if (skb->ip_summed == CHECKSUM_PARTIAL &&
+-		 (skb->csum_start - (skb->data - skb->head)) < 0)
+-		skb->ip_summed = CHECKSUM_NONE;
++	skb_pull_rcsum(skb, len);
+ }
+ EXPORT_SYMBOL(mt_os_pkt_pull_rcsum);
+ 
+@@ -184,13 +176,12 @@
+ 		VLAN_Size = OS_LENGTH_802_1Q;
+ 		/* make up TCI field */
+ 		TCI = (VLAN_VID & 0x0fff) | ((VLAN_Priority & 0x7) << 13);
+-		TCI = cpu_to_le16(TCI);
+ 		/* copy dst + src MAC (12B) */
+ 		memcpy(pData, pHeader802_3, OS_LENGTH_802_3_NO_TYPE);
+ 		/* copy VLAN tag (4B) */
+ 		/* do NOT use memcpy to speed up */
+ 		*(unsigned short *) (pData + OS_LENGTH_802_3_NO_TYPE) = *(unsigned short *) TPID;
+-		*(unsigned short *) (pData + OS_LENGTH_802_3_NO_TYPE + 2) = TCI;
++		put_unaligned_be16(TCI, pData + OS_LENGTH_802_3_NO_TYPE + 2);
+ 		/* copy type/len (2B) */
+ 		*(unsigned short *) (pData + OS_LENGTH_802_3_NO_TYPE + OS_LENGTH_802_1Q) =
+ 			*(unsigned short *) &pHeader802_3[OS_LENGTH_802_3 - OS_LENGTH_802_3_TYPE];

@@ -3925,13 +3925,16 @@ INT RTMPQueryInformation(
 
 			if (ScanTab->BssEntry[i].VarIELen == 0) {
 				pBss->IELength = sizeof(NDIS_802_11_FIXED_IEs);
-				NdisMoveMemory(pBss->IEs, &ScanTab->BssEntry[i].FixIEs, sizeof(NDIS_802_11_FIXED_IEs));
+				NdisMoveMemory((UCHAR *)pBss + offsetof(NDIS_WLAN_BSSID_EX, IEs),
+								&ScanTab->BssEntry[i].FixIEs, sizeof(NDIS_802_11_FIXED_IEs));
 				pPtr = pPtr + sizeof(NDIS_WLAN_BSSID_EX) - 1 + sizeof(NDIS_802_11_FIXED_IEs);
 			} else {
 				pBss->IELength = (ULONG)(sizeof(NDIS_802_11_FIXED_IEs) + ScanTab->BssEntry[i].VarIELen);
 				pPtr = pPtr + sizeof(NDIS_WLAN_BSSID_EX) - 1 + sizeof(NDIS_802_11_FIXED_IEs);
-				NdisMoveMemory(pBss->IEs, &ScanTab->BssEntry[i].FixIEs, sizeof(NDIS_802_11_FIXED_IEs));
-				NdisMoveMemory(pBss->IEs + sizeof(NDIS_802_11_FIXED_IEs), ScanTab->BssEntry[i].VarIEs, ScanTab->BssEntry[i].VarIELen);
+				NdisMoveMemory((UCHAR *)pBss + offsetof(NDIS_WLAN_BSSID_EX, IEs),
+								&ScanTab->BssEntry[i].FixIEs, sizeof(NDIS_802_11_FIXED_IEs));
+				NdisMoveMemory((UCHAR *)pBss + offsetof(NDIS_WLAN_BSSID_EX, IEs) + sizeof(NDIS_802_11_FIXED_IEs),
+								ScanTab->BssEntry[i].VarIEs, ScanTab->BssEntry[i].VarIELen);
 				pPtr += ScanTab->BssEntry[i].VarIELen;
 			}
 
@@ -4151,9 +4154,18 @@ INT RTMPQueryInformation(
 				for (i = 0; VALID_UCAST_ENTRY_WCID(pAd, i); i++) {
 					entry = entry_get(pAd, i);
 					if (IS_ENTRY_CLIENT(entry) && (entry->Sst == SST_ASSOC)) {
-						NdisMoveMemory(&pMacTab->Entry[pMacTab->Num],
-							&entry->TxBFCounters,
-							sizeof(RT_COUNTER_TXBF));
+						RT_COUNTER_TXBF *txbf_entry = (RT_COUNTER_TXBF *)((UCHAR *)pMacTab +
+							offsetof(RT_802_11_TXBF_TABLE, Entry));
+
+						txbf_entry[pMacTab->Num].TxSuccessCount = entry->TxBFCounters.TxSuccessCount;
+						txbf_entry[pMacTab->Num].TxRetryCount = entry->TxBFCounters.TxRetryCount;
+						txbf_entry[pMacTab->Num].TxFailCount = entry->TxBFCounters.TxFailCount;
+						txbf_entry[pMacTab->Num].ETxSuccessCount = entry->TxBFCounters.ETxSuccessCount;
+						txbf_entry[pMacTab->Num].ETxRetryCount = entry->TxBFCounters.ETxRetryCount;
+						txbf_entry[pMacTab->Num].ETxFailCount = entry->TxBFCounters.ETxFailCount;
+						txbf_entry[pMacTab->Num].ITxSuccessCount = entry->TxBFCounters.ITxSuccessCount;
+						txbf_entry[pMacTab->Num].ITxRetryCount = entry->TxBFCounters.ITxRetryCount;
+						txbf_entry[pMacTab->Num].ITxFailCount = entry->TxBFCounters.ITxFailCount;
 						pMacTab->Num++;
 					}
 				}

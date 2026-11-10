@@ -7,10 +7,12 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mt_wifi7
+PKG_RELEASE:=3
 P4REV:=
 PKG_VERSION:=TEST
 PKG_SOURCE_URL:=
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
+PKG_FILE_DEPENDS:=$(CURDIR)/src/ $(CURDIR)/patches/
 
 PKG_KCONFIG:= \
 	AP_SUPPORT \
@@ -291,7 +293,8 @@ PKG_KCONFIG:= \
 	MLD_GROUP_RESTORE \
 	UNIFIED_COUNTRY_CONFIG_SUPPORT
 
-PKG_CONFIG_DEPENDS:=$(foreach c, $(PKG_KCONFIG),$(if $(CONFIG_MTK_WIFI7_$c),CONFIG_$(c)))
+PKG_CONFIG_DEPENDS:=$(addprefix CONFIG_MTK_WIFI7_,$(PKG_KCONFIG))
+PKG_CONFIG_DEPENDS+=CONFIG_MTK_WIFI7_OSAL_SUPPORT CONFIG_MTK_WIFI_OSAL_CFG80211_SUPPORT
 
 PKG_BUILD_PARALLEL:=1
 
@@ -300,12 +303,16 @@ include $(INCLUDE_DIR)/package.mk
 
 TAR_CMD=$(HOST_TAR) -C $(1)/ $(TAR_OPTIONS)
 
-BACKPORT_VERSION:=$(lastword $(subst /, , $(shell find $(KERNEL_BUILD_DIR) -type 'd' -name 'backports*')))
+BACKPORT_VERSION:=$(sort $(patsubst backports-%,%,$(notdir \
+	$(wildcard $(KERNEL_BUILD_DIR)/backports-* \
+		$(KERNEL_BUILD_DIR)/mac80211-regular/backports-*))))
 
 define KernelPackage/mt_wifi7
   CATEGORY:=MTK Properties
   TITLE:=MTK wifi7 AP driver
-  DEPENDS:=blkid +MTK_WIFI7_CFG80211_SUPPORT:kmod-cfg80211 +kmod-mt_wifi_cmn
+  DEPENDS:=blkid +MTK_WIFI7_CFG80211_SUPPORT:kmod-cfg80211 \
+	+MTK_WIFI7_OSAL_SUPPORT:kmod-mt_wifi_osal \
+	+!MTK_WIFI7_OSAL_SUPPORT:kmod-mt_wifi_cmn
 ifeq ($(CONFIG_MTK_CONNINFRA_APSOC),y)
   DEPENDS+=+kmod-conninfra
 endif
@@ -366,16 +373,27 @@ endif
 endif
 endif
 
-KCFLAGS += $(if $(CONFIG_MTK_WIFI7_OSAL_SUPPORT), -DMT_WIFI_COMMON_SUPPORT -DMT_WIFI_OSAL_SUPPORT -I$(STAGING_DIR)/usr/include/mt_wifi -I$(STAGING_DIR)/usr/include/mt_wifi/os)
+KCFLAGS += $(if $(CONFIG_MTK_WIFI7_OSAL_SUPPORT), -DMT_WIFI_COMMON_SUPPORT -DMT_WIFI_OSAL_SUPPORT -I$(STAGING_DIR)/usr/include/mt_wifi/os)
 
 define Build/Compile
+	$(if $(and $(CONFIG_MTK_WIFI7_OSAL_SUPPORT),$(filter y,$(CONFIG_PACKAGE_kmod-mt_wifi_cmn))),\
+		$(error WiFi7 OSAL and mt_wifi_cmn providers cannot be built together))
+	$(if $(CONFIG_MTK_WIFI7_CFG80211_SUPPORT),\
+		$(if $(filter 1,$(words $(BACKPORT_VERSION))),true,\
+			$(error WiFi7 requires one matching mac80211 backport version; found $(BACKPORT_VERSION))))
+	$(if $(and $(CONFIG_MTK_WIFI7_OSAL_SUPPORT),$(CONFIG_MTK_WIFI7_CFG80211_SUPPORT)),\
+		$(if $(CONFIG_MTK_WIFI_OSAL_CFG80211_SUPPORT),true,\
+			$(error WiFi7 cfg80211 requires cfg80211 support in its OSAL provider)))
 	$(MAKE) $(PKG_JOBS) -C "$(LINUX_DIR)" V=1 \
 		$(KERNEL_MAKE_FLAGS) \
 		M="$(PKG_BUILD_DIR)/mt_wifi_ap" \
 		LINUX_DIR="$(KERNEL_BUILD_DIR)" \
+		$(if $(CONFIG_MTK_WIFI7_CFG80211_SUPPORT),UL_CTRL=CFG80211) \
+		CFG_CFG80211_VERSION="$(if $(CONFIG_MTK_WIFI7_CFG80211_SUPPORT),$(BACKPORT_VERSION))" \
 		$(foreach c, $(PKG_KCONFIG),$(if $(CONFIG_MTK_WIFI7_$c),CONFIG_$(c)=$(CONFIG_MTK_WIFI7_$(c)))) \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
 	 	KCFLAGS="$(KCFLAGS)" \
+		KBUILD_EXTRA_SYMBOLS="$(filter-out $(PKG_SYMVERS_DIR)/$(if $(CONFIG_MTK_WIFI7_OSAL_SUPPORT),mt_wifi_cmn,mt_wifi_osal).symvers,$(wildcard $(PKG_SYMVERS_DIR)/*.symvers))" \
 		modules
 	touch $(PKG_BUILD_DIR)/.no_autorebuild
 	cp $(PKG_BUILD_DIR)/mt_wifi_ap/Module.symvers $(PKG_BUILD_DIR)/Module.symvers

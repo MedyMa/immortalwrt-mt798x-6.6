@@ -289,6 +289,7 @@ void RtmpOSNetDeviceRefPut(PNET_DEV pNetDev);
 
 INT RtmpOSNetDevDestory(VOID *pReserved, PNET_DEV pNetDev);
 void RtmpOSNetDevDetach(PNET_DEV pNetDev);
+void RtmpOSNetDevDetachRTNL(PNET_DEV pNetDev);
 int RtmpOSNetDevAttach(
 	IN	UCHAR					OpMode,
 	IN	PNET_DEV				pNetDev,

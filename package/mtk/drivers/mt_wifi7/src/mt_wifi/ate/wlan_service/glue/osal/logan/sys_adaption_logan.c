@@ -92,6 +92,13 @@ static inline s_int32 _sys_ad_kill_os_task(struct serv_os_task *task)
 	return ret;
 }
 
+static int _sys_ad_task_thread(void *data)
+{
+	struct serv_os_task *task = data;
+
+	return task->kthread_fn(task->kthread_arg);
+}
+
 static inline s_int32 _sys_ad_attach_os_task(
 	IN struct serv_os_task *task, IN SERV_OS_TASK_CALLBACK fn,
 	IN u_long arg)
@@ -108,7 +115,9 @@ static inline s_int32 _sys_ad_attach_os_task(
 		goto done;
 	}
 
-	task->kthread_task = kthread_run((cast_fn) fn, (void *)arg,
+	task->kthread_fn = fn;
+	task->kthread_arg = arg;
+	task->kthread_task = kthread_run(_sys_ad_task_thread, task,
 					task->task_name);
 
 	if (IS_ERR(task->kthread_task)) {

@@ -5367,20 +5367,7 @@ void bss_mngr_con_sync_ml_probe_rsp_per_sta_profile(
 		return;
 	}
 
-	mld_grp = entry->entry_info.mld_grp;
-	mld = BMGR_VALID_MLD_GRP_IDX(mld_grp) ? GET_MLD_BY_GRP_IDX(mld_grp) : NULL;
-	if (!BMGR_VALID_MLO_DEV(mld)) {
-		MTWF_DBG(NULL, DBG_CAT_MLO, CATMLO_BMGR, DBG_LVL_ERROR,
-			"bss_idx (%d), mld grp invalid(%d)\n",
-			entry->bss_idx, entry->entry_info.mld_grp);
-		return;
-	}
-
-	MTWF_DBG(NULL, DBG_CAT_MLO, CATMLO_BMGR, DBG_LVL_NOTICE,
-		"%s(%s) sync probe rsp STA-Pf, mlo:%d, cnt:%d\n",
-		pNetDev->name, entry->valid ? "active" : "inactive",
-		entry->mlo_en, mld->mld_link_cnt);
-
+	/* Retire cached profiles even after the MLD group has been destroyed. */
 	if (!BMGR_VALID_MLO_BSS_ENTRY(entry)) {
 		for (link = 0; link < BSS_MNGR_MAX_BAND_NUM; link++) {
 			/* free non-MLO entry's buffer */
@@ -5392,6 +5379,23 @@ void bss_mngr_con_sync_ml_probe_rsp_per_sta_profile(
 
 		}
 	}
+
+	mld_grp = entry->entry_info.mld_grp;
+	mld = BMGR_VALID_MLD_GRP_IDX(mld_grp) ? GET_MLD_BY_GRP_IDX(mld_grp) : NULL;
+	if (!BMGR_VALID_MLO_DEV(mld)) {
+		if (!entry->valid)
+			return;
+		MTWF_DBG(NULL, DBG_CAT_MLO, CATMLO_BMGR, DBG_LVL_ERROR,
+			"bss_idx (%d), mld grp invalid(%d)\n",
+			entry->bss_idx, entry->entry_info.mld_grp);
+		return;
+	}
+
+	MTWF_DBG(NULL, DBG_CAT_MLO, CATMLO_BMGR, DBG_LVL_NOTICE,
+		"%s(%s) sync probe rsp STA-Pf, mlo:%d, cnt:%d\n",
+		pNetDev->name, entry->valid ? "active" : "inactive",
+		entry->mlo_en, mld->mld_link_cnt);
+
 
 	/* query probe response frames to driver */
 	for (link = 0; link < BSS_MNGR_MAX_BAND_NUM; link++) {

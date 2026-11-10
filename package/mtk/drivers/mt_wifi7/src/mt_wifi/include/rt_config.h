@@ -320,6 +320,7 @@
 
 #ifdef LINUX
 #ifdef RT_CFG80211_SUPPORT
+#include <net/netlink.h>
 #include "cfg80211/cfg80211extr.h"
 #include "cfg80211/cfg80211_cmm.h"
 #include "cfg80211/cfg80211.h"

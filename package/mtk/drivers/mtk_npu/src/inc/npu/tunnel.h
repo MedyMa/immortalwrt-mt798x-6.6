@@ -189,7 +189,7 @@ struct npu_tnl_type {
 	bool use_multi_cls;
 
 	/* parameter setup */
-	void (*tnl_flow_param_setup)(const struct net_device_path *path,
+	int (*tnl_flow_param_setup)(const struct net_device_path *path,
 				    struct npu_params *params);
 	int (*tnl_decap_param_setup)(struct sk_buff *skb,
 				     struct npu_params *params);

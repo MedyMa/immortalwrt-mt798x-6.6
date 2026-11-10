@@ -119,6 +119,8 @@ typedef struct _RTMP_OS_TASK_ {
 	struct task_struct *kthread_task;
 	wait_queue_head_t kthread_q;
 	BOOLEAN kthread_running;
+	INT (*kthread_fn)(ULONG);
+	ULONG kthread_arg;
 #endif
 } OS_TASK;
 

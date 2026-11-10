@@ -39,7 +39,6 @@
 #endif
 
 #define MCAST_WCID_TO_REMOVE 0 /* Pat: TODO */
-#define MIN(a, b)					((a) < (b) ? (a) : (b))
 INT UNII4BandSupportRegions[] = {25, 26};
 INT MCSMappingRateTable[] = {
 	2,  4, 11, 22, 12,  18,  24,  36, 48,  72,  96, 108, 109, 110, 111, 112,/* CCK and OFDM */
@@ -6837,7 +6836,7 @@ INT mtk_cfg80211_get_scan_result(struct wiphy *wiphy, RTMP_ADAPTER *pAd, SCAN_CT
 						"Snprintf failed!\n");
 			goto ERROR;
 		}
-		RTMPCommSiteSurveyData(msg, pBss, TotalLen);
+		RTMPCommSiteSurveyData(msg, pBss, TotalLen, false);
 #ifdef WSC_INCLUDED
 
 		/*WPS*/
@@ -9044,7 +9043,7 @@ INT	Set_HtTxStream_Proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg)
 
 	pMbss = &pAd->ApCfg.MBSSID[apidx];
 
-	ucTxPath = MIN(MCS_NSS_CAP(pAd)->max_nss,
+	ucTxPath = min_t(u32, MCS_NSS_CAP(pAd)->max_nss,
 		MCS_NSS_CAP(pAd)->max_path[MAX_PATH_TX]);
 
 
@@ -9092,7 +9091,7 @@ INT	mtk_cfg80211_Set_HtTxStream_Proc(RTMP_ADAPTER *pAd, ULONG value)
 
 	pMbss = &pAd->ApCfg.MBSSID[apidx];
 
-	ucTxPath = MIN(MCS_NSS_CAP(pAd)->max_nss,
+	ucTxPath = min_t(u32, MCS_NSS_CAP(pAd)->max_nss,
 		MCS_NSS_CAP(pAd)->max_path[MAX_PATH_TX]);
 
 #ifdef ANTENNA_CONTROL_SUPPORT
@@ -9147,7 +9146,7 @@ INT	Set_HtRxStream_Proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg)
 
 	pMbss = &pAd->ApCfg.MBSSID[apidx];
 
-	ucRxPath = MIN(MCS_NSS_CAP(pAd)->max_nss,
+	ucRxPath = min_t(u32, MCS_NSS_CAP(pAd)->max_nss,
 		MCS_NSS_CAP(pAd)->max_path[MAX_PATH_RX]);
 
 	Value = os_str_tol(arg, 0, 10);
@@ -13787,7 +13786,7 @@ INT show_sysinfo_proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg)
 
 			if (wdev->if_dev) {
 				UINT idx, q_num;
-				UCHAR *mac_str = RTMP_OS_NETDEV_GET_PHYADDR(wdev->if_dev);
+				const UCHAR *mac_str = RTMP_OS_NETDEV_GET_PHYADDR(wdev->if_dev);
 
 				MTWF_PRINT("\t\tOS NetDev status(%s[%d]-"MACSTR"):\n",
 						  RtmpOsGetNetDevName(wdev->if_dev),

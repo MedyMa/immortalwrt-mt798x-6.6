@@ -246,7 +246,7 @@ PNET_DEV RTMP_CFG80211_FindVifEntry_ByType(
 	IN      VOID     *pAdSrc,
 	IN      UINT32    devType);
 
-VOID RTMP_CFG80211_AddVifEntry(
+BOOLEAN RTMP_CFG80211_AddVifEntry(
 	IN      VOID     *pAdSrc,
 	IN      PNET_DEV pNewNetDev,
 	IN      UINT32   DevType);

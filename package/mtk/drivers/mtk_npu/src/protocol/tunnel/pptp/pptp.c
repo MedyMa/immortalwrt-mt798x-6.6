@@ -297,7 +297,7 @@ static void pptp_tnl_statistic_clear(struct npu_tnl_type *tnl_type)
 }
 
 #if IS_ENABLED(CONFIG_MTK_NPU_FLOW)
-static void pptp_tnl_flow_param_setup(const struct net_device_path *path,
+static int pptp_tnl_flow_param_setup(const struct net_device_path *path,
                                      struct npu_params *params)
 {
 	params->mac.type = NPU_MAC_ETH;
@@ -313,6 +313,7 @@ static void pptp_tnl_flow_param_setup(const struct net_device_path *path,
 	params->tunnel.type = NPU_TUNNEL_PPTP;
 	params->tunnel.pptp.ul_call_id = htons(path->tunnel.pptp.peer_call_id);
 	params->tunnel.pptp.dl_call_id = htons(path->tunnel.pptp.call_id);
+	return 0;
 }
 #endif
 

@@ -844,7 +844,7 @@ void dabs_host_delay(PRTMP_ADAPTER pAd,  NDIS_PACKET *pkt)
 			struct timespec64 kts64 = {0};
 			ktime_t kts, delta_kt;
 
-			ktime_get_real_ts64(&kts64);
+			mt_ktime_get_real_ts64(&kts64);
 			kts = timespec64_to_ktime(kts64);
 			delta_kt = ktime_sub(kts, RTPKT_TO_OSPKT(pkt)->tstamp);
 #else

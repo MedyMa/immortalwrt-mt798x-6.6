@@ -107,8 +107,12 @@ enum
 	ACL_POLICY_ALLOW	= 2				/* allow traffic from MAC */
 };
 
+#ifndef MIN
 #define MIN(a, b)					((a) < (b) ? (a) : (b))
+#endif
+#ifndef MAX
 #define MAX(a, b)					((a) > (b) ? (a) : (b))
+#endif
 
 #define SETBIT(a,i)					((a)[(i) >> 3] |= 1 << ((i) & (NBBY - 1)))
 #define CLRBIT(a,i)					((a)[(i) >> 3] &= ~(1 << ((i) & (NBBY - 1))))

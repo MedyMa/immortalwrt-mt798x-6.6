@@ -1,0 +1,57 @@
+Subject: osal: keep netdevice allocations caller-owned and release ops exactly once
+
+--- a/mt_osal_net.c
++++ b/mt_osal_net.c
+@@ -155,6 +155,7 @@
+ 	}
+ 
+ 	net_dev_ops = (void *)net_dev->netdev_ops;
++	net_dev->netdev_ops = NULL;
+ 	if (net_dev_ops)
+ 		vfree(net_dev_ops);
+ }
+@@ -494,7 +495,15 @@
+ 		return;
+ 	}
+ 
+-	tmp_ptr = (void *)dev->netdev_ops;
++	tmp_ptr = NULL;
++#ifdef BACKPORT_NOSTDINC
++	if (dev->priv_destructor == mt_os_net_dev_ops_free) {
++		/* A device which never registered still owns its ops. */
++		if (dev->reg_state == NETREG_UNINITIALIZED)
++			mt_os_net_dev_ops_free(dev);
++	} else
++#endif
++		tmp_ptr = (void *)dev->netdev_ops;
+ 	free_netdev(dev);
+ 	if (tmp_ptr)
+ 		vfree(tmp_ptr);
+@@ -662,7 +671,8 @@
+         if (!wdev)
+       		return -EPERM;
+ #ifdef BACKPORT_NOSTDINC
+-		net_dev->needs_free_netdev = true;
++		/* detach unregisters; mt_os_net_dev_free() releases the allocation. */
++		net_dev->needs_free_netdev = false;
+ 		net_dev->priv_destructor = mt_os_net_dev_ops_free;
+ 		if (rtnl_locked) {
+ 			ret = cfg80211_register_netdevice(net_dev);
+--- a/inc/mt_osal_net.h
++++ b/inc/mt_osal_net.h
+@@ -103,6 +103,7 @@
+ unsigned long mt_os_net_dev_get_qstate(void *net_dev, unsigned int q_idx);
+ char *mt_os_net_dev_get_name(void *net_dev);
+ int mt_os_net_dev_get_if_idx(void *net_dev);
++/* Caller owns the allocation and calls this once after detach (or attach failure). */
+ void mt_os_net_dev_free(void *net_dev);
+ void *mt_os_net_dev_eth_convert_search(void *net_dev_, unsigned char *data);
+ void *mt_os_net_dev_create(
+@@ -114,6 +115,7 @@
+ 	char *name_prefix,
+ 	unsigned char add_suffix,
+ 	unsigned char auto_suffix);
++/* Caller holds RTNL; unregisters the device without freeing its allocation. */
+ void mt_os_net_dev_detach(void *net_dev_, enum net_dev_mode unused);
+ void mt_os_net_dev_protect(bool lock_it);
+ int mt_os_net_dev_register(

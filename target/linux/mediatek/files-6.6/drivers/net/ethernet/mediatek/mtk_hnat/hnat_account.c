@@ -373,6 +373,46 @@ int hnat_account_drain(struct mtk_hnat *h, u32 ppe, u32 slot,
 	return err;
 }
 
+/* Caller holds entry_lock. Keep API-only metadata changes and the owner's
+ * identity atomic with respect to MIB polling, without replacing the flow or
+ * resetting its generation, pending rule credit or client counters.
+ */
+int hnat_account_update_metadata(struct mtk_hnat *h, u32 ppe, u32 slot,
+				 const struct foe_entry *before,
+				 const struct foe_entry *updated)
+{
+	struct hnat_accounting delta;
+	struct hnat_account_ppe *p;
+	struct foe_entry *entry;
+	int err = -ESTALE;
+
+	if (!before || !updated || !account_valid(h, ppe, slot))
+		return -EINVAL;
+	lockdep_assert_held(&h->entry_lock);
+	p = &h->account->ppe[ppe];
+	entry = &h->foe_table_cpu[ppe][slot];
+	spin_lock_bh(&p->lock);
+	if (p->paused || entry->bfib1.state != BIND ||
+	    !account_identity(before, entry))
+		goto out;
+	err = drain_locked(h, ppe, slot, &delta);
+	if (err)
+		goto out;
+	/* The PPE can age or relearn a slot during the read-clear transaction. */
+	if (entry->bfib1.state != BIND || !account_identity(before, entry)) {
+		err = -ESTALE;
+		goto out;
+	}
+	wmb();
+	memcpy(entry, updated, sizeof(*entry));
+	dma_wmb();
+	if (p->slots[slot].owner)
+		p->slots[slot].owner->identity = *updated;
+out:
+	spin_unlock_bh(&p->lock);
+	return err;
+}
+
 bool hnat_account_entry_snapshot(struct mtk_hnat *h, u32 ppe, u32 slot,
 				 struct foe_entry *entry, u64 *generation)
 {
@@ -833,6 +873,11 @@ bool hnat_account_clear_all_bindings(struct mtk_hnat *h, u32 ppe)
 		spin_lock_bh(&p->lock);
 		needs_clear = h->foe_table_cpu[ppe][slot].bfib1.state == BIND ||
 			      p->slots[slot].owner;
+		/* Fence a parser that captured this unowned UNBIND slot before the
+		 * bulk clear. It may reach publication after clearing is released.
+		 */
+		if (!needs_clear)
+			p->slots[slot].generation++;
 		spin_unlock_bh(&p->lock);
 
 		/* Publishers are fenced. Another retirement may advance generation

@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mtk_npu
-PKG_RELEASE:=10
+PKG_RELEASE:=12
 PKG_BUILD_DEPENDS:=pce
 PKG_FILE_DEPENDS:=$(CURDIR)/src/ $(CURDIR)/firmware/
 SCAN_DEPS = *.mk Config*.in
@@ -73,6 +73,7 @@ define Build/Compile
 		M="$(PKG_BUILD_DIR)" \
 		EXTRA_CFLAGS="$(EXTRA_CFLAGS)" \
 		$(EXTRA_KCONFIG) \
+		KBUILD_EXTRA_SYMBOLS="$(wildcard $(PKG_SYMVERS_DIR)/*.symvers)" \
 		modules
 endef
 

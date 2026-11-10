@@ -1,0 +1,622 @@
+Subject: osal: unwind native cfg80211 failures and populate stable per-band channel tables
+
+--- a/mt_osal_cfg80211.c
++++ b/mt_osal_cfg80211.c
+@@ -234,18 +234,6 @@
+ 	},
+ };
+ 
+-#if (KERNEL_VERSION(6, 0, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+-static const struct wiphy_iftype_ext_capab add_iftypes_ext_capa[] = {
+-	{
+-		.iftype = NL80211_IFTYPE_AP,
+-		.eml_capabilities = IEEE80211_EML_CAP_EMLSR_SUPP,
+-	},
+-	{
+-		.iftype = NL80211_IFTYPE_STATION,
+-		.eml_capabilities = IEEE80211_EML_CAP_EMLSR_SUPP,
+-	},
+-};
+-#endif
+ 
+ #if (KERNEL_VERSION(3, 0, 0) <= LINUX_VERSION_CODE)
+ static const struct ieee80211_iface_limit mtk_p2p_sta_go_limits[] = {
+@@ -371,12 +359,16 @@
+ 	struct mt_net_dev_priv *net_priv_info = NULL;
+ 	struct net_device *net_dev;
+ 
++	if (!pWiphy)
++		return -ENODEV;
+ 	mt_priv = (struct mt_cfg80211_priv *)(wiphy_priv(pWiphy));
+ 	if (!mt_priv) {
+ 		MT_DEBUG_TRACE("no mt priv");
+ 		return -ENETDOWN;
+ 	}
+ 	net_dev = mt_priv->net_dev;
++	if (!net_dev)
++		return -ENODEV;
+ 	net_priv_info = (struct mt_net_dev_priv *)netdev_priv((struct net_device *)net_dev);
+ 	if (!net_priv_info)
+ 		return -ENETDOWN;
+@@ -389,7 +381,7 @@
+ 	pIoctlConfig->data = data;
+ 	pIoctlConfig->data_len = data_len;
+ 	ret = net_priv_info->ioctl(net_dev, pIoctlConfig);
+-	return ret;
++	return ret > 0 ? -EIO : ret;
+ }
+ 
+ static int mt_cfg80211_ops_ctrl(
+@@ -412,8 +404,10 @@
+ 	}
+ 	if (!net_dev)
+ 		net_dev = mt_priv->net_dev;
+-	if (net_dev)
+-		net_priv_info = (struct mt_net_dev_priv *)netdev_priv((struct net_device *)net_dev);
++	if (!net_dev || !net_dev->netdev_ops ||
++	    net_dev->netdev_ops->ndo_do_ioctl != mt_os_wifi_ioctl)
++		return -ENODEV;
++	net_priv_info = netdev_priv(net_dev);
+ 	if (!net_priv_info)
+ 		return -ENETDOWN;
+ 	if (!net_priv_info->ioctl)
+@@ -425,7 +419,7 @@
+ 	pIoctlConfig->data = data;
+ 	pIoctlConfig->data_len = data_len;
+ 	ret = net_priv_info->ioctl(net_dev, pIoctlConfig);
+-	return ret;
++	return ret > 0 ? -EIO : ret;
+ }
+ 
+ void mt_cfg80211_scan_status_lock_init(
+@@ -467,7 +461,8 @@
+ 
+ 	/* Enabling OCV to indicate Hostapd to support OCV Feature*/
+ #if KERNEL_VERSION(5, 9, 0) <= LINUX_VERSION_CODE || defined(BACKPORT_NOSTDINC)
+-	wiphy_ext_feature_set(prWiphy, NL80211_EXT_FEATURE_OPERATING_CHANNEL_VALIDATION);
++	if (mtk_cfg8011_features & MT_CFG80211_FEATURE_OPERATING_CHANNEL_VALIDATION)
++		wiphy_ext_feature_set(prWiphy, NL80211_EXT_FEATURE_OPERATING_CHANNEL_VALIDATION);
+ #endif
+ 	if (mtk_cfg8011_features & MT_CFG80211_FEATURE_MGMT_TX_RANDOM_TA)
+ 		wiphy_ext_feature_set(prWiphy, NL80211_EXT_FEATURE_MGMT_TX_RANDOM_TA);
+@@ -943,7 +938,7 @@
+ 	}
+ 	data = &mt_priv->sband_data[band_idx];
+ 	memset(data, 0, sizeof(struct ieee80211_sband_iftype_data));
+-	data->types_mask = BIT(NL80211_IFTYPE_AP);
++	data->types_mask = BIT(NL80211_IFTYPE_AP) | BIT(NL80211_IFTYPE_STATION);
+ 	CFG80211_sband_data_he_cap_init(mt_band_info, band_idx, data);
+ 	CFG80211_sband_data_eht_cap_init(mt_band_info, band_idx, data);
+ 	band_info->n_iftype_data = 1;
+@@ -992,7 +987,12 @@
+ 	if (!mt_priv)
+ 		return false;
+ 
+-	/* 1. Calcute the Channel Number */
++	if (!mt_band_info ||
++	    !(mt_band_info->phy_caps & (MTK_PHY_CAP_RFIC_24GHZ | MTK_PHY_CAP_RFIC_5GHZ | MTK_PHY_CAP_RFIC_6GHZ)) ||
++	    !mt_band_info->TxStream || mt_band_info->TxStream > MTK_MAX_STREAM ||
++	    !mt_band_info->RxStream || mt_band_info->RxStream > MTK_MAX_STREAM ||
++	    !mt_band_info->max_nss || mt_band_info->max_nss > MTK_MAX_STREAM)
++		return false;
+ 	if (mt_band_info->phy_caps & MTK_PHY_CAP_5M_SHIFT) {
+ 		channel_num_2g = MTK_CFG80211_NUM_OF_CHAN_2GHZ_5M_SHIFT;
+ 		channel_num_5g = MTK_CFG80211_NUM_OF_CHAN_5GHZ_5M_SHIFT;
+@@ -1002,121 +1002,68 @@
+ 		channel_num_5g = MTK_CFG80211_NUM_OF_CHAN_5GHZ;
+ 		channel_num_6g = MTK_CFG80211_NUM_OF_CHAN_6GHZ;
+ 	}
+-
+-	if (mt_band_info->phy_caps & MTK_PHY_CAP_RFIC_24GHZ)
+-		NumOfChan += channel_num_2g;
+-
+-	if (mt_band_info->phy_caps & MTK_PHY_CAP_RFIC_5GHZ)
+-		NumOfChan += channel_num_5g;
+-
+-	if (mt_band_info->phy_caps & MTK_PHY_CAP_RFIC_6GHZ)
+-		NumOfChan += channel_num_6g;
+-
+-	/*need to check why FlgIsBMode set to TRUE*/
+-	NumOfRate = 4 + 8;
+-
+-	MT_DEBUG_TRACE("80211> mtk_phy_caps = 0x%x, NumOfChan= %d, re_init = %d\n",
+-		mt_band_info->phy_caps, NumOfChan, re_init);
+-	MT_DEBUG_TRACE("80211> Number of rate = %d\n", NumOfRate);
+-
+-	/* 3. Allocate the Channel instance */
+-	if (pChannels == NULL && NumOfChan) {
++	/* Band pointers below use canonical offsets, even on a single-band radio. */
++	NumOfChan = channel_num_2g + channel_num_5g + channel_num_6g;
++	NumOfRate = ARRAY_SIZE(cfg80211_sup_rate);
++	if (re_init && mt_priv->channel_capacity != NumOfChan)
++		return false;
++	if (!pChannels) {
+ 		pChannels = kcalloc(NumOfChan, sizeof(*pChannels), GFP_KERNEL);
+-
+-		if (!pChannels) {
+-			MT_DEBUG_TRACE("80211> ieee80211_channel allocation fail!\n");
++		if (!pChannels)
++			return false;
++	}
++	if (!pRates) {
++		pRates = kcalloc(NumOfRate, sizeof(*pRates), GFP_KERNEL);
++		if (!pRates) {
++			if (!pChannelsOrg)
++				kfree(pChannels);
+ 			return false;
+ 		}
+ 	}
+-
+-	/* 4. Allocate the Rate instance */
+-	if (pRates == NULL && NumOfRate) {
+-		pRates = kcalloc(NumOfRate, sizeof(*pRates), GFP_KERNEL);
+-
+-		if (!pRates) {
+-			kfree(pChannels);
+-			MT_DEBUG_TRACE("80211> ieee80211_rate allocation fail!\n");
+-			return false;
+-		}
+-	}
+-
+-	/* get TX power */
+-	CurTxPower = 0; /* unknown */
+-	MT_DEBUG_TRACE("80211> CurTxPower = %d dBm\n", CurTxPower);
+-
+-	/* 5. init channel */
++	CurTxPower = 0;
+ 	if (!re_init) {
+ 		if (mt_band_info->phy_caps & MTK_PHY_CAP_5M_SHIFT) {
+-			while (range->startFreq) {
+-				u32 end = range->endFreq;
+-				u32 start = range->startFreq;
+-
+-				if (end < 4920)
+-					band = IEEE80211_BAND_2GHZ;
+-				else if (end < 5910)
+-					band = IEEE80211_BAND_5GHZ;
+-				else
+-					band = IEEE80211_BAND_6GHZ;
+-
+-				for (freq = start; freq <= end; freq = freq + 5) {
+-					if (IdLoop >= NumOfChan)
++			for (; range->startFreq; range++) {
++				band = range == freq_range ? IEEE80211_BAND_2GHZ :
++				       range == freq_range + 1 ? IEEE80211_BAND_5GHZ : IEEE80211_BAND_6GHZ;
++				for (freq = range->startFreq; freq <= range->endFreq; freq += 5) {
++					struct ieee80211_channel *channel = &pChannels[IdLoop];
++
++					if (WARN_ON_ONCE(IdLoop >= NumOfChan))
+ 						break;
+-
+-					pChannels[IdLoop].band = band;
+-					pChannels[IdLoop].center_freq = freq;
+-					pChannels[IdLoop].hw_value = IdLoop;
+-					pChannels[IdLoop].max_power = CurTxPower;
+-					pChannels[IdLoop].max_antenna_gain = 0xff;
+-					pChannels[IdLoop].flags = 0;
+-
+-					if (IsRadarFreq(freq)) {
+-						MT_DEBUG_TRACE("====> Radar Channel %d\n", freq);
+-						pChannels[IdLoop].flags |= IEEE80211_CHAN_RADAR;
+-						pChannels[IdLoop].dfs_state = NL80211_DFS_AVAILABLE;
++					channel->band = band;
++					channel->center_freq = freq;
++					channel->hw_value = IdLoop++;
++					channel->max_power = CurTxPower;
++					channel->max_antenna_gain = 0xff;
++					if (band == IEEE80211_BAND_5GHZ && IsRadarFreq(freq)) {
++						channel->flags |= IEEE80211_CHAN_RADAR;
++						channel->dfs_state = NL80211_DFS_USABLE;
+ 					}
+-
+-					IdLoop = IdLoop + 1;
+ 				}
+-				range++;
+ 			}
+ 		} else {
+ 			for (IdLoop = 0; IdLoop < NumOfChan; IdLoop++) {
+-				u32 center_freq;
+-
+-				if (IdLoop >= (channel_num_5g + channel_num_2g)) {
+-					pChannels[IdLoop].band = IEEE80211_BAND_6GHZ;
+-					center_freq = ieee80211_channel_to_frequency(
+-						mtk_cfg80211_chan[IdLoop], IEEE80211_BAND_6GHZ);
+-				} else if (IdLoop >= channel_num_2g) {
+-					pChannels[IdLoop].band = IEEE80211_BAND_5GHZ;
+-					center_freq = ieee80211_channel_to_frequency(
+-						mtk_cfg80211_chan[IdLoop], IEEE80211_BAND_5GHZ);
+-				} else {
+-					pChannels[IdLoop].band = IEEE80211_BAND_2GHZ;
+-					center_freq = ieee80211_channel_to_frequency(
+-						mtk_cfg80211_chan[IdLoop], IEEE80211_BAND_2GHZ);
+-				}
+-
+-				pChannels[IdLoop].center_freq = center_freq;
+-				pChannels[IdLoop].hw_value = IdLoop;
+-				pChannels[IdLoop].max_power = CurTxPower;
+-
+-				pChannels[IdLoop].max_antenna_gain = 0xff;
+-				pChannels[IdLoop].flags = 0;
+-
+-				/* if (RadarChannelCheck(pAd, Cfg80211_Chan[IdLoop])) */
+-				if (is_radar_channel(mtk_cfg80211_chan[IdLoop])) {
+-					MT_DEBUG_TRACE("====> Radar Channel %d\n",
+-						mtk_cfg80211_chan[IdLoop]);
+-					pChannels[IdLoop].flags |= IEEE80211_CHAN_RADAR;
+-					pChannels[IdLoop].dfs_state = NL80211_DFS_AVAILABLE;
++				struct ieee80211_channel *channel = &pChannels[IdLoop];
++
++				if (IdLoop >= channel_num_2g + channel_num_5g)
++					band = IEEE80211_BAND_6GHZ;
++				else if (IdLoop >= channel_num_2g)
++					band = IEEE80211_BAND_5GHZ;
++				else
++					band = IEEE80211_BAND_2GHZ;
++				channel->band = band;
++				channel->center_freq = ieee80211_channel_to_frequency(mtk_cfg80211_chan[IdLoop], band);
++				channel->hw_value = IdLoop;
++				channel->max_power = CurTxPower;
++				channel->max_antenna_gain = 0xff;
++				if (band == IEEE80211_BAND_5GHZ && is_radar_channel(mtk_cfg80211_chan[IdLoop])) {
++					channel->flags |= IEEE80211_CHAN_RADAR;
++					channel->dfs_state = NL80211_DFS_USABLE;
+ 				}
+ 			}
+ 		}
+-
+-		/* 6. init rate */
+-		for (IdLoop = 0; IdLoop < NumOfRate; IdLoop++)
+-			memcpy(&pRates[IdLoop], &cfg80211_sup_rate[IdLoop], sizeof(*pRates));
++		memcpy(pRates, cfg80211_sup_rate, NumOfRate * sizeof(*pRates));
+ 	}
+ 
+ 	/*		CFG_TODO:
+@@ -1130,6 +1077,7 @@
+ 	 */
+ 	/* 7. Fill the Band 2.4GHz */
+ 	pBand = &mt_priv->Cfg80211_bands[IEEE80211_BAND_2GHZ];
++	memset(pBand, 0, sizeof(*pBand));
+ 
+ 	if (mt_band_info->phy_caps & MTK_PHY_CAP_RFIC_24GHZ) {
+ 		pBand->n_channels = channel_num_2g;
+@@ -1208,6 +1156,7 @@
+ 
+ 	/* 8. Fill the Band 5GHz */
+ 	pBand = &mt_priv->Cfg80211_bands[IEEE80211_BAND_5GHZ];
++	memset(pBand, 0, sizeof(*pBand));
+ 
+ 	if (mt_band_info->phy_caps & MTK_PHY_CAP_RFIC_5GHZ) {
+ 		pBand->n_channels = channel_num_5g;
+@@ -1291,14 +1240,14 @@
+ 				IEEE80211_VHT_MCS_SUPPORT_0_9);
+ 			pBand->vht_cap.vht_mcs.rx_mcs_map = vht_mcs;
+ 			pBand->vht_cap.vht_mcs.rx_highest =
+-				cpu_to_le16(mtk_vht_high_rate_bw80[2][mt_band_info->RxStream&0x03]);
++				cpu_to_le16(mtk_vht_high_rate_bw80[2][mt_band_info->RxStream - 1]);
+ 
+ 			vht_mcs = get_vht_mcs_map(mt_band_info->TxStream,
+ 				IEEE80211_VHT_MCS_SUPPORT_0_9);
+ 
+ 			pBand->vht_cap.vht_mcs.tx_mcs_map = vht_mcs;
+ 			pBand->vht_cap.vht_mcs.tx_highest =
+-				cpu_to_le16(mtk_vht_high_rate_bw80[2][mt_band_info->TxStream&0x03]);
++				cpu_to_le16(mtk_vht_high_rate_bw80[2][mt_band_info->TxStream - 1]);
+ 		}
+ 		mt_cfg80211_sband_data_init(mt_priv, mt_band_info, IEEE80211_BAND_5GHZ, pBand, re_init);
+ 		wiphy->bands[IEEE80211_BAND_5GHZ] = pBand;
+@@ -1311,6 +1260,7 @@
+ 
+ 	/* 9. Fill the Band 6GHz */
+ 	pBand = &mt_priv->Cfg80211_bands[IEEE80211_BAND_6GHZ];
++	memset(pBand, 0, sizeof(*pBand));
+ 
+ 	if (mt_band_info->phy_caps & MTK_PHY_CAP_RFIC_6GHZ) {
+ 		pBand->n_channels = channel_num_6g;
+@@ -1328,6 +1278,7 @@
+ 	}
+ 
+ 	/* 10. re-assign to mainDevice info */
++	mt_priv->channel_capacity = NumOfChan;
+ 	mt_priv->pCfg80211_Channels = pChannels;
+ 	mt_priv->pCfg80211_Rates = pRates;
+ 	return true;
+@@ -1734,7 +1685,7 @@
+ 	enum nl80211_iftype type,
+ 	struct vif_params *params)
+ {
+-	struct mt_priv_ops_vif_set vif_info;
++	struct mt_priv_ops_vif_set vif_info = {};
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int ret = 0;
+ 
+@@ -1745,7 +1696,7 @@
+ 	vif_info.vifType = type;
+ 	vif_info.vifNameLen = strlen(name);
+ 	vif_info.wl_dev = NULL;
+-	vif_info.use_4addr = params->use_4addr;
++	vif_info.use_4addr = params ? params->use_4addr : false;
+ 
+ 	if (vif_info.vifNameLen < IFNAMSIZ) {
+ 		memset(vif_info.vifName, 0, sizeof(vif_info.vifName));
+@@ -1768,7 +1719,7 @@
+ 
+ 	MT_DEBUG_TRACE("80211> ==>ret: %d, wl_dev: %p\n", ret, vif_info.wl_dev);
+ 	if (ret == 0)
+-		return vif_info.wl_dev;
++		return vif_info.wl_dev ? vif_info.wl_dev : ERR_PTR(-EIO);
+ 	if (vif_info.vif_exist || vif_info.is_main_if)
+ 		return ERR_PTR(-ENFILE);
+ 	return ERR_PTR(-EINVAL);
+@@ -2285,12 +2236,9 @@
+ 		MT_DEBUG_TRACE("chandef NULL!\n");
+ 		return -EFAULT;
+ 	}
+-#if 0
+-	if (wl_dev) {
+-		netdev = wl_dev->netdev;
+-		MT_DEBUG_TRACE("80211> ==> %s\n", netdev->name);
+-	}
+-#endif
++	if (!wl_dev || !wl_dev->netdev)
++		return -ENODEV;
++	netdev = wl_dev->netdev;
+ 	memset(&chaninfo, 0, sizeof(chaninfo));
+ 	ctrl_data_ptr->data = &chaninfo;
+ 	ctrl_data_ptr->data_len = sizeof(chaninfo);
+@@ -2744,15 +2692,16 @@
+ 	struct net_device *pNdev,
+ 	struct cfg80211_connect_params *pSme)
+ {
+-	struct cfg80211_crypto_settings *crypto = &pSme->crypto;
++	struct cfg80211_crypto_settings *crypto;
+ 	struct mt_priv_ops_connect_info ops_connect;
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	void *wsc_ie = NULL;
+ 	u32 wps_oui = 0x0050F2;
+ 	u8 wps_oui_type = 4;
+ 
+-	if (!pNdev || !pWiphy)
++	if (!pNdev || !pWiphy || !pSme)
+ 		return -ENODEV;
++	crypto = &pSme->crypto;
+ 	MT_DEBUG_TRACE("80211> ==> %s\n", pNdev->name);
+ 
+ 	memset(&ops_connect, 0, sizeof(ops_connect));
+@@ -2779,10 +2728,12 @@
+ 	MT_DEBUG_TRACE("AuthType: %d\n", ops_connect.conn_info.AuthType);
+ 
+ 	// wpa_supplicant sets 1 akm-suite and pairwise-cipher
+-	ops_connect.conn_info.AkmSuite = crypto->akm_suites[0];
++	if (crypto->n_akm_suites)
++		ops_connect.conn_info.AkmSuite = crypto->akm_suites[0];
+ 	MT_DEBUG_TRACE("AkmSuite: %08x\n", ops_connect.conn_info.AkmSuite);
+ 
+-	ops_connect.conn_info.Pairwise = crypto->ciphers_pairwise[0];
++	if (crypto->n_ciphers_pairwise)
++		ops_connect.conn_info.Pairwise = crypto->ciphers_pairwise[0];
+ 	MT_DEBUG_TRACE("Pairwise: %08x\n", ops_connect.conn_info.Pairwise);
+ 
+ 	ops_connect.conn_info.Group = crypto->cipher_group;
+@@ -3050,8 +3001,11 @@
+ 	}
+ 	net_dev = wdev->netdev;
+ 	mgmt = (struct ieee80211_mgmt *)params->buf;
+-	if (mgmt == NULL)
+-		return 0;
++	if (!mgmt || !pCookie || params->len < 24)
++		return -EINVAL;
++	if ((ieee80211_is_action(mgmt->frame_control) && params->len < 25) ||
++	    (ieee80211_is_auth(mgmt->frame_control) && params->len < 30))
++		return -EINVAL;
+ 	/*MT_DEBUG_TRACE("80211> ==>\n");*/
+ 	memset(&mt_priv_info, 0, sizeof(mt_priv_info));
+ 	pChan = params->chan;
+@@ -3355,7 +3309,7 @@
+ 	struct station_parameters *params)
+ {
+ 	MT_DEBUG_TRACE("80211> ==>\n");
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ #if defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(6, 1, 0) <= CFG_CFG80211_VERSION)
+@@ -3365,7 +3319,7 @@
+ 	unsigned int link_id)
+ {
+ 	MT_DEBUG_TRACE("[%s][%d]:80211> ==>\n", __func__, __LINE__);
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ static void mt_cfg80211_ops_del_intf_link(
+@@ -3382,7 +3336,7 @@
+ 	struct link_station_parameters *params)
+ {
+ 	MT_DEBUG_TRACE("[%s][%d]:80211> ==>\n", __func__, __LINE__);
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ static int mt_cfg80211_ops_mod_link_sta(
+@@ -3391,7 +3345,7 @@
+ 	struct link_station_parameters *params)
+ {
+ 	MT_DEBUG_TRACE("[%s][%d]:80211> ==>\n", __func__, __LINE__);
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ static int mt_cfg80211_ops_del_link_sta(
+@@ -3400,7 +3354,7 @@
+ 	struct link_station_del_parameters *params)
+ {
+ 	MT_DEBUG_TRACE("[%s][%d]:80211> ==>\n", __func__, __LINE__);
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ #endif
+ 
+@@ -3633,6 +3587,16 @@
+ 	.get_tx_power		= mt_cfg80211_ops_get_tx_power,
+ };
+ 
++static void mt_cfg80211_free_bands(struct wiphy *wiphy)
++{
++	struct mt_cfg80211_priv *priv = wiphy_priv(wiphy);
++
++	kfree(priv->pCfg80211_Channels);
++	kfree(priv->pCfg80211_Rates);
++	priv->pCfg80211_Channels = NULL;
++	priv->pCfg80211_Rates = NULL;
++}
++
+ #ifndef __MOCK
+ static struct wireless_dev *mt_cfg80211_wireless_dev_alloc(
+ 	struct device *dev,
+@@ -3642,7 +3606,7 @@
+ 	struct wireless_dev *wl_dev;
+ 	struct wiphy *wiphy = NULL;
+ 	struct mt_cfg80211_priv *pPriv;
+-	char phy_name[10];
++	char phy_name[32];
+ 	int ret;
+ 	unsigned int mtk_dev_features = net_dev_op_hook->mtk_dev_features;
+ 	struct mt_cfg80211_band mt_band_info;
+@@ -3654,7 +3618,7 @@
+ 	}
+ 	memset(wl_dev, 0, sizeof(struct wireless_dev));
+ 	if (mtk_dev_features & MT_FEATURE_SEL_DUAL_BAND) {
+-		ret = sprintf(phy_name, "phy%d", net_dev_op_hook->dev_idx);
++		ret = snprintf(phy_name, sizeof(phy_name), "phy%d", net_dev_op_hook->dev_idx);
+ 		if (ret < 0)
+ 			MT_DEBUG_TRACE("80211> Sprintf error!\n");
+ 		wl_dev->wiphy = wiphy_new_nm(
+@@ -3685,6 +3649,7 @@
+ 	pPriv->net_dev = net_dev;
+ 	pPriv->mtk_dev_features = net_dev_op_hook->mtk_dev_features;
+ 	pPriv->pCfg80211_Wdev = wl_dev;
++	spin_lock_init(&pPriv->scan_notify_lock);
+ 	set_wiphy_dev(wiphy, dev);
+ 	/* max_scan_ssids means in each scan request, how many ssids can driver handle to send probe-req.
+ 	 *  In current design, we only support 1 ssid at a time. So we should set to 1.
+@@ -3702,9 +3667,10 @@
+ 	 wl_dev->wiphy->reg_notifier = mt_cfg80211_reg_notifier;
+ 	/* init channel information */
+ 	memset(&mt_band_info, 0, sizeof(struct mt_cfg80211_band));
+-	mt_cfg80211_init_ctrl(
+-		wiphy, MT_80211_GET_BAND_INFO, &mt_band_info, sizeof(struct mt_cfg80211_band));
+-	mt_cfg80211_sup_band_init(wiphy, &mt_band_info, 0, 0, false);
++	ret = mt_cfg80211_init_ctrl(
++		wiphy, MT_80211_GET_BAND_INFO, &mt_band_info, sizeof(mt_band_info));
++	if (ret || !mt_cfg80211_sup_band_init(wiphy, &mt_band_info, NULL, NULL, false))
++		goto LabelErrReg;
+ 
+ 	/* CFG80211_SIGNAL_TYPE_MBM: signal strength in mBm (100*dBm) */
+ 	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
+@@ -3720,17 +3686,11 @@
+ 	wiphy->flags |= WIPHY_FLAG_HAVE_AP_SME;
+ 	/*what if you get compile error for below flag, please add the patch into your kernel*/
+ 	/* 008-cfg80211-offchan-flags.patch */
+-	wiphy->flags |= WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL;
++	/* remain_on_channel/cancel_remain_on_channel are not implemented. */
+ 
+ 	wiphy->flags |= WIPHY_FLAG_HAS_CHANNEL_SWITCH;
+ 
+-#if (KERNEL_VERSION(6, 0, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+-	if (mtk_dev_features & MT_FEATURE_MLO) {
+-		wiphy->flags |= WIPHY_FLAG_SUPPORTS_MLO;
+-		wiphy->iftype_ext_capab = add_iftypes_ext_capa;
+-		wiphy->num_iftype_ext_capab = ARRAY_SIZE(add_iftypes_ext_capa);
+-	}
+-#endif
++	/* Native OSAL has no link-operation backend; do not advertise MLO. */
+ 	wiphy->max_num_csa_counters = 10;
+ #if (KERNEL_VERSION(5, 1, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+ 	if (mtk_dev_features & MT_FEATURE_11V_MBSS)
+@@ -3758,6 +3718,7 @@
+ 
+ 	return wl_dev;
+ LabelErrReg:
++	mt_cfg80211_free_bands(wiphy);
+ 	wiphy_free(wiphy);
+ 	wl_dev->wiphy = NULL;
+ LabelErrWiphyNew:
+@@ -3813,7 +3774,7 @@
+ 	struct wireless_dev *wl_dev;
+ 	unsigned int mtk_dev_feature = 0;
+ 
+-	if (!net_dev_op_hook)
++	if (!net_dev || !net_dev_op_hook || net_dev->ieee80211_ptr)
+ 		return false;
+ 	mtk_dev_feature = net_dev_op_hook->mtk_dev_features;
+ 	MT_DEBUG_TRACE("mtk_features = 0x%x\n", mtk_dev_feature);
+@@ -3829,10 +3790,17 @@
+ 	wl_dev->iftype = NL80211_IFTYPE_AP;
+ 	net_dev->ieee80211_ptr = wl_dev;
+ 	SET_NETDEV_DEV(net_dev, wiphy_dev(prWiphy));
++	if (mt_cfg80211_init_ctrl(prWiphy, MT_80211_DRIVER_REGISTER, wiphy_priv(prWiphy), 0)) {
++		wiphy_unregister(prWiphy);
++		mt_cfg80211_free_bands(prWiphy);
++		wiphy_free(prWiphy);
++		kfree(wl_dev);
++		net_dev->ieee80211_ptr = NULL;
++		SET_NETDEV_DEV(net_dev, NULL);
++		return false;
++	}
+ 	if (mtk_dev_feature & MT_FEATURE_RFKILL_HW_SUPPORT)
+ 		wiphy_rfkill_start_polling(prWiphy);
+-	mt_cfg80211_init_ctrl(prWiphy, MT_80211_DRIVER_REGISTER, wiphy_priv(prWiphy), 0);
+-	mt_cfg80211_scan_status_lock_init(prWiphy, true);
+ 
+ 	MT_DEBUG_TRACE("80211> end\n");
+ #endif /* !__MOCK */
+@@ -3854,7 +3822,6 @@
+ 		mt_priv = (struct mt_cfg80211_priv *)(wiphy_priv(wiphy));
+ 
+ 		MT_DEBUG_TRACE("80211> unregister/free wireless device\n");
+-		mt_cfg80211_init_ctrl(wiphy, MT_80211_DRIVER_UNREGISTER, NULL, 0);
+ 		/*
+ 		 *	Must unregister, or you will suffer problem when you change
+ 		 *	regulatory domain by using iw.
+@@ -3862,12 +3829,11 @@
+ 		if (mt_priv) {
+ 			if (mt_priv->mtk_dev_features & MT_FEATURE_RFKILL_HW_SUPPORT)
+ 				wiphy_rfkill_stop_polling(wiphy);
+-			if (mt_priv->pCfg80211_Channels)
+-				kfree(mt_priv->pCfg80211_Channels);
+-			if (mt_priv->pCfg80211_Rates)
+-				kfree(mt_priv->pCfg80211_Rates);
+ 		}
+ 		wiphy_unregister(wiphy);
++		/* Core callbacks and rfkill polling have stopped; retire the backend last. */
++		mt_cfg80211_init_ctrl(wiphy, MT_80211_DRIVER_UNREGISTER, NULL, 0);
++		mt_cfg80211_free_bands(wiphy);
+ 		wiphy_free(wiphy);
+ 		kfree(net_dev->ieee80211_ptr);
+ 		net_dev->ieee80211_ptr = 0;
+@@ -3895,11 +3861,10 @@
+ 		mt_priv = (struct mt_cfg80211_priv *)(wiphy_priv(wiphy));
+ 		MT_DEBUG_TRACE("80211> re-init bands...\n");
+ 		/* re-init bands */
+-		if (mt_priv)
+-			mt_cfg80211_sup_band_init(wiphy, mt_band_info,
+-					mt_priv->pCfg80211_Channels,
+-					mt_priv->pCfg80211_Rates,
+-					true);
++		if (!mt_priv || !mt_cfg80211_sup_band_init(wiphy, mt_band_info,
++				mt_priv->pCfg80211_Channels,
++				mt_priv->pCfg80211_Rates, true))
++			return false;
+ 		/* re-init PHY */
+ 		wiphy->rts_threshold = mt_band_info->RtsThreshold;
+ 		wiphy->frag_threshold = mt_band_info->FragmentThreshold;
+--- a/inc/mt_osal_cfg80211.h
++++ b/inc/mt_osal_cfg80211.h
+@@ -285,6 +285,7 @@
+ 
+ 	/* to protect scan status */
+ 	spinlock_t scan_notify_lock;
++	u32 channel_capacity;
+ };
+ 
+ struct mt_cfg80211_io_reg_notify {

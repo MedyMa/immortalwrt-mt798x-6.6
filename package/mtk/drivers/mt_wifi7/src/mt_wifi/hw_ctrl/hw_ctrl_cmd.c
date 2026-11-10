@@ -116,12 +116,17 @@ VOID RTMP_SET_LED(PRTMP_ADAPTER pAd, UINT32 WPSLedMode10, CHAR BandIdx)
 
 VOID RTMP_LED_GPIO_MAP(RTMP_ADAPTER *pAd, UINT8 led_index, UINT16 map_index, BOOLEAN ctr_type)
 {
-	MT_LED_GPIO_MAP led_gpio_map;
+	MT_LED_GPIO_MAP led_gpio_map = {0};
+	INT32 ret;
 
 	led_gpio_map.led_index = led_index;
 	led_gpio_map.map_index = map_index;
 	led_gpio_map.ctr_type = ctr_type;
-	HW_CTRL_BASIC_ENQ(pAd, HWCMD_TYPE_PERIPHERAL, HWCMD_ID_LED_GPIO_MAP, sizeof(MT_LED_GPIO_MAP), &led_gpio_map);
+	ret = HW_CTRL_BASIC_ENQ(pAd, HWCMD_TYPE_PERIPHERAL, HWCMD_ID_LED_GPIO_MAP, sizeof(MT_LED_GPIO_MAP), &led_gpio_map);
+	if (ret != NDIS_STATUS_SUCCESS)
+		MTWF_DBG(pAd, DBG_CAT_CFG, CATCFG_DBGLOG, DBG_LVL_ERROR,
+			"LED %u GPIO %u mapping enqueue failed: %d\n",
+			led_index, map_index, ret);
 }
 
 /* PCI, USB use the same LP function */

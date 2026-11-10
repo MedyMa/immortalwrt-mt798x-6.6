@@ -278,4 +278,6 @@ struct __attribute__((packed)) wo_cmd_query {
 	u32 query_arg1;
 };
 
+struct wo_entry;
+void wed_wo_init(struct wo_entry **wo);
 #endif /*_WARP_WOIF_H_*/

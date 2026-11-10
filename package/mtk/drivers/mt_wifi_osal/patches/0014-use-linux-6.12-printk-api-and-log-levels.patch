@@ -1,0 +1,87 @@
+Subject: osal: use the current printk ABI and retain message severity
+
+--- a/mt_osal_debug.c
++++ b/mt_osal_debug.c
+@@ -29,9 +29,9 @@
+ 
+ 	va_start(args, fmt);
+ #ifdef CUSTOM_FACILITY
+-	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_DEFAULT, NULL, 0, fmt, args);
++	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_DEFAULT, NULL, fmt, args);
+ #else
+-	ret = vprintk(fmt, args);
++	ret = vprintk_emit(0, LOGLEVEL_DEFAULT, NULL, fmt, args);
+ #endif
+ 	va_end(args);
+ 
+@@ -46,9 +46,9 @@
+ 
+ 	va_start(args, fmt);
+ #ifdef CUSTOM_FACILITY
+-	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_ERR, NULL, 0, fmt, args);
++	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_ERR, NULL, fmt, args);
+ #else
+-	ret = vprintk(fmt, args);
++	ret = vprintk_emit(0, LOGLEVEL_ERR, NULL, fmt, args);
+ #endif
+ 	va_end(args);
+ 
+@@ -64,9 +64,9 @@
+ 
+ 	va_start(args, fmt);
+ #ifdef CUSTOM_FACILITY
+-	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_WARNING, NULL, 0, fmt, args);
++	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_WARNING, NULL, fmt, args);
+ #else
+-	ret = vprintk(fmt, args);
++	ret = vprintk_emit(0, LOGLEVEL_WARNING, NULL, fmt, args);
+ #endif
+ 	va_end(args);
+ 
+@@ -82,9 +82,9 @@
+ 
+ 	va_start(args, fmt);
+ #ifdef CUSTOM_FACILITY
+-	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_NOTICE, NULL, 0, fmt, args);
++	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_NOTICE, NULL, fmt, args);
+ #else
+-	ret = vprintk(fmt, args);
++	ret = vprintk_emit(0, LOGLEVEL_NOTICE, NULL, fmt, args);
+ #endif
+ 	va_end(args);
+ 
+@@ -99,9 +99,9 @@
+ 
+ 	va_start(args, fmt);
+ #ifdef CUSTOM_FACILITY
+-	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_INFO, NULL, 0, fmt, args);
++	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_INFO, NULL, fmt, args);
+ #else
+-	ret = vprintk(fmt, args);
++	ret = vprintk_emit(0, LOGLEVEL_INFO, NULL, fmt, args);
+ #endif
+ 	va_end(args);
+ 
+@@ -116,9 +116,9 @@
+ 
+ 	va_start(args, fmt);
+ #ifdef CUSTOM_FACILITY
+-	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_DEBUG, NULL, 0, fmt, args);
++	ret = vprintk_emit(CUSTOM_FACILITY, LOGLEVEL_DEBUG, NULL, fmt, args);
+ #else
+-	ret = vprintk(fmt, args);
++	ret = vprintk_emit(0, LOGLEVEL_DEBUG, NULL, fmt, args);
+ #endif
+ 	va_end(args);
+ 
+--- a/mt_osal_proc.c
++++ b/mt_osal_proc.c
+@@ -194,7 +194,7 @@
+ 
+ DECLARE_SUB_MODULE_INIT(mt_osal_proc_init)
+ {
+-	MT_DEBUG_ERROR("mt_osal_proc_init loaded");
++	MT_DEBUG_TRACE("loaded");
+ 
+ 	return 0;
+ }

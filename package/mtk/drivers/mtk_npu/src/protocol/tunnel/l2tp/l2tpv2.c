@@ -174,7 +174,7 @@ static inline bool l2tpv2_hdr_valid(struct sk_buff *skb, u16 hdrflags)
 }
 
 #if IS_ENABLED(CONFIG_MTK_NPU_FLOW)
-static void l2tpv2_tnl_flow_param_setup(const struct net_device_path *path,
+static int l2tpv2_tnl_flow_param_setup(const struct net_device_path *path,
 					struct npu_params *params)
 {
 	struct npu_l2tp_params *l2tpp = &params->tunnel.l2tp;
@@ -203,6 +203,7 @@ static void l2tpv2_tnl_flow_param_setup(const struct net_device_path *path,
 	l2tpp->dl_tid = path->tunnel.l2tp.dl_tid;
 	l2tpp->ul_sid = path->tunnel.l2tp.ul_sid;
 	l2tpp->dl_sid = path->tunnel.l2tp.dl_sid;
+	return 0;
 }
 #endif
 

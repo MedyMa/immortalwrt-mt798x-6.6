@@ -1350,11 +1350,13 @@ NDIS_STATUS bss_mngr_fill_bss_info(
 #ifdef CONFIG_AP_SUPPORT
 	BSS_STRUCT *pMbss = NULL;
 #endif
-	PSECURITY_CONFIG pSecConfig = &wdev->SecConfig;
+	PSECURITY_CONFIG pSecConfig;
 	u8 band_idx = 0;
 	ULONG sys_time;
 
 	u8 dot11v_mbssid_idx = 0;
+	if (!reg_info)
+		return NDIS_STATUS_FAILURE;
 	if (wdev) {
 #ifdef CONFIG_AP_SUPPORT
 		if (wdev->wdev_type == WDEV_TYPE_AP)
@@ -1363,6 +1365,7 @@ NDIS_STATUS bss_mngr_fill_bss_info(
 	} else {
 		return NDIS_STATUS_FAILURE;
 	}
+	pSecConfig = &wdev->SecConfig;
 	ad = (struct _RTMP_ADAPTER *)wdev->sys_handle;
 	if (ad == NULL)
 		return NDIS_STATUS_FAILURE;
@@ -1383,8 +1386,8 @@ NDIS_STATUS bss_mngr_fill_bss_info(
 			reg_info->dev_type = DEV_TYPE_AP_COH;
 		else {
 			reg_info->dev_type = DEV_TYPE_AP_LEGACY;
-			MTWF_DBG(NULL, DBG_CAT_MLO, CATMLO_BMGR, DBG_LVL_ERROR,
-					"dev_type UNDEFINED\n");
+			MTWF_DBG(NULL, DBG_CAT_MLO, CATMLO_BMGR, DBG_LVL_DEBUG,
+					"legacy AP BSS\n");
 		}
 
 		reg_info->max_bssid_indicator =

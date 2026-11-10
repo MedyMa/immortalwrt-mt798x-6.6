@@ -57,10 +57,10 @@ struct physical_device_workq_handler {
 static u32 physical_device_workq_delete_entry(
 	struct _RTMP_ADAPTER *ad, struct wifi_dev *wdev, u8 *data, u16 data_len)
 {
-	if (ad && data) {
+	if (ad && data && data_len >= sizeof(UINT16) + MAC_ADDR_LEN) {
 		UINT16 wcid = 0;
 
-		wcid = *((UINT16 *)data);
+		memcpy(&wcid, data, sizeof(wcid));
 		MacTableDeleteEntry(ad, wcid, (data + 2));
 		return NDIS_STATUS_SUCCESS;
 	} else
@@ -119,7 +119,7 @@ static void physical_device_workq_handle(
 
 	while ((count < MAX_HANDLE_COUNT) &&
 		((data = physical_device_workq_get_data(ph_dev, &ph_dev->ph_dev_work_list)) != NULL)) {
-		if (data->tag_id < MAIN_WORKQ_END_TAG_ID) {
+		if (data->tag_id < ARRAY_SIZE(workq_handle_table)) {
 			if (workq_handle_table[data->tag_id].handler) {
 				workq_handle_table[data->tag_id].handler(
 					(struct _RTMP_ADAPTER *)data->mac_ad,
@@ -179,16 +179,13 @@ void physical_device_workq_init(
 {
 	struct physical_device *ph_dev = (struct physical_device *)physical_dev;
 
-	ph_dev->ph_dev_wq = mt_create_workqueue("ph_dev_wq");
-	if (ph_dev->ph_dev_wq == NULL) {
-		MTWF_PRINT("%s(): No memory for workqueue\n", __func__);
-		return;
-	}
+	/* The timer and producers also use this lock when allocation fails. */
 	NdisAllocateSpinLock(ph_dev, &ph_dev->ph_dev_wq_lock);
-	OS_SEM_LOCK(&ph_dev->ph_dev_wq_lock);
 	initList(&ph_dev->ph_dev_work_list);
-	OS_SEM_UNLOCK(&ph_dev->ph_dev_wq_lock);
 	mt_init_delayed_work(&ph_dev->ph_dev_work, physical_device_workq_handle);
+	ph_dev->ph_dev_wq = mt_create_workqueue("ph_dev_wq");
+	if (!ph_dev->ph_dev_wq)
+		MTWF_PRINT("%s(): No memory for workqueue\n", __func__);
 }
 
 /**
@@ -200,20 +197,24 @@ void physical_device_workq_init(
  *
  * @param physical_dev Pointer to the physical device structure to exit the work queue
  */
-void physical_device_workq_exit(
-	void *physical_dev)
+void physical_device_workq_exit(void *physical_dev)
 {
-	struct physical_device *ph_dev = (struct physical_device *)physical_dev;
+	struct physical_device *ph_dev = physical_dev;
+	struct workqueue_struct *wq;
 
-	if (ph_dev->ph_dev_wq) {
-		mt_flush_workqueue(ph_dev->ph_dev_wq);
-		mt_destroy_workqueue(ph_dev->ph_dev_wq);
-		ph_dev->ph_dev_wq = NULL;
-		OS_SEM_LOCK(&ph_dev->ph_dev_wq_lock);
-		physical_device_workq_clear_list(&ph_dev->ph_dev_work_list);
-		OS_SEM_UNLOCK(&ph_dev->ph_dev_wq_lock);
-		NdisFreeSpinLock(&ph_dev->ph_dev_wq_lock);
+	OS_SEM_LOCK(&ph_dev->ph_dev_wq_lock);
+	wq = ph_dev->ph_dev_wq;
+	ph_dev->ph_dev_wq = NULL;
+	OS_SEM_UNLOCK(&ph_dev->ph_dev_wq_lock);
+	/* Detach before draining so timer/atomic producers cannot queue again. */
+	if (wq) {
+		cancel_delayed_work_sync(&ph_dev->ph_dev_work);
+		mt_destroy_workqueue(wq);
 	}
+	OS_SEM_LOCK(&ph_dev->ph_dev_wq_lock);
+	physical_device_workq_clear_list(&ph_dev->ph_dev_work_list);
+	OS_SEM_UNLOCK(&ph_dev->ph_dev_wq_lock);
+	NdisFreeSpinLock(&ph_dev->ph_dev_wq_lock);
 }
 
 /**
@@ -258,40 +259,39 @@ void physical_device_workq_exit(
  * @param data_len The length of the data in bytes
  * @param schedule_now Flag indicating whether to schedule the job immediately
  */
-void physical_device_workq_add_job(
-	struct _RTMP_ADAPTER *mac_ad,
-	struct wifi_dev *wdev,
-	u32 tag_id,
-	uint8_t *data,
-	uint32_t data_len,
-	u8 schedule_now)
+BOOLEAN physical_device_workq_add_job(
+	struct _RTMP_ADAPTER *mac_ad, struct wifi_dev *wdev, u32 tag_id,
+	uint8_t *data, uint32_t data_len, u8 schedule_now)
 {
-	struct physical_device *ph_dev = (struct physical_device *)mac_ad->physical_dev;
+	struct physical_device *ph_dev;
 	struct physical_device_workq_item *item;
 	u32 item_size;
 
-	if (ph_dev->ph_dev_wq == NULL) {
-		MTWF_DBG(NULL, DBG_CAT_INIT, CATINIT_TASK, DBG_LVL_INFO,
-				 "no workqueue.....\n");
-		return;
-	}
-
-	item_size = sizeof(struct physical_device_workq_item) + data_len;
+	if (!mac_ad || !mac_ad->physical_dev || !data || !data_len ||
+	    data_len > U16_MAX || tag_id >= ARRAY_SIZE(workq_handle_table))
+		return FALSE;
+	ph_dev = mac_ad->physical_dev;
+	item_size = sizeof(*item) + data_len;
 	os_alloc_mem(NULL, (UCHAR **)&item, item_size);
-	if (item) {
-		os_zero_mem(item, item_size);
-		if (data && data_len)
-			os_move_mem(&item->data[0], data, data_len);
-		item->data_len = data_len;
-		item->mac_ad = mac_ad;
-		item->wdev = wdev;
-		item->tag_id = tag_id;
-		OS_SEM_LOCK(&ph_dev->ph_dev_wq_lock);
-		insertTailList(&ph_dev->ph_dev_work_list, (RT_LIST_ENTRY *)item);
+	if (!item)
+		return FALSE;
+	os_zero_mem(item, item_size);
+	os_move_mem(item->data, data, data_len);
+	item->data_len = data_len;
+	item->mac_ad = mac_ad;
+	item->wdev = wdev;
+	item->tag_id = tag_id;
+	OS_SEM_LOCK(&ph_dev->ph_dev_wq_lock);
+	if (!ph_dev->ph_dev_wq) {
 		OS_SEM_UNLOCK(&ph_dev->ph_dev_wq_lock);
+		os_free_mem(item);
+		return FALSE;
 	}
+	insertTailList(&ph_dev->ph_dev_work_list, (RT_LIST_ENTRY *)item);
 	if (schedule_now == TRUE)
 		mt_queue_delayed_work(ph_dev->ph_dev_wq, &ph_dev->ph_dev_work, 0);
+	OS_SEM_UNLOCK(&ph_dev->ph_dev_wq_lock);
+	return TRUE;
 }
 
 /**
@@ -329,7 +329,7 @@ INT physical_device_workq_show_info(struct _RTMP_ADAPTER *mac_ad, RTMP_STRING *a
 	OS_SEM_LOCK(&ph_dev->ph_dev_wq_lock);
 	item = (struct physical_device_workq_item *)ph_dev->ph_dev_work_list.pHead;
 	while (item) {
-		if (item->tag_id < MAIN_WORKQ_END_TAG_ID)
+		if (item->tag_id < ARRAY_SIZE(workq_handle_table))
 			MTWF_PRINT("TagID: %d (%s)\n",
 				item->tag_id, workq_handle_table[item->tag_id].tag_string);
 		else

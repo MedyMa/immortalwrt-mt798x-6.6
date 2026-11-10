@@ -335,7 +335,7 @@ VOID SendGASRsp(
 		FrameLen += 2;
 		GASFrame->u.GAS_INIT_RSP.GASComebackDelay = Event->u.GAS_RSP_DATA.GASComebackDelay;
 		FrameLen += 2;
-		Pos = GASFrame->u.GAS_INIT_RSP.Variable;
+		Pos = (UCHAR *)GASFrame + offsetof(GAS_FRAME, u.GAS_INIT_RSP.Variable);
 		*Pos++ = IE_ADVERTISEMENT_PROTO;
 		*Pos++ = 2; /* Length field */
 		*Pos++ = 0; /* Query response info field */
@@ -372,7 +372,7 @@ VOID SendGASRsp(
 		FrameLen += 2;
 		GASFrame->u.GAS_INIT_RSP.GASComebackDelay = Event->u.GAS_RSP_MORE_DATA.GASComebackDelay;
 		FrameLen += 2;
-		Pos = GASFrame->u.GAS_INIT_RSP.Variable;
+		Pos = (UCHAR *)GASFrame + offsetof(GAS_FRAME, u.GAS_INIT_RSP.Variable);
 		*Pos++ = IE_ADVERTISEMENT_PROTO;
 		*Pos++ = 2; /* Length field */
 		*Pos++ = 0; /* Query response info field */
@@ -820,7 +820,7 @@ static VOID SendGASCBRsp(
 		FrameLen += 1;
 		GASFrame->u.GAS_CB_RSP.GASComebackDelay = 0;
 		FrameLen += 2;
-		Pos = GASFrame->u.GAS_CB_RSP.Variable;
+		Pos = (UCHAR *)GASFrame + offsetof(GAS_FRAME, u.GAS_CB_RSP.Variable);
 		*Pos++ = IE_ADVERTISEMENT_PROTO;
 		*Pos++ = 2; /* Length field */
 		*Pos++ = 0; /* Query response info field */
@@ -871,7 +871,7 @@ static VOID SendGASCBRsp(
 		FrameLen += 1;
 		GASFrame->u.GAS_CB_RSP.GASComebackDelay = 0;
 		FrameLen += 2;
-		Pos = GASFrame->u.GAS_CB_RSP.Variable;
+		Pos = (UCHAR *)GASFrame + offsetof(GAS_FRAME, u.GAS_CB_RSP.Variable);
 		*Pos++ = IE_ADVERTISEMENT_PROTO;
 		*Pos++ = 2; /* Length field */
 		*Pos++ = 0; /* Query response info field */

@@ -1,0 +1,1366 @@
+Subject: osal: validate native vendor replies and size event attributes explicitly
+
+--- a/mt_osal_cfg80211_vndr.c
++++ b/mt_osal_cfg80211_vndr.c
+@@ -1926,7 +1926,8 @@
+ 	struct sk_buff *skb;
+ 	int ret;
+ 
+-	if (!data) {
++	if (!wiphy || data_len > U16_MAX - NLA_HDRLEN ||
++	    nla_total_size(data_len) > U16_MAX - NLA_HDRLEN || (data_len && !data)) {
+ 		MT_DEBUG_TRACE("data pointer is NULL\n");
+ 		return -ENOMEM;
+ 	}
+@@ -1934,7 +1935,7 @@
+ 	return 0;
+ #endif
+ 
+-	skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, data_len);
++	skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, nla_total_size(data_len));
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("fail to allocate reply msg\n");
+ 		return -ENOMEM;
+@@ -1961,12 +1962,14 @@
+ 	enum mt_cfg80211_vndr_attr_type vndr_attr_type,
+ 	struct mt_cfg80211_vndr_ctrl *data)
+ {
+-	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig, *pIoctlConfig = &IoctlConfig;
++	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig = {}, *pIoctlConfig = &IoctlConfig;
+ 	int ret;
+ 	struct mt_cfg80211_priv *mt_priv;
+ 	struct mt_net_dev_priv *net_priv_info = NULL;
+ 	struct net_device *net_dev;
+ 
++	if (!wiphy || !data)
++		return -EINVAL;
+ 	mt_priv = (struct mt_cfg80211_priv *)(wiphy_priv(wiphy));
+ 	if (!mt_priv) {
+ 		MT_DEBUG_TRACE("no mt priv");
+@@ -1977,7 +1980,10 @@
+ 	else
+ 		net_dev = mt_priv->net_dev;
+ 
+-	net_priv_info = (struct mt_net_dev_priv *)netdev_priv((struct net_device *)net_dev);
++	if (!net_dev || !net_dev->netdev_ops ||
++	    net_dev->netdev_ops->ndo_do_ioctl != mt_os_wifi_ioctl)
++		return -ENODEV;
++	net_priv_info = netdev_priv(net_dev);
+ 	if (!net_priv_info)
+ 		return -ENETDOWN;
+ 	if (!net_priv_info->ioctl)
+@@ -1987,161 +1993,74 @@
+ 	pIoctlConfig->cmd = MT_IO_CFG80211_VNDR;
+ 	pIoctlConfig->subcmd = vndr_attr_type;
+ 	pIoctlConfig->data = data;
++	pIoctlConfig->data_len = sizeof(*data);
+ 	ret = net_priv_info->ioctl(net_dev, pIoctlConfig);
++	return ret > 0 ? -EIO : ret;
++}
++
++/* The allocating variants own response; the backend fills it without replacing it. */
++static int mt_cfg80211_vndr_cmd_get_buffer(
++	struct wiphy *wiphy, struct wireless_dev *wifi_dev,
++	enum mt_cfg80211_vndr_attr_type type, unsigned int attr_cmd,
++	struct mt_cfg80211_vndr_ctrl *ctrl, unsigned int capacity)
++{
++	void *response;
++	int ret;
++
++	if (!ctrl)
++		return -EINVAL;
++	response = kzalloc(capacity, GFP_ATOMIC);
++	if (!response)
++		return -ENOMEM;
++	ctrl->rsp_data = response;
++	ctrl->rsp_data_len = capacity;
++	ctrl->sub_id = attr_cmd;
++	ret = mt_cfg80211_vndr_cmd_handler(wiphy, wifi_dev, type, ctrl);
++	if (!ret && (ctrl->rsp_data != response || ctrl->rsp_data_len > capacity))
++		ret = -EMSGSIZE;
++	if (!ret)
++		ret = mt_cfg80211_vndr_cmd_reply_msg(wiphy, attr_cmd, response, ctrl->rsp_data_len);
++	kfree(response);
++	ctrl->rsp_data = NULL;
++	ctrl->rsp_data_len = 0;
+ 	return ret;
+ }
+ 
+ int mt_cfg80211_vndr_cmd_get_handler(
+-	struct wiphy *wiphy,
+-	struct wireless_dev *wifi_dev,
+-	enum mt_cfg80211_vndr_attr_type vndr_attr_type,
+-	unsigned int attr_cmd,
+-	struct mt_cfg80211_vndr_ctrl *ctrl_data_ptr)
++	struct wiphy *wiphy, struct wireless_dev *wifi_dev,
++	enum mt_cfg80211_vndr_attr_type type, unsigned int attr_cmd,
++	struct mt_cfg80211_vndr_ctrl *ctrl)
++{
++	return mt_cfg80211_vndr_cmd_get_buffer(wiphy, wifi_dev, type, attr_cmd,
++					     ctrl, MT_MAX_VENDOR_MSG_LEN);
++}
++
++int mt_cfg80211_vndr_cmd_hqa_get_handler(
++	struct wiphy *wiphy, struct wireless_dev *wifi_dev,
++	enum mt_cfg80211_vndr_attr_type type, unsigned int attr_cmd,
++	struct mt_cfg80211_vndr_ctrl *ctrl)
++{
++	return mt_cfg80211_vndr_cmd_get_buffer(wiphy, wifi_dev, type, attr_cmd,
++					     ctrl, MT_MAX_SERV_IOCTLBUFF);
++}
++
++int mt_cfg80211_vndr_cmd_get_handler_without_alloc(
++	struct wiphy *wiphy, struct wireless_dev *wifi_dev,
++	enum mt_cfg80211_vndr_attr_type type, unsigned int attr_cmd,
++	struct mt_cfg80211_vndr_ctrl *ctrl)
+ {
+ 	int ret;
+-	struct sk_buff *skb;
+-
+-	ctrl_data_ptr->rsp_data = (void *)kmalloc(MT_MAX_VENDOR_MSG_LEN, GFP_ATOMIC);
+-	if (ctrl_data_ptr->rsp_data == NULL)
+-		return -EFAULT;
+-	memset(ctrl_data_ptr->rsp_data, 0x00, MT_MAX_VENDOR_MSG_LEN);
+-	ctrl_data_ptr->rsp_data_len = MT_MAX_VENDOR_MSG_LEN;
+-	ctrl_data_ptr->sub_id = attr_cmd;
+-	ret = mt_cfg80211_vndr_cmd_handler(
+-		wiphy, wifi_dev, vndr_attr_type, ctrl_data_ptr);
++
++	if (!ctrl)
++		return -EINVAL;
++	ctrl->rsp_data_len = 0;
++	ctrl->sub_id = attr_cmd;
++	ret = mt_cfg80211_vndr_cmd_handler(wiphy, wifi_dev, type, ctrl);
+ 	if (ret)
+-		MT_DEBUG_TRACE("get failed.(vndr_attr_type=%d, attr_cmd=%d)\n",
+-			vndr_attr_type, attr_cmd);
+-	else {
+-
+-#ifdef __MOCK
+-		if (ctrl_data_ptr->rsp_data)
+-			kfree(ctrl_data_ptr->rsp_data);
+-		return 0;
+-#endif /* __MOCK */
+-		skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, ctrl_data_ptr->rsp_data_len);
+-		if (!skb) {
+-			MT_DEBUG_TRACE("fail to allocate reply msg\n");
+-			ret = -ENOMEM;
+-			goto out;
+-		}
+-		if (nla_put(
+-			skb, attr_cmd, ctrl_data_ptr->rsp_data_len, ctrl_data_ptr->rsp_data)) {
+-			MT_DEBUG_TRACE("fail to put nla to skb\n");
+-			dev_kfree_skb(skb);
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-
+-		ret = cfg80211_vendor_cmd_reply(skb);
+-		if (ret) {
+-			MT_DEBUG_TRACE("reply msg failed\n");
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-	}
+-out:
+-	if (ctrl_data_ptr->rsp_data)
+-		kfree(ctrl_data_ptr->rsp_data);
+-	return ret;
+-}
+-
+-int mt_cfg80211_vndr_cmd_hqa_get_handler(
+-	struct wiphy *wiphy,
+-	struct wireless_dev *wifi_dev,
+-	enum mt_cfg80211_vndr_attr_type vndr_attr_type,
+-	unsigned int attr_cmd,
+-	struct mt_cfg80211_vndr_ctrl *ctrl_data_ptr)
+-{
+-	int ret;
+-	struct sk_buff *skb;
+-
+-	ctrl_data_ptr->rsp_data = (void *)kmalloc(MT_MAX_SERV_IOCTLBUFF, GFP_ATOMIC);
+-	if (ctrl_data_ptr->rsp_data == NULL)
+-		return -EFAULT;
+-	memset(ctrl_data_ptr->rsp_data, 0x00, MT_MAX_SERV_IOCTLBUFF);
+-	ctrl_data_ptr->rsp_data_len = MT_MAX_SERV_IOCTLBUFF;
+-	ctrl_data_ptr->sub_id = attr_cmd;
+-	ret = mt_cfg80211_vndr_cmd_handler(
+-		wiphy, wifi_dev, vndr_attr_type, ctrl_data_ptr);
+-	if (ret)
+-		MT_DEBUG_TRACE("get failed.(vndr_attr_type=%d, attr_cmd=%d)\n",
+-			vndr_attr_type, attr_cmd);
+-	else {
+-
+-#ifdef __MOCK
+-		if (ctrl_data_ptr->rsp_data)
+-			kfree(ctrl_data_ptr->rsp_data);
+-		return 0;
+-#endif /* __MOCK */
+-		skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, ctrl_data_ptr->rsp_data_len);
+-		if (!skb) {
+-			MT_DEBUG_TRACE("fail to allocate reply msg\n");
+-			ret = -ENOMEM;
+-			goto out;
+-		}
+-		if (nla_put(
+-			skb, attr_cmd, ctrl_data_ptr->rsp_data_len, ctrl_data_ptr->rsp_data)) {
+-			MT_DEBUG_TRACE("fail to put nla to skb\n");
+-			dev_kfree_skb(skb);
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-
+-		ret = cfg80211_vendor_cmd_reply(skb);
+-		if (ret) {
+-			MT_DEBUG_TRACE("reply msg failed\n");
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-	}
+-out:
+-	if (ctrl_data_ptr->rsp_data)
+-		kfree(ctrl_data_ptr->rsp_data);
+-	return ret;
+-}
+-
+-int mt_cfg80211_vndr_cmd_get_handler_without_alloc(
+-	struct wiphy *wiphy,
+-	struct wireless_dev *wifi_dev,
+-	enum mt_cfg80211_vndr_attr_type vndr_attr_type,
+-	unsigned int attr_cmd,
+-	struct mt_cfg80211_vndr_ctrl *ctrl_data_ptr)
+-{
+-	int ret;
+-	struct sk_buff *skb;
+-
+-	ctrl_data_ptr->rsp_data_len = 0;
+-	ctrl_data_ptr->sub_id = attr_cmd;
+-	ret = mt_cfg80211_vndr_cmd_handler(
+-		wiphy, wifi_dev, vndr_attr_type, ctrl_data_ptr);
+-	if (ret)
+-		MT_DEBUG_TRACE("vndr cmd failed.(vndr_attr_type=%d, attr_cmd=%u)\n",
+-			vndr_attr_type, attr_cmd);
+-	else {
+-
+-#ifdef __MOCK
+-		return 0;
+-#endif /* __MOCK */
+-		skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, ctrl_data_ptr->rsp_data_len);
+-		if (!skb) {
+-			MT_DEBUG_TRACE("fail to allocate reply msg\n");
+-			return -ENOMEM;
+-		}
+-		if (nla_put(
+-			skb, attr_cmd, ctrl_data_ptr->rsp_data_len, ctrl_data_ptr->rsp_data)) {
+-			MT_DEBUG_TRACE("fail to put nla to skb\n");
+-			dev_kfree_skb(skb);
+-			return -EINVAL;
+-		}
+-
+-		ret = cfg80211_vendor_cmd_reply(skb);
+-		if (ret) {
+-			MT_DEBUG_TRACE("reply msg failed\n");
+-			return -EINVAL;
+-		}
+-	}
+-	return ret;
++		return ret;
++	/* Borrowed response remains owned by the backend. */
++	return mt_cfg80211_vndr_cmd_reply_msg(wiphy, attr_cmd,
++					    ctrl->rsp_data, ctrl->rsp_data_len);
+ }
+ 
+ int mt_cfg80211_reply_ap_mld(
+@@ -2702,7 +2621,7 @@
+ {
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_GET_CAP_INFO_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int ret;
+ 
+ 	if (!wifi_dev)
+@@ -2777,7 +2696,7 @@
+ {
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_GET_RUNTIME_INFO_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int ret;
+ 
+ 	if (!wifi_dev)
+@@ -2985,7 +2904,7 @@
+ {
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_GET_STATISTIC_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int ret;
+ 
+ 	if (!wifi_dev)
+@@ -3033,7 +2952,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_GET_STATIC_INFO_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev)
+ 		return -EFAULT;
+@@ -3102,7 +3021,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_GET_BAND_INFO_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_GET_BAND_INFO_MAX,
+ 		(struct nlattr *)data, len, NULL, NULL);
+@@ -3161,7 +3080,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_WAPP_REQ_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev)
+ 		return -EFAULT;
+@@ -3193,7 +3112,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_MCAST_SNOOP_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev)
+ 		return -EFAULT;
+@@ -3323,7 +3242,7 @@
+ 	int ret = 0;
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_FTM_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -3545,7 +3464,7 @@
+ {
+ 	int ret = 0;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_BSS_STATS_ATTR_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -3576,7 +3495,7 @@
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_AP_WIRELESS_MAX + 1];
+ 	int ret;
+ 	char temp_buf[64] = "\0";
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -3690,7 +3609,7 @@
+ 	int ret;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_AP_RFEATURE_ATTR_MAX + 1];
+ 	char temp_buf[64] = "\0";
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -3787,7 +3706,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_COUNTRY_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	MT_DEBUG_TRACE("====>\n");
+ 
+@@ -3833,7 +3752,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_CHAN_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_ch_switch_param ch_switch_params;
+ 	struct mt_ch_switch_param *ch_switch_params_ptr = &ch_switch_params;
+ 	unsigned int freq = 0;
+@@ -3893,7 +3812,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_AP_ACL_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -3972,7 +3891,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_AP_VOW_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_AP_VOW_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_AP_VOW_POLICY, NULL);
+@@ -4080,7 +3999,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_MWDS_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -4111,7 +4030,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_AUTO_CH_SEL_MAX + 1];
+ 	int ret = -EOPNOTSUPP;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_auto_ch_sel_param auto_ch_sel_params = {0};
+ 	struct mt_auto_ch_sel_param *auto_ch_sel_params_ptr = &auto_ch_sel_params;
+ 
+@@ -4268,7 +4187,7 @@
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SCAN_MAX + 1];
+ 	int ret;
+ 	unsigned char scan_type;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_off_ch_scan_param off_ch_scan, *off_ch_scan_ptr = &off_ch_scan;
+ 
+ 	if (!wiphy) {
+@@ -4402,7 +4321,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_AP_BSS_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_AP_BSS_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_AP_BSS_POLICY, NULL);
+@@ -4728,7 +4647,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_AP_RADIO_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_AP_RADIO_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_AP_RADIO_POLICY, NULL);
+@@ -4855,7 +4774,7 @@
+ 	int ret;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_FT_MAX + 1];
+ 	struct net_device *net_dev;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -4895,7 +4814,7 @@
+ 	struct net_device *net_dev;
+ 	int ret;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_MLO_IE_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -4935,7 +4854,7 @@
+ 	struct net_device *net_dev;
+ 	int ret;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_DEL_MLO_STA_ENTRY_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -4977,7 +4896,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SET_COSR_IE_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -5021,7 +4940,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SET_COSR_INFO_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -5072,7 +4991,7 @@
+ 	struct net_device *net_dev;
+ 	int ret;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_PMKID_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -5111,7 +5030,7 @@
+ 	struct net_device *net_dev;
+ 	int ret;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SET_AP_PTK_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -5149,7 +5068,7 @@
+ {
+ 	int ret;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SET_MAC_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_SET_MAC_MAX, (struct nlattr *)data,
+ 		len, MTK_VNDR_ATTR_SET_MAC_ADDR_POLICY, NULL);
+@@ -5175,7 +5094,7 @@
+ {
+ 	int ret = 0;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SET_SEQ_NUM_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_SET_SEQ_NUM_MAX, (struct nlattr *)data,
+ 		len, MTK_VNDR_ATTR_SET_SEQ_NUM_POLICY, NULL);
+@@ -5196,7 +5115,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SET_PASN_KEY_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_SET_PASN_KEY_MAX, (struct nlattr *)data,
+ 		len, MTK_VNDR_ATTR_SET_PASN_KEY_POLICY, NULL);
+@@ -5223,7 +5142,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_WMM_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_WMM_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_WMM_POLICY, NULL);
+@@ -5295,7 +5214,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_AP_MONITOR_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_AP_MONITOR_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_AP_MONITOR_POLICY, NULL);
+@@ -5415,7 +5334,7 @@
+ 	};
+ 	int ret = 0;
+ 	struct sk_buff *skb = NULL;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int msg_len = 0;
+ 
+ 	if (wifi_dev == NULL) {
+@@ -5493,7 +5412,7 @@
+ 	char *cmd_string;
+ 	int cmd_len;
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (wifi_dev == NULL) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -5535,7 +5454,7 @@
+ 	struct sk_buff *skb;
+ 	struct mac_param *param; /* defined in mtk_vendor_nl80211.h */
+ 	unsigned int msg_len = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ctrl_data_ptr->rsp_data = (void *)kmalloc(sizeof(char)*(4096 + 256 + 12), GFP_ATOMIC);
+ 	if (!ctrl_data_ptr->rsp_data)
+@@ -5594,7 +5513,7 @@
+ {
+ 	unsigned int max_len = 2048;
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -5631,7 +5550,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_STA_CLEAN_ATTR_MAX + 1];
+ 	int ret = -EFAULT;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -5661,7 +5580,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_AP_BA_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_AP_BA_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_BA_POLICY, NULL);
+@@ -5756,7 +5675,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SET_ACTION_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -5855,7 +5774,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_QOS_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_QOS_MAX, (struct nlattr *)data,
+ 		len, MTK_VENDOR_SUBCMD_QOS_POLICY, NULL);
+@@ -5922,7 +5841,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SUBCMD_OFF_CHANNEL_INFO_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -5962,7 +5881,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_DFS_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -6021,7 +5940,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_EASYMESH_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -6876,7 +6795,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_VLAN_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_VLAN_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_VLAN_POLICY, NULL);
+@@ -6940,7 +6859,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_MBO_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_MBO_MAX, (struct nlattr *)data,
+ 			len, MTK_SUBCMD_SET_MBO_POLICY, NULL);
+@@ -6968,7 +6887,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_WMM_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_MLO_PRESET_LINKID_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_VENDOR_SUBCMD_MLO_PRESENT_LINKID_POLICY, NULL);
+@@ -6994,7 +6913,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_TXPWR_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_TXPWR_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_TXPOWER_POLICY, NULL);
+@@ -7129,7 +7048,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_EDCA_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_EDCA_ATTR_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_EDCA_POLICY, NULL);
+@@ -7152,7 +7071,7 @@
+ #ifdef CUSTOMER_VENDOR_IE_SUPPORT
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_VIE_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_VIE_ATTR_MAX, (struct nlattr *)data,
+ 		len, NULL, NULL);
+@@ -7212,7 +7131,7 @@
+ 	int ret = 0;
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_RADIO_SET_STATS_ATTR_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -7265,7 +7184,7 @@
+ 	struct net_device *net_dev;
+ 	int ret = 0;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_RADIO_STATS_ATTR_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -7339,7 +7258,7 @@
+ 	int ret = 0;
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_BSS_STATS_ATTR_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -7378,7 +7297,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_STA_ATTR_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -7450,7 +7369,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_HQA_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -7491,7 +7410,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_V10CONVERTER_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_V10CONVERTER_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_V10CONVERTER_POLICY, NULL);
+@@ -7516,7 +7435,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_APPROXYREFRESH_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_APPROXYREFRESH_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_APPROXYREFRESH_POLICY, NULL);
+@@ -7542,7 +7461,7 @@
+ 	unsigned int max_len = MT_EEPROM_SIZE;
+ 	struct sk_buff *skb;
+ 	int msg_len = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ctrl_data_ptr->rsp_data = (void *)kmalloc(max_len, GFP_ATOMIC);
+ 	if (!ctrl_data_ptr->rsp_data)
+@@ -7602,7 +7521,7 @@
+ 	unsigned int max_len = MT_MAX_SERV_IOCTLBUFF;
+ 	struct sk_buff *skb;
+ 	int msg_len = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ctrl_data_ptr->rsp_data = (void *)kmalloc(sizeof(char) * max_len, GFP_ATOMIC);
+ 	if (!ctrl_data_ptr->rsp_data)
+@@ -7658,7 +7577,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_MLO_INFO_SHOW_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_MLO_INFO_SHOW_ATTR_MAX, (struct nlattr *)data,
+ 				len, MTK_SUBCMD_VENDOR_MLO_INFO_POLICY, NULL);
+@@ -7701,7 +7620,7 @@
+ {
+ 	struct nlattr *tb[_MTK_NL80211_VENDOR_ATTR_MLO_SWITCH_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, _MTK_NL80211_VENDOR_ATTR_MLO_SWITCH_ATTR_MAX, (struct nlattr *)data,
+ 					len, MTK_SUBCMD_VENDOR_MLO_SWITH_POLICY, NULL);
+@@ -7729,7 +7648,7 @@
+ 	int ret = 0, i;
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_AP_MLD_ATTR_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -7836,7 +7755,7 @@
+ 	struct wiphy *wiphy, struct wireless_dev *wifi_dev, const void *data, int len)
+ {
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ctrl_data_ptr->rsp_data_len = sizeof(struct mt_phy_cap);
+ 	ctrl_data_ptr->rsp_data = (void *)kmalloc(ctrl_data_ptr->rsp_data_len, GFP_ATOMIC);
+@@ -7860,7 +7779,7 @@
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_DFS_SLAVE_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -7897,7 +7816,7 @@
+ 	int ret = 0;
+ 	struct net_device *net_dev;
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_CONNECTED_STA_MLD_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wifi_dev) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -7940,7 +7859,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_CONFIG_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_CONFIG_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_CONFIG_POLICY, NULL);
+@@ -8000,7 +7919,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SWACI_LNA_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_SWACI_LNA_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SWACI_LNA_POLICY, NULL);
+@@ -8124,7 +8043,7 @@
+ 	struct nlattr *attr)
+ {
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ctrl_data_ptr->u8_val = nla_get_u8(attr);
+ 	ctrl_data_ptr->sub_id = MTK_NL80211_VENDOR_ATTR_SET_AP_MLD_INDEX;
+@@ -8146,7 +8065,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_AP_MLD_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse_nested(tb, MTK_NL80211_VENDOR_ATTR_AP_MLD_ATTR_MAX,
+ 		(struct nlattr *)data, MTK_SUBCMD_SET_AP_MLD_ADDRESS_POLICY, NULL);
+@@ -8183,7 +8102,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_AP_MLD_ATTR_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse_nested(tb, MTK_NL80211_VENDOR_ATTR_AP_MLD_ATTR_MAX,
+ 		(struct nlattr *)data, MTK_SUBCMD_SET_AP_MLD_EML_MODE_POLICY, NULL);
+@@ -8272,7 +8191,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SET_MLO_KDE_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_SET_MLO_KDE_MAX, (struct nlattr *)data,
+ 			len, MTK_SUBCMD_VENDOR_SET_MLO_KDE_POLICY, NULL);
+@@ -8317,7 +8236,7 @@
+ 	{
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_ZR_HDO_RM_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_ZR_HDO_RM_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_ZR_HDO_RM_POLICY, NULL);
+ 
+@@ -8391,7 +8310,7 @@
+ 	{
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_ZR_HDO_RM_MAX + 1];
+ 	int ret;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ret = nla_parse(tb, MTK_NL80211_VENDOR_ATTR_ZR_HDO_RM_MAX, (struct nlattr *)data,
+ 		len, MTK_SUBCMD_SET_ZR_HDO_RM_POLICY, NULL);
+@@ -8419,7 +8338,7 @@
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SPECTRUM_INFO_MAX + 1];
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (wifi_dev == NULL) {
+ 		MT_DEBUG_TRACE("wdev is NULL\n");
+@@ -8469,7 +8388,7 @@
+ 	struct wiphy *wiphy, struct wireless_dev *wifi_dev, const void *data, int len)
+ {
+ 	struct nlattr *tb[MTK_NL80211_VENDOR_ATTR_SPECTRUM_INFO_MAX + 1];
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int ret;
+ 
+ 	if (!wifi_dev)
+--- a/mt_osal_cfg80211_event.c
++++ b/mt_osal_cfg80211_event.c
+@@ -33,16 +33,33 @@
+ 
+ 
+ #ifdef CFG80211_SUPPORT
++static bool mt_cfg80211_event_valid(const struct mt_cfg80211_vndr_ctrl *ctrl)
++{
++	return ctrl && ctrl->wiphy && ctrl->rsp_data_len <= U16_MAX - NLA_HDRLEN &&
++	       (!ctrl->rsp_data_len || ctrl->rsp_data);
++}
++
++static struct sk_buff *mt_cfg80211_event_alloc(struct wiphy *wiphy,
++	struct wireless_dev *wdev, int len, int index, gfp_t gfp)
++{
++	if (!wiphy || len < 0 || len > U16_MAX - NLA_HDRLEN ||
++	    (wdev && wdev->wiphy != wiphy) || index < 0 || index >= wiphy->n_vendor_events)
++		return NULL;
++	return cfg80211_vendor_event_alloc(wiphy, wdev, len, index, gfp);
++}
++
+ int mtk_nl80211_send_5m_shift_enbale(
+ 	void *ctrl_data_)
+ {
+ #ifndef __MOCK
+-	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+-	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+-	struct sk_buff *skb;
+-
+-	skb = cfg80211_vendor_event_alloc(
+-		wiphy, NULL, 4, MTK_NL80211_VENDOR_EVENT_5M_SHIFT_ENABLE, GFP_ATOMIC);
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
++	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
++	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
++	struct sk_buff *skb;
++
++	skb = mt_cfg80211_event_alloc(wiphy, NULL, nla_total_size(sizeof(u16)), MTK_NL80211_VENDOR_EVENT_5M_SHIFT_ENABLE, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -63,6 +80,9 @@
+ 	void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+ 	struct mt_phy_cap *mt_phy_cap = ctrl_data->rsp_data;
+@@ -76,7 +96,8 @@
+ 	u8 seg1_center_channel;
+ 	u16 ch_bw;
+ } params = {0};
+-	int len = sizeof(struct acs_req_params);
++	int len = 2 * nla_total_size(sizeof(u32)) +
++		  4 * nla_total_size(sizeof(u8)) + nla_total_size(sizeof(u16));
+ 	enum nl80211_band band_id;
+ 
+ 
+@@ -99,8 +120,7 @@
+ 
+ 	MT_DEBUG_TRACE("\n");
+ 
+-	skb = cfg80211_vendor_event_alloc(
+-		wiphy, NULL, len, MTK_NL80211_VENDOR_EVENT_ACS_COMPLETE_EVENT, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, NULL, len, MTK_NL80211_VENDOR_EVENT_ACS_COMPLETE_EVENT, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -128,13 +148,15 @@
+ 	void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+ 	struct sk_buff *skb;
+ 
+ 	MT_DEBUG_TRACE("event len:%d\n", ctrl_data->rsp_data_len);
+-	skb = cfg80211_vendor_event_alloc(
+-		wiphy, NULL, ctrl_data->rsp_data_len,
++	skb = mt_cfg80211_event_alloc(wiphy, NULL, nla_total_size(ctrl_data->rsp_data_len),
+ 		MTK_NL80211_VENDOR_EVENT_ACS_PER_CH_INFO, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("cfg80211_vendor_event_alloc fail!!\n");
+@@ -157,9 +179,12 @@
+ 	void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct net_device *net_dev = (struct net_device *)ctrl_data->net_dev;
+-	struct wireless_dev *wl_dev = (struct wireless_dev *)net_dev->ieee80211_ptr;
++	struct wireless_dev *wl_dev = net_dev ? net_dev->ieee80211_ptr : NULL;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+ 	struct sk_buff *skb;
+ 
+@@ -169,8 +194,7 @@
+ 	}
+ 	MT_DEBUG_TRACE("[DFS-SLAVE][%s] len:%d wdev:%p\n",
+ 			__func__, ctrl_data->rsp_data_len, wl_dev);
+-	skb = cfg80211_vendor_event_alloc(
+-		wiphy, wl_dev, ctrl_data->rsp_data_len,
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, nla_total_size(ctrl_data->rsp_data_len),
+ 		MTK_NL80211_VENDOR_EVENT_BH_STATUS, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("cfg80211_vendor_event_alloc fail!!\n");
+@@ -194,14 +218,17 @@
+ 	void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+ 	unsigned char *pmk = (unsigned char *)ctrl_data->rsp_data;
+ 	int pmk_len = ctrl_data->rsp_data_len;
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, NULL,
+-							pmk_len, 0, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, NULL,
++							nla_total_size(pmk_len), 0, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("connect params info cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -221,14 +248,17 @@
+ 	void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+ 	unsigned char *pmksa_event = (unsigned char *)ctrl_data->rsp_data;
+ 	int pmksa_event_len = ctrl_data->rsp_data_len;
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, NULL,
+-						pmksa_event_len, MTK_NL80211_VENDOR_EVENT_RSP_WAPP_EVENT, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, NULL,
++						nla_total_size(pmksa_event_len), MTK_NL80211_VENDOR_EVENT_RSP_WAPP_EVENT, GFP_ATOMIC);
+ 
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("pmksa cfg80211_vendor_event_alloc fail!!\n");
+@@ -249,6 +279,9 @@
+ int mtk_nl80211_send_sta_link_mac_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+@@ -261,7 +294,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, len, MTK_NL80211_VENDOR_EVENT_SEND_MLO_STA_LINK_MAC, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, nla_total_size(len), MTK_NL80211_VENDOR_EVENT_SEND_MLO_STA_LINK_MAC, GFP_ATOMIC);
+ 
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("sta link mac cfg80211_vendor_event_alloc fail!!\n");
+@@ -282,6 +315,9 @@
+ int mtk_nl80211_send_offchannel_info_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+@@ -294,7 +330,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, len, MTK_NL80211_VENDOR_EVENT_OFFCHANNEL_INFO, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, nla_total_size(len), MTK_NL80211_VENDOR_EVENT_OFFCHANNEL_INFO, GFP_ATOMIC);
+ 
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("offchannel info cfg80211_vendor_event_alloc fail!!\n");
+@@ -316,6 +352,9 @@
+ int mtk_nl80211_send_stop_disassoc_timer_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+@@ -326,7 +365,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, ctrl_data->rsp_data_len, MTK_NL80211_VENDOR_EVENT_RX_T2LM_STOP_DISASSOC_TIMER, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, nla_total_size(ctrl_data->rsp_data_len), MTK_NL80211_VENDOR_EVENT_RX_T2LM_STOP_DISASSOC_TIMER, GFP_ATOMIC);
+ 
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("disassoc timer cfg80211_vendor_event_alloc fail!!\n");
+@@ -347,12 +386,15 @@
+ int mtk_nl80211_send_wapp_qry_rsp_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
+-	struct sk_buff *skb;
+-	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+-	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+-	struct wireless_dev *wl_dev = (struct wireless_dev *)ctrl_data->wl_dev;
+-
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, ctrl_data->rsp_data_len, MTK_NL80211_VENDOR_EVENT_RSP_WAPP_EVENT, GFP_ATOMIC);
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
++	struct sk_buff *skb;
++	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
++	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
++	struct wireless_dev *wl_dev = (struct wireless_dev *)ctrl_data->wl_dev;
++
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, nla_total_size(ctrl_data->rsp_data_len), MTK_NL80211_VENDOR_EVENT_RSP_WAPP_EVENT, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("wapp qry rsp cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -373,6 +415,9 @@
+ int mtk_nl80211_send_cosr_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+@@ -380,7 +425,7 @@
+ 	unsigned int buflen = ctrl_data->rsp_data_len;
+ 	unsigned int event_attr = ctrl_data->sub_id;
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, buflen, MTK_NL80211_VENDOR_EVENT_MLO_EVENT, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, nla_total_size(buflen), MTK_NL80211_VENDOR_EVENT_MLO_EVENT, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("cosr event cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -435,13 +480,16 @@
+ int mtk_cfg80211_send_bss_ml_info_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+ 	struct wireless_dev *wl_dev = (struct wireless_dev *)ctrl_data->wl_dev;
+ 	unsigned int buflen = ctrl_data->rsp_data_len;
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, buflen, MTK_NL80211_VENDOR_EVENT_SEND_ML_INFO, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, nla_total_size(buflen), MTK_NL80211_VENDOR_EVENT_SEND_ML_INFO, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("bss ml info cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -462,6 +510,9 @@
+ int mtk_cfg80211_send_ml_reconf_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+@@ -469,10 +520,14 @@
+ 	unsigned int buflen = ctrl_data->rsp_data_len;
+ 	struct mt_ml_reconf_info *info = (struct mt_ml_reconf_info *)ctrl_data->rsp_data;
+ 
+-	if (info == NULL)
+-		return -EFAULT;
+-
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, buflen, MTK_NL80211_VENDOR_EVENT_NOTIFY_ML_RECONF, GFP_ATOMIC);
++	if (!info || ctrl_data->rsp_data_len < sizeof(*info) ||
++	    info->link_num > MT_MLD_LINK_MAX ||
++	    ctrl_data->rsp_data_len < struct_size(info, links, info->link_num))
++		return -EINVAL;
++	buflen = nla_total_size(MT_MAC_ADDR_LEN) + nla_total_size(sizeof(u8)) +
++		 nla_total_size(info->link_num * sizeof(struct mt_ml_reconf_link));
++
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, buflen, MTK_NL80211_VENDOR_EVENT_NOTIFY_ML_RECONF, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("ml reconf cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -506,13 +561,16 @@
+ int mtk_cfg80211_send_reconf_sm_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+ 	struct wireless_dev *wl_dev = (struct wireless_dev *)ctrl_data->wl_dev;
+ 	unsigned int buflen = ctrl_data->rsp_data_len;
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, buflen, MTK_NL80211_VENDOR_EVENT_MLO_RECONF, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, nla_total_size(buflen), MTK_NL80211_VENDOR_EVENT_MLO_RECONF, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("reconf sm cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -533,12 +591,15 @@
+ int mtk_nl80211_send_andlink_wifi_change_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+ 	unsigned int len = ctrl_data->rsp_data_len;
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, NULL, len, MTK_NL80211_VENDOR_EVENT_ANDLINK, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, NULL, nla_total_size(len), MTK_NL80211_VENDOR_EVENT_ANDLINK, GFP_ATOMIC);
+ 
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("addlink wifi change cfg80211_vendor_event_alloc fail!!\n");
+@@ -560,13 +621,22 @@
+ int mtk_cfg80211_APStaDelSendVendorEvent(void *ctrl_data_)
+ {
+ #ifndef __MOCK
+-	struct sk_buff *skb;
+-	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+-	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+-	struct wireless_dev *wl_dev = (struct wireless_dev *)ctrl_data->wl_dev;
+-	unsigned int event_len = ctrl_data->uint_val;
+-
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, event_len,
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
++	struct sk_buff *skb;
++	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
++	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
++	struct wireless_dev *wl_dev = (struct wireless_dev *)ctrl_data->wl_dev;
++	unsigned int event_len;
++
++	if (!ctrl_data->data || ctrl_data->data_len != ETH_ALEN)
++		return -EINVAL;
++	event_len = nla_total_size(ETH_ALEN) + nla_total_size(sizeof(u16));
++	if (ctrl_data->rsp_data_len)
++		event_len += nla_total_size(ctrl_data->rsp_data_len);
++
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, event_len,
+ 		MTK_NL80211_VENDOR_EVENT_DISC_STA, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("ap sta del cfg80211_vendor_event_alloc fail!!\n");
+@@ -601,12 +671,15 @@
+ int mtk_cfg80211os_VendorEventMloResponse(void *ctrl_data_)
+ {
+ #ifndef __MOCK
+-	struct sk_buff *skb;
+-	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+-	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+-
+-	skb = cfg80211_vendor_event_alloc(wiphy, NULL,
+-			ctrl_data->rsp_data_len, MTK_NL80211_VENDOR_EVENT_MLO_EVENT, GFP_ATOMIC);
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
++	struct sk_buff *skb;
++	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
++	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
++
++	skb = mt_cfg80211_event_alloc(wiphy, NULL,
++			nla_total_size(ctrl_data->rsp_data_len), MTK_NL80211_VENDOR_EVENT_MLO_EVENT, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("vendor event mlo response cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -626,12 +699,15 @@
+ int mtk_cfg80211_send_bss_ml_sta_profile_info_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
+-	struct sk_buff *skb;
+-	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+-	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+-
+-	skb = cfg80211_vendor_event_alloc(wiphy, NULL,
+-			ctrl_data->rsp_data_len, MTK_NL80211_VENDOR_EVENT_STA_PROFILE_EVENT, GFP_ATOMIC);
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
++	struct sk_buff *skb;
++	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
++	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
++
++	skb = mt_cfg80211_event_alloc(wiphy, NULL,
++			nla_total_size(ctrl_data->rsp_data_len), MTK_NL80211_VENDOR_EVENT_STA_PROFILE_EVENT, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("bss mlo sta profile cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;
+@@ -650,6 +726,9 @@
+ int mtk_nl80211_send_zr_hdo_rm_event(void *ctrl_data_)
+ {
+ #ifndef __MOCK
++	if (!mt_cfg80211_event_valid(ctrl_data_))
++		return -EINVAL;
++
+ 	struct sk_buff *skb;
+ 	struct mt_cfg80211_vndr_ctrl *ctrl_data = (struct mt_cfg80211_vndr_ctrl *)ctrl_data_;
+ 	struct wiphy *wiphy = (struct wiphy *)ctrl_data->wiphy;
+@@ -657,7 +736,7 @@
+ 	unsigned int buflen = ctrl_data->rsp_data_len;
+ 	unsigned int event_attr = ctrl_data->sub_id;
+ 
+-	skb = cfg80211_vendor_event_alloc(wiphy, wl_dev, buflen, MTK_NL80211_VENDOR_EVENT_ZR_HDO_RM, GFP_ATOMIC);
++	skb = mt_cfg80211_event_alloc(wiphy, wl_dev, nla_total_size(buflen), MTK_NL80211_VENDOR_EVENT_ZR_HDO_RM, GFP_ATOMIC);
+ 	if (!skb) {
+ 		MT_DEBUG_TRACE("cosr event cfg80211_vendor_event_alloc fail!!\n");
+ 		return -EINVAL;

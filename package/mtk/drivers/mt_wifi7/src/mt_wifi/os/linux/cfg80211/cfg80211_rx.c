@@ -41,8 +41,8 @@
 BOOLEAN CFG80211_AuthReqHandler(
 	struct _RTMP_ADAPTER *pAd, struct _RX_BLK *pRxBlk, void *pData, AUTH_FRAME_INFO *auth_info)
 {
-	PFRAME_802_11 Fr = (PFRAME_802_11)pData;
-	ULONG MsgLen = pRxBlk->DataSize;
+	PFRAME_802_11 Fr __maybe_unused = (PFRAME_802_11)pData;
+	ULONG MsgLen __maybe_unused = pRxBlk->DataSize;
 #ifdef BAND_STEERING
 	HEADER_802_11 AuthReqHdr;
 #endif /* BAND_STEERING */
@@ -229,7 +229,7 @@ static BOOLEAN CFG80211_ProbeReqHandler(
 	{
 		if (PeerProbeReqSanity(pAd, (VOID *)pRxBlk->pData,
 			pRxBlk->DataSize, ProbeReqParam) == FALSE) {
-			MTWF_DBG(pAd, DBG_CAT_RX, CATRX_MGMT, DBG_LVL_ERROR,
+			MTWF_DBG(pAd, DBG_CAT_RX, CATRX_MGMT, DBG_LVL_WARN,
 				"PeerProbeReqSanity fail!\n");
 			os_free_mem(ProbeReqParam);
 			return TRUE; /*drop when SSID sanity check fails in ProbeReq */
@@ -838,7 +838,7 @@ BOOLEAN CFG80211_CheckActionFrameType(
 #if (KERNEL_VERSION(5, 0, 0) < LINUX_VERSION_CODE)
 				struct timespec64 tv;
 
-				ktime_get_real_ts64(&tv);
+				mt_ktime_get_real_ts64(&tv);
 				mgmt->u.probe_resp.timestamp = (((UINT64) tv.tv_sec * 1000000000) + tv.tv_nsec)/1000;
 #else
 				struct timeval tv;
@@ -1106,7 +1106,7 @@ BOOLEAN CFG80211_HandleMgmtFrame(RTMP_ADAPTER *pAd, struct _RX_BLK *pRxBlk, UCHA
 	freq /= 1000;
 	if (pWdev) {
 		pNetDev = pWdev->if_dev;
-		OpMode = pWdev->wdev_type == WDEV_TYPE_AP ? OPMODE_AP : OPMODE_STA;
+		(void)OpMode; /* retained for legacy callers */
 		if ((pWdev->wdev_type == WDEV_TYPE_AP)
 			&& ap_rx_mgmt_drop(pAd, (FRAME_CONTROL *)pRxBlk->FC))
 			return TRUE; /* drop packet */

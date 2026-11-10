@@ -1,0 +1,27 @@
+Subject: osal: provide the checksum-pull ABI used by the BE14 receive path
+
+--- a/mt_osal_wifi_compat.c
++++ b/mt_osal_wifi_compat.c
+@@ -56,6 +56,12 @@
+ EXPORT_SYMBOL(mt_cfg80211_vendor_cmd_reply);
+ #endif
+ 
++void *mt_skb_pull_rcsum(struct sk_buff *skb, unsigned int len)
++{
++	return skb_pull_rcsum(skb, len);
++}
++EXPORT_SYMBOL(mt_skb_pull_rcsum);
++
+ void mt_rcu_barrier(void)
+ {
+ 	rcu_barrier();
+--- a/inc/mt_osal.h
++++ b/inc/mt_osal.h
+@@ -49,6 +49,7 @@
+ 
+ /* Compatibility ABI used by the proprietary MTK WiFi driver. */
+ void mt_rcu_barrier(void);
++void *mt_skb_pull_rcsum(struct sk_buff *skb, unsigned int len);
+ ktime_t mt_ktime_get_with_offset(enum tk_offsets offs);
+ int mt_register_oom_notifier(struct notifier_block *nb);
+ int mt_unregister_oom_notifier(struct notifier_block *nb);

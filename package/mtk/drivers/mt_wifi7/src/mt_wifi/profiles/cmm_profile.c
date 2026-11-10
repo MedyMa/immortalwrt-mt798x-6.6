@@ -5182,7 +5182,7 @@ NDIS_STATUS	RTMPSetProfileParameters(
 					MTWF_DBG(pAd, DBG_CAT_CFG, CATCFG_PROFILE, DBG_LVL_ERROR,
 							"snprintf error!\n");
 
-				if (RTMPGetKeyParameter(tok_str, tmpbuf, 25, pBuffer, TRUE)) {
+				if (RTMPGetKeyParameter(tok_str, tmpbuf, 25, pBuffer, TRUE) && tmpbuf[0]) {
 					retval = RT_CfgSetMacAddress(pAd, tmpbuf, i, OPMODE_AP);
 
 					if (retval)
@@ -5196,7 +5196,7 @@ NDIS_STATUS	RTMPSetProfileParameters(
 #endif /* MBSS_SUPPORT */
 
 #ifdef CONFIG_APSTA_MIXED_SUPPORT
-			if (RTMPGetKeyParameter("ApcliMacAddress", tmpbuf, 25, pBuffer, TRUE)) {
+			if (RTMPGetKeyParameter("ApcliMacAddress", tmpbuf, 25, pBuffer, TRUE) && tmpbuf[0]) {
 				retval = RT_CfgSetMacAddress(pAd, tmpbuf, 0, OPMODE_STA);
 
 				if (retval)
@@ -5204,7 +5204,7 @@ NDIS_STATUS	RTMPSetProfileParameters(
 						"ApcliMacAddress = "MACSTR"\n",
 						MAC2STR(pAd->ApcliAddr[0]));
 			}
-			if (RTMPGetKeyParameter("ApcliMacAddress1", tmpbuf, 25, pBuffer, TRUE)) {
+			if (RTMPGetKeyParameter("ApcliMacAddress1", tmpbuf, 25, pBuffer, TRUE) && tmpbuf[0]) {
 				retval = RT_CfgSetMacAddress(pAd, tmpbuf, 1, OPMODE_STA);
 
 				if (retval)
@@ -6173,7 +6173,7 @@ NDIS_STATUS	RTMPSetProfileParameters(
 					if (i >= pAd->ApCfg.BssidNum)
 						break;
 
-						pAd->ApCfg.MBSSID[PF_TO_BSS_IDX(pAd, i)].IsolateInterStaTraffic = FALSE;
+					pAd->ApCfg.MBSSID[PF_TO_BSS_IDX(pAd, i)].IsolateInterStaTraffic = FALSE;
 
 					MTWF_DBG(NULL, DBG_CAT_CFG, CATCFG_PROFILE, DBG_LVL_INFO,
 						"I/F(ra%d) NoForwarding=%ld\n", i,
@@ -9302,4 +9302,3 @@ NDIS_STATUS load_physical_device_profile(void *ph_dev_obj)
 }
 
 #endif /* !CONFIG_PROFILE_OFF */
-

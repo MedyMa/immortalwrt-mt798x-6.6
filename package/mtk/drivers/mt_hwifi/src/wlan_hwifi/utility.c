@@ -131,7 +131,7 @@ mtk_idr_replace(struct mtk_idr_mgmt *idrm, u32 idx, void *data, void **old_data)
 	spin_unlock_bh(&idrm->lock);
 
 	if (IS_ERR(ptr)) {
-		ret = -PTR_ERR(ptr);
+		ret = PTR_ERR(ptr);
 		goto err;
 	}
 

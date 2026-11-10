@@ -21,7 +21,7 @@ VOID log_time_begin(
 #ifdef LINUX
 	else if (unit == LOG_TIME_UNIT_US) {
 #if (KERNEL_VERSION(5, 0, 0) <= LINUX_VERSION_CODE)
-		ktime_get_real_ts64(&tl->t);
+		mt_ktime_get_real_ts64(&tl->t);
 #else
 		do_gettimeofday(&tl->t);
 #endif
@@ -48,7 +48,7 @@ VOID log_time_end(
 	if (tl->unit == LOG_TIME_UNIT_US) {
 #ifdef LINUX
 #if (KERNEL_VERSION(5, 0, 0) <= LINUX_VERSION_CODE)
-		ktime_get_real_ts64(&t);
+		mt_ktime_get_real_ts64(&t);
 		tl->time = ((t.tv_sec - tl->t.tv_sec) * 1000000000 + t.tv_nsec - tl->t.tv_nsec)/1000;
 #else
 		do_gettimeofday(&t);

@@ -504,6 +504,11 @@ void announce_802_3_packet(
 				if (RTMP_GET_PACKET_TYPE(pRxPkt)
 						== RX_PPE_VALID)
 					ra_sw_nat_hook_rx(pRxPkt);
+#ifdef WHNAT_SUPPORT
+				else
+					/* Recycled software RX buffers carry no PPE metadata. */
+					RtmpOsPktNatMagicTagInvalid(pRxPkt);
+#endif
 				RtmpOsPktRcvHandle(pRxPkt, napi);
 			}
 

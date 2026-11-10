@@ -1386,17 +1386,22 @@ static NTSTATUS HwCtrlSetLEDStatus(RTMP_ADAPTER *pAd, HwCmdQElmt *CMDQelmt)
 static NTSTATUS HwCtrlLedGpioMap(RTMP_ADAPTER *pAd, HwCmdQElmt *CMDQelmt)
 {
 	PMT_LED_GPIO_MAP prLedMapping = (PMT_LED_GPIO_MAP)(CMDQelmt->buffer);
+	INT32 ret;
 #ifdef WIFI_UNIFIED_COMMAND
 	RTMP_CHIP_CAP * pChipCap = hc_get_chip_cap(pAd->hdev_ctrl);
 #endif /* WIFI_UNIFIED_COMMAND */
 
 #ifdef WIFI_UNIFIED_COMMAND
 	if (pChipCap->uni_cmd_support)
-		UniCmdLedGpio(pAd, prLedMapping->led_index, prLedMapping->map_index, prLedMapping->ctr_type);
+		ret = UniCmdLedGpio(pAd, prLedMapping->led_index, prLedMapping->map_index, prLedMapping->ctr_type);
 	else
 #endif /* WIFI_UNIFIED_COMMAND */
-		AndesLedGpioMap(pAd, prLedMapping->led_index, prLedMapping->map_index, prLedMapping->ctr_type);
-	return NDIS_STATUS_SUCCESS;
+		ret = AndesLedGpioMap(pAd, prLedMapping->led_index, prLedMapping->map_index, prLedMapping->ctr_type);
+	if (ret != NDIS_STATUS_SUCCESS)
+		MTWF_DBG(pAd, DBG_CAT_CFG, CATCFG_DBGLOG, DBG_LVL_ERROR,
+			"LED %u GPIO %u mapping failed: %d\n",
+			prLedMapping->led_index, prLedMapping->map_index, ret);
+	return ret;
 }
 
 #endif /* LED_CONTROL_SUPPORT */

@@ -993,6 +993,10 @@ retransmit:
 				ret = msg->cmd_return_status;
 			}
 
+#ifdef WIFI_UNIFIED_COMMAND
+			if (IS_CMD_MSG_UNI_CMD_FLAG_SET(msg))
+				ret = msg->cmd_return_status;
+#endif
 			MTWF_DBG(NULL, DBG_CAT_FW, CATFW_DBGINFO, DBG_LVL_DEBUG,
 					 "msg state = %d\n", state);
 			/* msg will be free after enqueuing to tx_doneq. So msg is not able to pass FW's response to caller. */

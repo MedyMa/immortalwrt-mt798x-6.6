@@ -277,4 +277,5 @@ int warp_rx_rro_3_1_ring_init_hw(struct wed_entry *wed, struct wifi_entry *wifi)
 int warp_rx_rro_3_1_init_hw(struct wed_entry *wed, struct wifi_entry *wifi);
 void warp_rx_rro_3_1_exit_hw(struct wed_entry *wed, struct wifi_entry *wifi);
 #endif
+void warp_write_hw_extra(u32 addr, u32 *val);
 #endif

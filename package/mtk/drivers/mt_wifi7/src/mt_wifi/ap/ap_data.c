@@ -1165,7 +1165,8 @@ static inline VOID ap_build_802_11_header(RTMP_ADAPTER *pAd, struct _TX_BLK *pTx
 				COPY_MAC_ADDR(wifi_hdr->Addr2, pAd->CurrentAddress); /* from AP1 */
 			}
 			COPY_MAC_ADDR(wifi_hdr->Addr3, pTxBlk->pSrcBufHeader);	/* DA */
-			COPY_MAC_ADDR(wifi_hdr->Octet, pTxBlk->pSrcBufHeader + MAC_ADDR_LEN);/* ADDR4 = SA */
+			COPY_MAC_ADDR((UCHAR *)wifi_hdr + offsetof(HEADER_802_11, Octet),
+				pTxBlk->pSrcBufHeader + MAC_ADDR_LEN);/* ADDR4 = SA */
 			pTxBlk->MpduHeaderLen += MAC_ADDR_LEN;
 			pTxBlk->wifi_hdr_len += MAC_ADDR_LEN;
 		} else
@@ -1209,7 +1210,8 @@ static inline VOID ap_build_802_11_header(RTMP_ADAPTER *pAd, struct _TX_BLK *pTx
 				}
 				COPY_MAC_ADDR(wifi_hdr->Addr2, pAd->CurrentAddress);						/* from AP1 */
 				COPY_MAC_ADDR(wifi_hdr->Addr3, pTxBlk->pSrcBufHeader);					/* DA */
-				COPY_MAC_ADDR(&wifi_hdr->Octet[0], pTxBlk->pSrcBufHeader + MAC_ADDR_LEN);/* ADDR4 = SA */
+				COPY_MAC_ADDR((UCHAR *)wifi_hdr + offsetof(HEADER_802_11, Octet),
+					pTxBlk->pSrcBufHeader + MAC_ADDR_LEN);/* ADDR4 = SA */
 				pTxBlk->MpduHeaderLen += MAC_ADDR_LEN;
 				pTxBlk->wifi_hdr_len += MAC_ADDR_LEN;
 			} else

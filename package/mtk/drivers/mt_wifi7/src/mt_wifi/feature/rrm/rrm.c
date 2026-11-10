@@ -2504,7 +2504,6 @@ VOID RRM_PeerMeasureReqAction(
 		IN PRTMP_ADAPTER pAd,
 		IN MLME_QUEUE_ELEM *Elem)
 {
-#define MIN(_x, _y) ((_x) > (_y) ? (_x) : (_y))
 	MEASURE_REQ_INFO MeasureReqInfo;
 	RRM_BEACON_REQ_INFO BcnReq;
 	PFRAME_802_11 pFr = (PFRAME_802_11)Elem->Msg;
@@ -2562,8 +2561,8 @@ VOID RRM_PeerMeasureReqAction(
 			isWildcardBssid = RTMPEqualMemory(BcnReq.Bssid, WildCardBssid, MAC_ADDR_LEN);
 			if (isWildcardBssid == TRUE) {
 				if (SsidLen != 0) {
-					BssMatch = RTMPEqualMemory(pBssEntry->Ssid, pSsid,
-							MIN(SsidLen, pBssEntry->SsidLen));
+					BssMatch = SsidLen == pBssEntry->SsidLen &&
+						RTMPEqualMemory(pBssEntry->Ssid, pSsid, SsidLen);
 					if (BssMatch)
 						RRM_EnqueuePeerBeaconRep(pAd, pFr->Hdr.Addr2, pFr->Hdr.Addr1, DialogToken, MeasureReqInfo,
 						BcnReq, pBssEntry);

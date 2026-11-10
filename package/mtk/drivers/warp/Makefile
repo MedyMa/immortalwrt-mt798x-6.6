@@ -7,10 +7,11 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=warp
-PKG_RELEASE:=2
+PKG_RELEASE:=4
 P4REV:=
 PKG_VERSION:=
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
+PKG_FILE_DEPENDS:=$(CURDIR)/src/
 
 PKG_KCONFIG:= \
 	WARP_VERSION \
@@ -22,7 +23,7 @@ PKG_KCONFIG:= \
 	WARP_MEMORY_LEAK_DBG \
 	TARGET_mediatek
 
-PKG_CONFIG_DEPENDS:=$(foreach c, $(PKG_KCONFIG),$(if $(CONFIG_$c),CONFIG_$(c)))
+PKG_CONFIG_DEPENDS:=$(addprefix CONFIG_,$(PKG_KCONFIG))
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -50,6 +51,7 @@ define Build/Compile
 		CROSS_COMPILE="$(TARGET_CROSS)" \
 		ARCH="$(LINUX_KARCH)" \
 		M="$(PKG_BUILD_DIR)" \
+		KBUILD_EXTRA_SYMBOLS="$(wildcard $(PKG_SYMVERS_DIR)/*.symvers)" \
 		$(foreach c, $(PKG_KCONFIG),$(if $(CONFIG_$c),CONFIG_$(c)=$(CONFIG_$(c)))) \
 		modules
 endef

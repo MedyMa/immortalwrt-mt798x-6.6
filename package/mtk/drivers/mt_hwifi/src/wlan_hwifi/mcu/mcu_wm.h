@@ -540,6 +540,32 @@ struct mcu_fw_region {
 	u8 reserved1[15];
 } __packed;
 
+static inline bool mcu_fw_layout_valid(const u8 *data, size_t size)
+{
+	const struct mcu_fw_trailer *hdr;
+	const struct mcu_fw_region *regions;
+	size_t table_size, payload_size, used = 0;
+	unsigned int i;
+
+	if (!data || size < sizeof(*hdr) || size > INT_MAX)
+		return false;
+	hdr = (const void *)(data + size - sizeof(*hdr));
+	table_size = hdr->n_region * sizeof(*regions);
+	if (!hdr->n_region || table_size > size - sizeof(*hdr))
+		return false;
+	regions = (const void *)((const u8 *)hdr - table_size);
+	payload_size = size - sizeof(*hdr) - table_size;
+	for (i = 0; i < hdr->n_region; i++) {
+		u32 len = le32_to_cpu(regions[i].len);
+
+		if (len > payload_size - used ||
+		    len > U32_MAX - le32_to_cpu(regions[i].addr))
+			return false;
+		used += len;
+	}
+	return true;
+}
+
 #define UNI_CMD_ID_POWER_CTRL		0x000F
 
 enum {

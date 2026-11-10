@@ -1405,6 +1405,9 @@ int find_first_bit(unsigned long *bitmap, int size);
 int find_last_bit(unsigned long *bitmap, int size);
 void *kzalloc(size_t size, int flags);
 void mt_synchronize_rcu(void);
+void mt_rcu_barrier(void);
+struct sk_buff;
+void *mt_skb_pull_rcsum(struct sk_buff *skb, unsigned int len);
 
 /*******************************************************************************
  * Device Register I/O Access related definitions and data structures.

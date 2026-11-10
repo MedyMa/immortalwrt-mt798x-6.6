@@ -37,6 +37,7 @@
 
 #include "nf_hnat_mtk.h"
 #include "hnat.h"
+#include "hnat_api.h"
 
 #include "../mtk_eth_soc.h"
 #include "../mtk_eth_reset.h"
@@ -1523,6 +1524,48 @@ drop:
 	return NF_DROP;
 }
 
+/* HNAT metadata occupies skb headroom. Validate the real L2 header before
+ * reading or writing it, and inspect IPv6 fields only for IPv6 packets.
+ * Malformed or non-linear base headers stay on the software path.
+ */
+static struct ethhdr *hnat_skb_ethhdr(struct sk_buff *skb,
+				       struct flow_offload_hw_path *hw_path)
+{
+	struct ipv6hdr *ip6h;
+	unsigned char *mac;
+	unsigned int hlen;
+	int offset;
+
+	if (!skb || !hw_path)
+		return NULL;
+
+	if (skb->protocol == htons(ETH_P_IPV6)) {
+		offset = skb_network_offset(skb);
+		if (offset < 0 || (unsigned int)offset > skb_headlen(skb) ||
+		    skb_headlen(skb) - offset < sizeof(*ip6h))
+			return NULL;
+		ip6h = ipv6_hdr(skb);
+		if (ip6h->version != 6)
+			return NULL;
+		if (ip6h->nexthdr == NEXTHDR_IPIP) {
+			hlen = ETH_HLEN;
+			if (hw_path->flags & BIT(DEV_PATH_PPPOE))
+				hlen += PPPOE_SES_HLEN;
+			if (skb_headroom(skb) < FOE_INFO_LEN + hlen)
+				return NULL;
+			return (struct ethhdr *)(skb->data - hlen);
+		}
+	}
+
+	if (!skb_mac_header_was_set(skb))
+		return NULL;
+	mac = skb_mac_header(skb);
+	if (mac < skb->head + FOE_INFO_LEN || mac > skb_tail_pointer(skb) ||
+	    skb_tail_pointer(skb) - mac < ETH_HLEN)
+		return NULL;
+	return (struct ethhdr *)mac;
+}
+
 static unsigned int hnat_ipv6_get_nexthop(struct sk_buff *skb,
 					  const struct net_device *out,
 					  struct flow_offload_hw_path *hw_path)
@@ -1532,6 +1575,9 @@ static unsigned int hnat_ipv6_get_nexthop(struct sk_buff *skb,
 	struct dst_entry *dst = skb_dst(skb);
 	struct ethhdr *eth;
 	u16 eth_pppoe_hlen = ETH_HLEN + PPPOE_SES_HLEN;
+
+	if (!hnat_skb_ethhdr(skb, hw_path))
+		return -1;
 
 	if (hw_path->flags & BIT(DEV_PATH_PPPOE)) {
 		if (ipv6_hdr(skb)->nexthdr == NEXTHDR_IPIP) {
@@ -1590,6 +1636,9 @@ static unsigned int hnat_ipv4_get_nexthop(struct sk_buff *skb,
 	struct dst_entry *dst = skb_dst(skb);
 	struct rtable *rt = (struct rtable *)dst;
 	struct net_device *dev = (__force struct net_device *)out;
+
+	if (!hnat_skb_ethhdr(skb, hw_path))
+		return -1;
 
 	if (hw_path->flags & BIT(DEV_PATH_PPPOE)) {
 		memcpy(eth_hdr(skb)->h_source, hw_path->eth_src, ETH_ALEN);
@@ -1725,20 +1774,6 @@ struct foe_entry ppe_fill_info_blk(struct ethhdr *eth, struct foe_entry entry,
 		break;
 	}
 	return entry;
-}
-
-static struct ethhdr *get_ipv6_ipip_ethhdr(struct sk_buff *skb,
-					   struct flow_offload_hw_path *hw_path)
-{
-	struct ethhdr *eth;
-	u16 eth_pppoe_hlen = ETH_HLEN + PPPOE_SES_HLEN;
-
-	if (hw_path->flags & BIT(DEV_PATH_PPPOE))
-		eth = (struct ethhdr *)(skb->data - eth_pppoe_hlen);
-	else
-		eth = (struct ethhdr *)(skb->data - ETH_HLEN);
-
-	return eth;
 }
 
 static atomic64_t hnat_flow_entry_sequence = ATOMIC64_INIT(0);
@@ -2306,11 +2341,9 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 
 	ct = nf_ct_get(skb, &ctinfo);
 
-	if (ipv6_hdr(skb)->nexthdr == NEXTHDR_IPIP)
-		/* point to ethernet header for DS-Lite and MapE */
-		eth = get_ipv6_ipip_ethhdr(skb, hw_path);
-	else
-		eth = eth_hdr(skb);
+	eth = hnat_skb_ethhdr(skb, hw_path);
+	if (!eth)
+		return hnat_diag_skip(skb, HNAT_DIAG_NO_MAC_HEADER);
 
 	/*do not bind multicast if PPE mcast not enable*/
 	if (!hnat_priv->data->mcast && !hnat_npu_mcast_active() &&
@@ -3036,7 +3069,7 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 	struct nf_conn *ct;
 	enum ip_conntrack_info ctinfo;
 	u64 account_generation = 0, shadow_sequence;
-	bool account_handled, accepted = false;
+	bool account_handled, accepted = false, notify_bind = false;
 	struct ethhdr *eth;
 	struct hnat_tunnel_token rx_token = {};
 	const struct mtk_npu_rx_meta *rx = mtk_npu_rx_meta_find(skb);
@@ -3432,9 +3465,12 @@ int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no)
 	}
 #endif
 	spin_unlock_bh(&hnat_priv->entry_lock);
+	notify_bind = true;
 rx_unlock:
 	if (rx)
 		hnat_tunnel_bind_unlock(&rx_token);
+	if (notify_bind)
+		hnat_trigger_callback(false, skb);
 	return NF_ACCEPT;
 }
 
@@ -3622,6 +3658,9 @@ int mtk_464xlat_fill_mac(struct foe_entry *entry, struct sk_buff *skb,
 	const struct in6_addr *ipv6_nexthop;
 	struct dst_entry *dst = skb_dst(skb);
 	struct neighbour *neigh = NULL;
+	u8 dmac[ETH_ALEN];
+	u32 dmac_hi;
+	u16 dmac_lo;
 	struct rtable *rt = (struct rtable *)dst;
 	u32 nexthop;
 
@@ -3646,10 +3685,17 @@ int mtk_464xlat_fill_mac(struct foe_entry *entry, struct sk_buff *skb,
 			return -1;
 		}
 	}
+	if (!is_valid_ether_addr(neigh->ha)) {
+		rcu_read_unlock_bh();
+		return -1;
+	}
+	ether_addr_copy(dmac, neigh->ha);
 	rcu_read_unlock_bh();
+	memcpy(&dmac_hi, dmac, sizeof(dmac_hi));
+	memcpy(&dmac_lo, dmac + sizeof(dmac_hi), sizeof(dmac_lo));
 
-	entry->ipv4_dslite.dmac_hi = swab32(*((u32 *)neigh->ha));
-	entry->ipv4_dslite.dmac_lo = swab16(*((u16 *)&neigh->ha[4]));
+	entry->ipv4_dslite.dmac_hi = swab32(dmac_hi);
+	entry->ipv4_dslite.dmac_lo = swab16(dmac_lo);
 	entry->ipv4_dslite.smac_hi = swab32(*((u32 *)out->dev_addr));
 	entry->ipv4_dslite.smac_lo = swab16(*((u16 *)&out->dev_addr[4]));
 
@@ -4491,6 +4537,9 @@ static unsigned int mtk_hnat_nf_post_routing(
 	case HIT_BIND_EXCEED_MTU:
 		hnat_diag_note(skb, HNAT_DIAG_MTU, 0, 0, -1, 0, -1);
 		break;
+	case TCP_FIN_SYN_RST:
+		hnat_trigger_callback(true, skb);
+		break;
 	case HIT_UNBIND:
 		hnat_diag_note(skb, HNAT_DIAG_BIND_THRESHOLD, 0, 0, -1, 0, -1);
 		break;
@@ -4523,6 +4572,7 @@ static unsigned int mtk_hnat_nf_post_routing(
 			spin_unlock_bh(&hnat_priv->entry_lock);
 			if (rx)
 				hnat_tunnel_bind_unlock(&rx_token);
+			hnat_trigger_callback(false, skb);
 		}
 		break;
 	case HIT_BIND_KEEPALIVE_DUP_OLD_HDR:

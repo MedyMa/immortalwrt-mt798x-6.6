@@ -1,0 +1,454 @@
+Subject: osal: stop delayed-work producers before drainage and honor kthread exit semantics
+
+--- a/mt_osal_task.c
++++ b/mt_osal_task.c
+@@ -18,6 +18,7 @@
+ #include <linux/cpumask.h>
+ #include <linux/err.h>
+ #include <linux/kthread.h>
++#include <linux/mutex.h>
+ 
+ #define SUBMODULE "mt_osal_task"
+ #include <mt_osal_debug.h>
+@@ -32,142 +33,132 @@
+ };
+ 
+ struct os_task_handle_info {
++	spinlock_t lock;
+ 	struct workqueue_struct *dev_wq;
+ 	struct delayed_work dev_work;
+ 	struct mt_dev_handle_info mt_handle;
+-} g_os_task_handle[MT_MAX_DEVICE_NUM];
+-
+-static void mt_device_workq_handle_dev0(
+-	struct work_struct *work)
+-{
+-	static u8 device_idx = 0;
+-/*
+-	struct os_task_handle_info *handle = container_of(
+-			work, struct os_task_handle_info, dev_work.work);
+-*/
+-	struct mt_dev_handle_info *mt_handle = &g_os_task_handle[device_idx].mt_handle;
+-
+-	if (mt_handle->mt_work_handle)
+-		mt_handle->mt_work_handle(mt_handle->ph_dev);
+-}
+-
+-static void mt_device_workq_handle_dev1(
+-	struct work_struct *work)
+-{
+-	static u8 device_idx = 1;
+-/*
+-	struct os_task_handle_info *handle = container_of(
+-			work, struct os_task_handle_info, dev_work.work);
+-*/
+-	struct mt_dev_handle_info *mt_handle = &g_os_task_handle[device_idx].mt_handle;
+-
+-	if (mt_handle->mt_work_handle)
+-		mt_handle->mt_work_handle(mt_handle->ph_dev);
++};
++
++static struct os_task_handle_info g_os_task_handle[MT_MAX_DEVICE_NUM];
++/* Init/cleanup sleep; the per-device lock also serializes atomic producers. */
++static DEFINE_MUTEX(mt_device_work_mutex);
++
++static void mt_device_workq_handle(struct work_struct *work)
++{
++	struct os_task_handle_info *handle = container_of(to_delayed_work(work),
++					struct os_task_handle_info, dev_work);
++	MT_DEV_HANDLE_FN func;
++	void *ph_dev;
++
++	spin_lock_bh(&handle->lock);
++	func = handle->dev_wq ? handle->mt_handle.mt_work_handle : NULL;
++	ph_dev = handle->mt_handle.ph_dev;
++	spin_unlock_bh(&handle->lock);
++	if (func)
++		func(ph_dev);
+ }
+ 
+ struct workqueue_struct *mt_alloc_workqueue(const char *fmt, unsigned int flags, int max_active)
+ {
+-	return alloc_workqueue(fmt, flags, max_active);
++	return alloc_workqueue("%s", flags, max_active, fmt);
+ }
+ EXPORT_SYMBOL(mt_alloc_workqueue);
+ 
+ void mt_destroy_workqueue(struct workqueue_struct *wq)
+ {
+-	return destroy_workqueue(wq);
++	destroy_workqueue(wq);
+ }
+ EXPORT_SYMBOL(mt_destroy_workqueue);
+ 
+-void mt_device_init_work(
+-	void *ph_dev,
+-	u8 device_idx,
+-	MT_DEV_HANDLE_FN func)
+-{
+-	struct workqueue_struct *dev_wq;
++/* mt_device_work_mutex is held and this cannot run from the device worker. */
++static void mt_device_work_stop(struct os_task_handle_info *handle)
++{
++	struct workqueue_struct *wq;
++
++	spin_lock_bh(&handle->lock);
++	wq = handle->dev_wq;
++	/* Block requeue before waiting for the timer and running callback. */
++	handle->dev_wq = NULL;
++	spin_unlock_bh(&handle->lock);
++	if (wq) {
++		cancel_delayed_work_sync(&handle->dev_work);
++		destroy_workqueue(wq);
++	}
++	spin_lock_bh(&handle->lock);
++	handle->mt_handle.ph_dev = NULL;
++	handle->mt_handle.mt_work_handle = NULL;
++	spin_unlock_bh(&handle->lock);
++}
++
++void mt_device_init_work(void *ph_dev, u8 device_idx, MT_DEV_HANDLE_FN func)
++{
++	struct workqueue_struct *wq;
+ 	struct os_task_handle_info *handle;
+-
+-	if (device_idx >= MT_MAX_DEVICE_NUM) {
+-		MT_DEBUG_TRACE("not support(device_id=%d).", device_idx);
++	char name[32];
++
++	if (device_idx >= MT_MAX_DEVICE_NUM || !func)
+ 		return;
+-	}
+ 	handle = &g_os_task_handle[device_idx];
+-	switch (device_idx) {
+-	default:
+-	case 0:
+-		dev_wq = create_workqueue("ph_dev_wq_0");
+-		if (dev_wq == NULL) {
+-			MT_DEBUG_TRACE("No memory.");
+-			handle->dev_wq = NULL;
+-			return;
+-		}
+-		INIT_DELAYED_WORK(&handle->dev_work, mt_device_workq_handle_dev0);
+-		break;
+-	case 1:
+-		dev_wq = create_workqueue("ph_dev_wq_1");
+-		if (dev_wq == NULL) {
+-			MT_DEBUG_TRACE("No memory.");
+-			handle->dev_wq = NULL;
+-			return;
+-		}
+-		INIT_DELAYED_WORK(&handle->dev_work, mt_device_workq_handle_dev1);
+-		break;
+-	}
+-	handle->dev_wq = dev_wq;
++	mutex_lock(&mt_device_work_mutex);
++	mt_device_work_stop(handle);
++	snprintf(name, sizeof(name), "ph_dev_wq_%u", device_idx);
++	wq = create_workqueue(name);
++	if (!wq) {
++		MT_DEBUG_ERROR("cannot allocate workqueue for device %u\n", device_idx);
++		goto out;
++	}
++	INIT_DELAYED_WORK(&handle->dev_work, mt_device_workq_handle);
++	spin_lock_bh(&handle->lock);
+ 	handle->mt_handle.ph_dev = ph_dev;
+ 	handle->mt_handle.mt_work_handle = func;
++	handle->dev_wq = wq;
++	spin_unlock_bh(&handle->lock);
++out:
++	mutex_unlock(&mt_device_work_mutex);
+ }
+ EXPORT_SYMBOL(mt_device_init_work);
+ 
+ void mt_device_clean_work(u8 device_idx)
+ {
++	if (device_idx >= MT_MAX_DEVICE_NUM)
++		return;
++	mutex_lock(&mt_device_work_mutex);
++	mt_device_work_stop(&g_os_task_handle[device_idx]);
++	mutex_unlock(&mt_device_work_mutex);
++}
++EXPORT_SYMBOL(mt_device_clean_work);
++
++void mt_add_delayed_work(u8 device_idx, unsigned int delay)
++{
+ 	struct os_task_handle_info *handle;
+ 
+-	if (device_idx >= MT_MAX_DEVICE_NUM) {
+-		MT_DEBUG_TRACE("not support(device_id=%d).", device_idx);
++	if (device_idx >= MT_MAX_DEVICE_NUM)
+ 		return;
+-	}
+ 	handle = &g_os_task_handle[device_idx];
+-	if (handle->dev_wq) {
+-		flush_workqueue(handle->dev_wq);
+-		destroy_workqueue(handle->dev_wq);
+-		handle->dev_wq = NULL;
+-	}
+-}
+-EXPORT_SYMBOL(mt_device_clean_work);
+-
+-void mt_add_delayed_work(
+-	u8 device_idx,
+-	unsigned int delay)
+-{
+-	unsigned long timeout = msecs_to_jiffies(delay);
+-	struct os_task_handle_info *handle;
+-
+-	if (device_idx >= MT_MAX_DEVICE_NUM) {
+-		MT_DEBUG_TRACE("not support(device_id=%d).", device_idx);
+-		return;
+-	}
+-	handle = &g_os_task_handle[device_idx];
++	spin_lock_bh(&handle->lock);
+ 	if (handle->dev_wq)
+-		queue_delayed_work(handle->dev_wq, &handle->dev_work, timeout);
++		queue_delayed_work(handle->dev_wq, &handle->dev_work,
++				   msecs_to_jiffies(delay));
++	spin_unlock_bh(&handle->lock);
+ }
+ EXPORT_SYMBOL(mt_add_delayed_work);
+ 
+ bool mt_os_task_kill(MT_OS_TASK *pTask)
+ {
+-	bool ret = false;
+-
+-	if (pTask->kthread_task) {
+-		if (kthread_stop(pTask->kthread_task) == 0) {
+-			pTask->kthread_task = NULL;
+-			ret = true;
+-		} else {
+-			MT_DEBUG_TRACE("kthread_task %s stop failed\n",
+-				pTask->taskName);
+-		}
+-	} else
+-		MT_DEBUG_TRACE("null kthread_task %s\n",
+-				pTask->taskName);
+-
+-	return ret;
++	struct task_struct *task;
++	int status __maybe_unused;
++
++	if (!pTask)
++		return false;
++	task = xchg(&pTask->kthread_task, NULL);
++	if (IS_ERR_OR_NULL(task))
++		return false;
++	/* kthread_stop sets the stop flag and wakes the waiters itself. */
++	status = kthread_stop(task);
++	WRITE_ONCE(pTask->task_killed, true);
++	pTask->taskStatus = MT_TASK_STAT_STOPED;
++	MT_DEBUG_TRACE("task %s stopped with status %d\n", pTask->taskName, status);
++	return true;
+ }
+ EXPORT_SYMBOL(mt_os_task_kill);
+ 
+@@ -181,6 +172,8 @@
+ 	bool status = true;
+ 	unsigned char retry = 0;
+ 
++	if (!pTask || !__fn)
++		return false;
+ 	if (pTask->kthread_task) {
+ 		MT_DEBUG_TRACE("non-null kthread_task %s\n", pTask->taskName);
+ 		status = false;
+@@ -188,14 +181,15 @@
+ 	}
+ 
+ RETRY:
+-	pTask->kthread_task = kthread_run(fn, (void *)arg, pTask->taskName);
++	WRITE_ONCE(pTask->task_killed, false);
++	pTask->kthread_task = kthread_run(fn, arg, "%s", pTask->taskName);
+ 
+ 	if (IS_ERR(pTask->kthread_task)) {
+ 		MT_DEBUG_TRACE("kthread_run %s err %ld\n",
+ 			pTask->taskName, PTR_ERR(pTask->kthread_task));
+ 
+ 		/* just an interrupted system call */
+-		if ((PTR_ERR(pTask->kthread_task) == EINTR) && (retry < 5)) {
++		if ((PTR_ERR(pTask->kthread_task) == -EINTR) && (retry < 5)) {
+ 			retry++;
+ 			mdelay(1);
+ 			goto RETRY;
+@@ -207,95 +201,73 @@
+ 	}
+ 
+ done:
++	if (status)
++		pTask->taskStatus = MT_TASK_STAT_RUNNING;
+ 	MT_DEBUG_TRACE("%s %s end %d\n", __func__, pTask->taskName, status);
+ 	return status;
+ }
+ EXPORT_SYMBOL(mt_os_task_attach);
+ 
+-bool mt_os_task_init(
+-	MT_OS_TASK *pTask, char *pTaskName, void *pPriv)
+-{
+-	int len;
+-
+-	if (!pTask)
+-		return false;
+-	len = strlen(pTaskName);
+-	len = len > (MT_OS_TASK_NAME_LEN - 1) ? (MT_OS_TASK_NAME_LEN - 1) : len;
+-	memmove(&pTask->taskName[0], pTaskName, len);
++bool mt_os_task_init(MT_OS_TASK *pTask, char *pTaskName, void *pPriv)
++{
++	if (!pTask || !pTaskName)
++		return false;
++	memset(pTask, 0, sizeof(*pTask));
++	strscpy(pTask->taskName, pTaskName, sizeof(pTask->taskName));
+ 	pTask->priv = pPriv;
+-	init_waitqueue_head(&(pTask->kthread_q));
++	pTask->taskStatus = MT_TASK_STAT_INITED;
++	init_waitqueue_head(&pTask->kthread_q);
+ 	return true;
+ }
+ EXPORT_SYMBOL(mt_os_task_init);
+ 
+-bool mt_os_task_wait(
+-	void *pReserved, MT_OS_TASK *pTask, int *pStatus)
+-{
+-	int status;
+-
+-	do {
+-		wait_event_interruptible(
+-			pTask->kthread_q, pTask->kthread_running || kthread_should_stop());
+-		pTask->kthread_running = false;
+-		if (kthread_should_stop()) {
+-			status = -1;
+-			break;
+-		} else
+-			status = 0;
+-	} while (0);
+-
+-	if (pStatus)
+-		*pStatus = status;
+-	if (status != 0)
+-		return false;
+-	return true;
++static bool mt_os_task_wait_common(MT_OS_TASK *task, unsigned int cond,
++				   int *status, bool consume)
++{
++	int ret;
++
++	if (!task) {
++		ret = -EINVAL;
++		goto out;
++	}
++	ret = wait_event_interruptible(task->kthread_q,
++		READ_ONCE(task->kthread_running) ||
++		READ_ONCE(task->task_killed) || kthread_should_stop() || cond);
++	if (!ret && (READ_ONCE(task->task_killed) || kthread_should_stop()))
++		ret = -1;
++	if (consume)
++		WRITE_ONCE(task->kthread_running, false);
++out:
++	if (status)
++		*status = ret;
++	return ret == 0;
++}
++
++bool mt_os_task_wait(void *reserved, MT_OS_TASK *task, int *status)
++{
++	return mt_os_task_wait_common(task, 0, status, true);
+ }
+ EXPORT_SYMBOL(mt_os_task_wait);
+ 
+-bool mt_os_task_wait_cond(
+-	void *pReserved, MT_OS_TASK *pTask, unsigned int u4Cond, int *pStatus)
+-{
+-	int status;
+-
+-	do {
+-		wait_event_interruptible(
+-			pTask->kthread_q,
+-			pTask->kthread_running || kthread_should_stop() || (u4Cond));
+-		pTask->kthread_running = false;
+-		if (kthread_should_stop()) {
+-			status = -1;
+-			break;
+-		} else
+-			status = 0;
+-	} while (0);
+-
+-	if (pStatus)
+-		*pStatus = status;
+-	if (status != 0)
+-		return false;
+-	return true;
++bool mt_os_task_wait_cond(void *reserved, MT_OS_TASK *task,
++			  unsigned int cond, int *status)
++{
++	return mt_os_task_wait_common(task, cond, status, true);
+ }
+ EXPORT_SYMBOL(mt_os_task_wait_cond);
+ 
+-bool mt_os_task_wait_event(
+-	void *pReserved, MT_OS_TASK *pTask, unsigned int u4Cond, int *pStatus)
+-{
+-	do {
+-		wait_event_interruptible(
+-			pTask->kthread_q,
+-			pTask->kthread_running || (u4Cond));
+-		*pStatus = 0;
+-	} while (0);
+-
+-	return true;
++bool mt_os_task_wait_event(void *reserved, MT_OS_TASK *task,
++			   unsigned int cond, int *status)
++{
++	return mt_os_task_wait_common(task, cond, status, false);
+ }
+ EXPORT_SYMBOL(mt_os_task_wait_event);
+ 
+-void mt_os_task_wake_up(MT_OS_TASK *pTask, unsigned int u4Cond)
+-{
+-	if (u4Cond) {
+-		pTask->kthread_running = true;
+-		wake_up_interruptible(&pTask->kthread_q);
++void mt_os_task_wake_up(MT_OS_TASK *task, unsigned int cond)
++{
++	if (task && cond) {
++		WRITE_ONCE(task->kthread_running, true);
++		wake_up_interruptible(&task->kthread_q);
+ 	}
+ }
+ EXPORT_SYMBOL(mt_os_task_wake_up);
+@@ -305,6 +277,7 @@
+ 	int idx;
+ 
+ 	for (idx = 0; idx < MT_MAX_DEVICE_NUM; idx++) {
++		spin_lock_init(&g_os_task_handle[idx].lock);
+ 		g_os_task_handle[idx].dev_wq = NULL;
+ 		g_os_task_handle[idx].mt_handle.ph_dev = NULL;
+ 	}
+@@ -316,6 +289,10 @@
+ 
+ DECLARE_SUB_MODULE_EXIT(mt_osal_task_exit)
+ {
++	int idx;
++
++	for (idx = 0; idx < MT_MAX_DEVICE_NUM; idx++)
++		mt_device_clean_work(idx);
+ 	MT_DEBUG_TRACE("unloaded");
+ }
+ sub_module_exit(mt_osal_task_exit);
+--- a/inc/mt_osal_task.h
++++ b/inc/mt_osal_task.h
+@@ -32,6 +32,7 @@
+ void mt_destroy_workqueue(struct workqueue_struct *wq);
+ 
+ typedef void (*MT_DEV_HANDLE_FN)(void *ph_dev);
++/* Init/clean run in process context, outside the device worker itself. */
+ void mt_device_init_work(
+ 	void *ph_dev,
+ 	u8 device_id,
+@@ -41,6 +42,7 @@
+ 	u8 device_idx,
+ 	unsigned int delay);
+ 
++/* The owner serializes init, attach and kill for a given task object. */
+ bool mt_os_task_kill(MT_OS_TASK *pTask);
+ bool mt_os_task_attach(
+ 	MT_OS_TASK *pTask,

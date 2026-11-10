@@ -99,6 +99,7 @@ VOID RTMPSetLEDStatus(RTMP_ADAPTER *pAd, UCHAR Status, UCHAR BandIdx)
 	UCHAR LedMode;
 	BOOLEAN	bIgnored = FALSE;
 	INT	LED_CMD = -1;
+	INT32 ret = NDIS_STATUS_SUCCESS;
 	struct wifi_dev *wdev = NULL;
 #ifdef WSC_INCLUDED
 #ifdef WSC_LED_SUPPORT
@@ -365,16 +366,15 @@ VOID RTMPSetLEDStatus(RTMP_ADAPTER *pAd, UCHAR Status, UCHAR BandIdx)
 				if (wdev_temp && wdev_temp->if_up_down_state) {
 					if (HcGetBandByWdev(wdev_temp) == BandIdx) {
 						wdev_same_band_cnt++;
-						break;
 					}
 				}
 			}
 
 			if ((Status == LED_RADIO_OFF) && (wdev_same_band_cnt == 0)) { /* Interface down case */
-				AndesLedEnhanceOP(pAd, led_idx, LED_TX_OVER_BLINK_DISABLE, LED_REVERSE_POLARITY_DISABLE,
+				ret = AndesLedEnhanceOP(pAd, led_idx, LED_TX_OVER_BLINK_DISABLE, LED_REVERSE_POLARITY_DISABLE,
 					BandIdx, LED_TX_DATA_ONLY, 0, 0, LED_CMD);
 			} else if ((Status == LED_LINK_DOWN) && (wdev_same_band_cnt == 1)) { /* Radio On/Off case */
-				AndesLedEnhanceOP(pAd, led_idx, LED_TX_OVER_BLINK_DISABLE, LED_REVERSE_POLARITY_DISABLE,
+				ret = AndesLedEnhanceOP(pAd, led_idx, LED_TX_OVER_BLINK_DISABLE, LED_REVERSE_POLARITY_DISABLE,
 						BandIdx, LED_TX_DATA_ONLY, 0, 0, LED_CMD);
 			}
 		} else {
@@ -382,13 +382,17 @@ VOID RTMPSetLEDStatus(RTMP_ADAPTER *pAd, UCHAR Status, UCHAR BandIdx)
 				IS_MT7992(pAd) ||
 				IS_MT7993(pAd)) {
 				if ((Status == LED_LINK_UP) || (Status == LED_RADIO_ON))
-					AndesLedEnhanceOP(pAd, led_idx, LED_TX_OVER_BLINK_DISABLE, LED_REVERSE_POLARITY_DISABLE,
+					ret = AndesLedEnhanceOP(pAd, led_idx, LED_TX_OVER_BLINK_DISABLE, LED_REVERSE_POLARITY_DISABLE,
 										BandIdx, LED_TX_DATA_ONLY, 0, 0, LED_CMD);
 			} else {
-				AndesLedEnhanceOP(pAd, led_idx, LED_TX_OVER_BLINK_DISABLE, LED_REVERSE_POLARITY_DISABLE,
+				ret = AndesLedEnhanceOP(pAd, led_idx, LED_TX_OVER_BLINK_DISABLE, LED_REVERSE_POLARITY_DISABLE,
 								BandIdx, LED_TX_DATA_ONLY, 0, 0, LED_CMD);
 			}
 		}
+		if (ret != NDIS_STATUS_SUCCESS)
+			MTWF_DBG(pAd, DBG_CAT_CFG, CATCFG_DBGLOG, DBG_LVL_ERROR,
+				"LED %u band %u status %u command failed: %d\n",
+				led_idx, BandIdx, Status, ret);
 	}
 
 	/*

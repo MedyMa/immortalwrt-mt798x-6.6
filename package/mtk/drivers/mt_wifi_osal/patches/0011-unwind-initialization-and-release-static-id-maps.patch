@@ -1,0 +1,133 @@
+Subject: osal: report initialization failures and release owned resources
+
+--- a/inc/mt_osal_module.h
++++ b/inc/mt_osal_module.h
+@@ -29,10 +29,10 @@
+ 
+ #ifndef __MOCK
+ #define DECLARE_SUB_MODULE_EXIT(__sub_module_exit_func__)	\
+-	static void __exit __sub_module_exit_func__(void)
++	static void __sub_module_exit_func__(void)
+ #else
+ #define DECLARE_SUB_MODULE_EXIT(__sub_module_exit_func__)	\
+-	void __exit __sub_module_exit_func__(void)
++	void __sub_module_exit_func__(void)
+ #endif /* __MOCK */
+ 
+ typedef int (*initcall_t)(void);
+--- a/mt_osal_genl.c
++++ b/mt_osal_genl.c
+@@ -117,11 +117,13 @@
+ 	net_priv_info = (struct mt_net_dev_priv *)netdev_priv((struct net_device *)dev);
+ 	if (!net_priv_info) {
+ 		MT_DEBUG_ERROR("!net_priv_info\n");
+-		return -ENETDOWN;
++		ret = -ENETDOWN;
++		goto out_dev;
+ 	}
+ 	if (!net_priv_info->ioctl) {
+ 		MT_DEBUG_ERROR("!net_priv_info->ioctl\n");
+-		return -ENETDOWN;
++		ret = -ENETDOWN;
++		goto out_dev;
+ 	}
+ 
+ 	pIoctlConfig->net_dev = dev;
+@@ -130,7 +132,9 @@
+ 	pIoctlConfig->data = ctrl_data_ptr;
+ 	ret = net_priv_info->ioctl(dev, pIoctlConfig);
+ 
+-	return 0;
++out_dev:
++	dev_put(dev);
++	return ret;
+ }
+ 
+ int mt_fips_140_3_send_reply(int attr_type, struct mt_cmm_genl_ctrl *ctrl_data_rsp)
+@@ -210,9 +214,8 @@
+ DECLARE_SUB_MODULE_INIT(mt_osal_genl_init)
+ {
+ 	MT_DEBUG_TRACE("loaded");
+-	mtk_cmm_genl_register();
+-
+-	return 0;
++
++	return mtk_cmm_genl_register();
+ }
+ sub_module_init(mt_osal_genl_init);
+ 
+--- a/mt_osal_main.c
++++ b/mt_osal_main.c
+@@ -20,6 +20,12 @@
+ #include <mt_osal.h>
+ #include <mt_osal_module.h>
+ 
++static void mt_wifi_osal_cleanup(size_t initialized)
++{
++	while (initialized)
++		__sub_mod_exitcall_start[--initialized]();
++}
++
+ static int __init mt_wifi_osal_init(void)
+ {
+ 	int ret = 0;
+@@ -27,12 +33,22 @@
+ 
+ 	MT_DEBUG_TRACE_IN("");
+ 
++	/* Each submodule registers one init and one cleanup in object order. */
++	if (__sub_mod_initcall_end - __sub_mod_initcall_start !=
++	    __sub_mod_exitcall_end - __sub_mod_exitcall_start) {
++		MT_DEBUG_ERROR("unbalanced OSAL init/exit callbacks\n");
++		return -EINVAL;
++	}
++
+ 	for (sub_mod_initcall = __sub_mod_initcall_start;
+ 	     sub_mod_initcall < __sub_mod_initcall_end;
+ 	     sub_mod_initcall++) {
+ 		ret = (*sub_mod_initcall)();
+-		if (ret)
++		if (ret) {
++			mt_wifi_osal_cleanup(sub_mod_initcall -
++					     __sub_mod_initcall_start);
+ 			return ret;
++		}
+ 	}
+ 
+ 	MT_DEBUG_TRACE_OUT("");
+@@ -41,14 +57,9 @@
+ 
+ static void __exit mt_wifi_osal_exit(void)
+ {
+-	exitcall_t *sub_mod_exitcall;
+-
+ 	MT_DEBUG_TRACE_IN("");
+ 
+-	for (sub_mod_exitcall = __sub_mod_exitcall_end - 1;
+-	     sub_mod_exitcall >= __sub_mod_exitcall_start;
+-	     sub_mod_exitcall--)
+-		(*sub_mod_exitcall)();
++	mt_wifi_osal_cleanup(__sub_mod_exitcall_end - __sub_mod_exitcall_start);
+ 
+ 	MT_DEBUG_TRACE_OUT("");
+ }
+--- a/mt_osal_util.c
++++ b/mt_osal_util.c
+@@ -248,7 +248,7 @@
+ 	struct xarray *xa = (struct xarray *)static_id;
+ 
+ 	if (!xa)
+-		return
++		return;
+ 
+ 	xa_destroy(xa);
+ 	kmem_cache_free(mt_os_static_id_cache, xa);
+@@ -309,7 +309,7 @@
+ 					SLAB_HWCACHE_ALIGN,
+ 					NULL);
+ 
+-	return 0;
++	return mt_os_static_id_cache ? 0 : -ENOMEM;
+ }
+ sub_module_init(mt_osal_util_init);
+ 

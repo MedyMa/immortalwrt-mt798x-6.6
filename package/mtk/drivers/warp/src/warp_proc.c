@@ -22,6 +22,7 @@
 #include "wdma.h"
 #include "wed.h"
 #include "warp.h"
+#include "warp_proc.h"
 #include "warp_hw.h"
 #ifdef WED_PAO_SUPPORT
 #include "regs/reg_v3/pao_hw.h"
@@ -1731,6 +1732,8 @@ warp_entry_proc_init(struct warp_ctrl *warp_ctrl, struct warp_entry *warp)
 	if (ret < 0)
 		return -1;
 	proc = proc_mkdir(name, root);
+	if (!proc)
+		return -ENOMEM;
 	warp->proc = (void *)proc;
 	proc = proc_create_data(PROC_STAT_DIR, 0, warp->proc, &proc_warp_stat_fops,
 				warp);
@@ -1822,39 +1825,30 @@ warp_entry_proc_init(struct warp_ctrl *warp_ctrl, struct warp_entry *warp)
 err_proc_rro:
 #endif
 #if defined(WED_RX_HW_RRO_3_0) || defined(WED_RX_HW_RRO_3_1)
-	remove_proc_entry(PROC_RTQM_DIR, warp->proc);
 err_proc_rtqm:
 #endif
 #ifdef WED_PAO_SUPPORT
-	remove_proc_entry(PROC_PAO_DIR, warp->proc);
 err_proc_pao:
 #endif
-	remove_proc_entry(PROC_CTRL_DIR, warp->proc);
 err_proc_ctrl:
-	remove_proc_entry(PROC_RX_DIR, warp->proc);
 err_proc_rx:
-	remove_proc_entry(PROC_TX_DIR, warp->proc);
 err_proc_tx:
-	remove_proc_entry(PROC_CFG_DIR, warp->proc);
 err_proc_cfg:
-	remove_proc_entry(PROC_CR_DIR, warp->proc);
 err_proc_cr:
-	remove_proc_entry(PROC_STAT_DIR, warp->proc);
 err_proc_stat:
-	remove_proc_entry(name, root);
-	return -1;
+	warp_entry_proc_quiesce(warp);
+	proc_remove(warp->proc);
+	warp->proc = NULL;
+	return -ENOMEM;
 }
 
 /*
 *
 */
 void
-warp_entry_proc_exit(struct warp_ctrl *warp_ctrl, struct warp_entry *warp)
+warp_entry_proc_quiesce(struct warp_entry *warp)
 {
-	int ret = 0;
-	struct proc_dir_entry *root = (struct proc_dir_entry *)warp_ctrl->proc;
 	struct proc_dir_entry *proc = (struct proc_dir_entry *)warp->proc;
-	char name[64] = "";
 #ifdef WED_RX_HW_RRO_3_0
 	struct wifi_entry *wifi = &warp->wifi;
 #endif
@@ -1912,6 +1906,18 @@ warp_entry_proc_exit(struct warp_ctrl *warp_ctrl, struct warp_entry *warp)
 	}
 #endif
 
+	/* The entry directory also contains WED/WDMA children. Keep it alive. */
+}
+
+void
+warp_entry_proc_exit(struct warp_ctrl *warp_ctrl, struct warp_entry *warp)
+{
+	struct proc_dir_entry *root = (struct proc_dir_entry *)warp_ctrl->proc;
+	struct proc_dir_entry *proc = (struct proc_dir_entry *)warp->proc;
+	char name[64];
+	int ret;
+
+	warp_entry_proc_quiesce(warp);
 	ret = snprintf(name, sizeof(name), "%s%d", PROC_WHNAT_DIR, warp->idx);
 	if (ret < 0)
 		return;
@@ -1934,7 +1940,7 @@ warp_ctrl_proc_init(struct warp_ctrl *warp_ctrl)
 
 	if (!proc) {
 		warp_dbg(WARP_DBG_ERR, "create %s failed!!!\n", PROC_ROOT_DIR);
-		return -1;
+		return -ENOMEM;
 	}
 
 	warp_ctrl->proc = (void *)proc;
@@ -1957,21 +1963,35 @@ warp_ctrl_proc_init(struct warp_ctrl *warp_ctrl)
 	warp_dbg(WARP_DBG_OFF, "create %s ok!!!\n", PROC_ROOT_DIR);
 	return 0;
 err1:
-	remove_proc_entry(PROC_ROOT_DIR, warp_ctrl->proc);
-	return 0;
+	proc_remove(warp_ctrl->proc);
+	warp_ctrl->proc = NULL;
+	warp_ctrl->proc_sw_conf = NULL;
+	warp_ctrl->proc_trace = NULL;
+	return -ENOMEM;
 }
 
 /*
 *
 */
 void
+warp_ctrl_proc_quiesce(struct warp_ctrl *warp_ctrl)
+{
+	proc_remove(warp_ctrl->proc_sw_conf);
+	warp_ctrl->proc_sw_conf = NULL;
+	proc_remove(warp_ctrl->proc_trace);
+	warp_ctrl->proc_trace = NULL;
+}
+
+void
 warp_ctrl_proc_exit(struct warp_ctrl *warp_ctrl)
 {
 	struct proc_dir_entry *proc = (struct proc_dir_entry *)warp_ctrl->proc;
 
 	if (proc) {
-		remove_proc_entry(PROC_CONF_DIR, proc);
-		remove_proc_entry(PROC_TRACE_DIR, proc);
-		remove_proc_entry(PROC_ROOT_DIR, NULL);
+		warp_ctrl_proc_quiesce(warp_ctrl);
+		proc_remove(proc);
+		warp_ctrl->proc = NULL;
+		warp_ctrl->proc_sw_conf = NULL;
+		warp_ctrl->proc_trace = NULL;
 	}
 }

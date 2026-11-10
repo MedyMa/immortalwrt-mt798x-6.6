@@ -50,5 +50,5 @@ BOOLEAN MBSS_Reconfig_Is_Idle(RTMP_ADAPTER *pAd, BSS_STRUCT *pMbss);
 VOID MBSS_Reconfig_State_transition(RTMP_ADAPTER *pAd, BSS_STRUCT *pMbss, enum bss_reconfig_state next_state, UINT timeout);
 INT MBSS_Reconfig_flow_proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg);
 INT MBSS_Reconfig_flow_info(RTMP_ADAPTER *pAd, RTMP_STRING *arg);
-VOID MBSS_Reconfig_SM(RTMP_ADAPTER *pAd, struct wifi_dev *wdev, UINT32 reconfig_state);
+VOID MBSS_Reconfig_SM(RTMP_ADAPTER *pAd, struct wifi_dev *wdev, enum bss_reconfig_state reconfig_state);
 NTSTATUS MBSS_Reconfig_SM_Handler(RTMP_ADAPTER *pAd, PCmdQElmt CMDQelmt);

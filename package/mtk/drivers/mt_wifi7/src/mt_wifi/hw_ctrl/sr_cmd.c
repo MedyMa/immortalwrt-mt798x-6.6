@@ -13181,7 +13181,9 @@ void UniPrintSrSupportmodeEvent(RTMP_ADAPTER *pAd,
 
 	MTWF_DBG(NULL, DBG_CAT_FW, CATCFG_SR, DBG_LVL_ERROR,
 		"[%s] u4Value = %d\n", __func__, prSrEvent->u4Value);
+#ifdef WAPP_SUPPORT
 	wapp_send_sr_support_mode_query_rsp(pAd, prSrEvent->u4Value);
+#endif /* WAPP_SUPPORT */
 }
 
 void UniEventSRHandler(

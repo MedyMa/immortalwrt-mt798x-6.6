@@ -1,0 +1,762 @@
+Subject: osal: preserve cfg80211 failures and accept partial beacon updates
+
+--- a/mt_osal_cfg80211.c
++++ b/mt_osal_cfg80211.c
+@@ -12,6 +12,7 @@
+ #include <net/cfg80211.h>
+ #include <net/mac80211.h>
+ #include <linux/skbuff.h>
++#include <linux/etherdevice.h>
+ #include <linux/debugfs.h>
+ #include <linux/idr.h>
+ #include <linux/device.h>
+@@ -364,7 +365,7 @@
+ 	void *data,
+ 	unsigned int data_len)
+ {
+-	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig, *pIoctlConfig = &IoctlConfig;
++	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig = {}, *pIoctlConfig = &IoctlConfig;
+ 	int ret;
+ 	struct mt_cfg80211_priv *mt_priv;
+ 	struct mt_net_dev_priv *net_priv_info = NULL;
+@@ -398,7 +399,7 @@
+ 	void *data,
+ 	unsigned int data_len)
+ {
+-	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig, *pIoctlConfig = &IoctlConfig;
++	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig = {}, *pIoctlConfig = &IoctlConfig;
+ 	int ret;
+ 	struct mt_cfg80211_priv *mt_priv = NULL;
+ 	struct mt_net_dev_priv *net_priv_info = NULL;
+@@ -1666,7 +1667,7 @@
+ 	struct mt_phy_cap mt_phy_cap;
+ 	u8 band, i;
+ 	struct mt_cfg80211_bit_rate_info bit_rate_info;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wiphy || !netdev || !mask) {
+ 		MT_DEBUG_TRACE("failed - [ERROR]input NULL pointer.\n");
+@@ -1722,9 +1723,8 @@
+ 	}
+ 	ctrl_data_ptr->data = &bit_rate_info;
+ 	ctrl_data_ptr->data_len = sizeof(bit_rate_info);
+-	mt_cfg80211_ops_ctrl(wiphy, netdev, mtk_ops_set_bit_rate,
++	return mt_cfg80211_ops_ctrl(wiphy, netdev, mtk_ops_set_bit_rate,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ static struct wireless_dev *mt_cfg80211_ops_virtual_inf_add(
+@@ -1735,13 +1735,13 @@
+ 	struct vif_params *params)
+ {
+ 	struct mt_priv_ops_vif_set vif_info;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int ret = 0;
+ 
+ 	MT_DEBUG_TRACE("80211> ==>type: %d, name: %s\n", type, name);
+ 
+ 	if (mt_cfg80211_get_mac_ad(wiphy) == NULL)
+-		return 0;
++		return ERR_PTR(-ENETDOWN);
+ 	vif_info.vifType = type;
+ 	vif_info.vifNameLen = strlen(name);
+ 	vif_info.wl_dev = NULL;
+@@ -1780,7 +1780,7 @@
+ 	struct wireless_dev *pwdev)
+ {
+ 	struct net_device *dev = NULL;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	dev = pwdev->netdev;
+ 	if (!dev)
+@@ -1790,12 +1790,11 @@
+ 	ctrl_data_ptr->net_dev = dev;
+ 
+ 	if (dev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN)
+-		mt_cfg80211_ops_ctrl(wiphy, NULL, mtk_ops_del_vif_inf,
++		return mt_cfg80211_ops_ctrl(wiphy, NULL, mtk_ops_del_vif_inf,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+ 	else
+-		mt_cfg80211_ops_ctrl(wiphy, dev, mtk_ops_del_vif_inf,
++		return mt_cfg80211_ops_ctrl(wiphy, dev, mtk_ops_del_vif_inf,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ #define MTK_OFDM_RATE_IDX_OFFSET 4
+@@ -1804,9 +1803,9 @@
+ 	struct net_device *netdev,
+ 	struct cfg80211_ap_settings *settings)
+ {
+-	struct mt_priv_ops_ap_setting ap_setting;
++	struct mt_priv_ops_ap_setting ap_setting = {};
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	unsigned char *beacon_head_buf = NULL, *beacon_tail_buf = NULL;
+ 
+ 	ctrl_data_ptr->net_dev = NULL;
+@@ -1845,7 +1844,6 @@
+ 		}
+ 		memcpy(beacon_tail_buf, settings->beacon.tail, settings->beacon.tail_len);
+ 	}
+-	memset(&ap_setting, 0, sizeof(ap_setting));
+ 	ap_setting.bcn.beacon_head_len = settings->beacon.head_len;
+ 	ap_setting.bcn.beacon_tail_len = settings->beacon.tail_len;
+ 	ap_setting.bcn.beacon_head = beacon_head_buf;
+@@ -1964,7 +1962,7 @@
+ 	}
+ 	ctrl_data_ptr->data = &ap_setting;
+ 	ctrl_data_ptr->data_len = sizeof(ap_setting);
+-	mt_cfg80211_ops_ctrl(wiphy, netdev, mtk_ops_start_ap,
++	ret = mt_cfg80211_ops_ctrl(wiphy, netdev, mtk_ops_start_ap,
+ 		ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+ end:
+ 	if (beacon_head_buf)
+@@ -1991,7 +1989,7 @@
+ 	unsigned char *beacon_tail_buf = NULL;
+ 	unsigned char *assoc_rsp_buf = NULL;
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ #if defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(6, 7, 0) <= CFG_CFG80211_VERSION)
+ 	struct cfg80211_beacon_data *beacon = &info->beacon;
+ #else
+@@ -1999,6 +1997,11 @@
+ #endif
+ 
+ 	memset(&bcn, 0, sizeof(bcn));
++	if ((beacon->head_len && !beacon->head) ||
++	    (beacon->tail_len && !beacon->tail) ||
++	    (beacon->assocresp_ies_len && !beacon->assocresp_ies))
++		return -EINVAL;
++
+ 
+ 	ctrl_data_ptr->net_dev = NULL;
+ 	if (netdev) {
+@@ -2014,9 +2017,6 @@
+ 			goto end;
+ 		}
+ 		memcpy(beacon_head_buf, beacon->head, beacon->head_len);
+-	} else {
+-		ret = -EINVAL;
+-		goto end;
+ 	}
+ 
+ 	if (beacon->tail_len > 0) {
+@@ -2027,9 +2027,6 @@
+ 			goto end;
+ 		}
+ 		memcpy(beacon_tail_buf, beacon->tail, beacon->tail_len);
+-	} else {
+-		ret = -EINVAL;
+-		goto end;
+ 	}
+ 
+ 	bcn.beacon_head_len = beacon->head_len;
+@@ -2052,7 +2049,7 @@
+ 	}
+ 	ctrl_data_ptr->data = &bcn;
+ 	ctrl_data_ptr->data_len = sizeof(bcn);
+-	mt_cfg80211_ops_ctrl(wiphy, netdev, mtk_ops_change_beacon,
++	ret = mt_cfg80211_ops_ctrl(wiphy, netdev, mtk_ops_change_beacon,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+ end:
+ 	if (beacon_head_buf)
+@@ -2074,16 +2071,15 @@
+ #endif
+ 	)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (netdev)
+ 		MT_DEBUG_TRACE("80211> %s ==>\n", netdev->name);
+ 
+ 	ctrl_data_ptr->net_dev = netdev;
+ 	ctrl_data_ptr->wiphy = wiphy;
+-	mt_cfg80211_ops_ctrl(wiphy, netdev, mtk_ops_stop_ap,
++	return mt_cfg80211_ops_ctrl(wiphy, netdev, mtk_ops_stop_ap,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ 
+ }
+ 
+@@ -2097,7 +2093,7 @@
+ {
+ 	int ret = 0;
+ 	struct mt_priv_ops_chan_info chaninfo;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	MT_DEBUG_TRACE("80211> ==>\n");
+ 
+@@ -2164,7 +2160,7 @@
+ 	int ret = 0;
+ 	struct cfg80211_chan_def *chandef;
+ 	struct mt_priv_ops_chan_info chaninfo;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (NULL == wiphy || NULL == dev || NULL == params) {
+ 		MT_DEBUG_TRACE("ERROR, Invalid parameter: pWiphy = %p;net_dev = %p; params = %p\n",
+@@ -2277,7 +2273,7 @@
+ 	struct cfg80211_chan_def *chandef)
+ {
+ 	int ret = 0;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_chan_info chaninfo;
+ 	struct net_device *netdev = NULL;
+ 
+@@ -2341,7 +2337,7 @@
+ 	u32 cac_time_ms)
+ #endif
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wiphy || !netdev) {
+ 		MT_DEBUG_TRACE("ERROR, Invalid parameter: pWiphy = %p, netdev = %p\n",
+@@ -2352,13 +2348,10 @@
+ 	MT_DEBUG_TRACE("cac_time = %u (secs) (cac_time_ms=%u)\n",
+ 			(u32)MSEC_TO_SEC(cac_time_ms), cac_time_ms);
+ 	ctrl_data_ptr->uint_val = MSEC_TO_SEC(cac_time_ms);
+-	mt_cfg80211_ops_ctrl(
++	return mt_cfg80211_ops_ctrl(
+ 		wiphy, netdev, mtk_ops_start_radar_detect,
+ 		ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+ 
+-	MT_DEBUG_TRACE("80211> %s end.\n", __func__);
+-
+-	return 0;
+ }
+ 
+ #if defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(6, 12, 6) <= CFG_CFG80211_VERSION)
+@@ -2388,7 +2381,7 @@
+ {
+ 	struct net_device *pNdev = NULL;
+ 	struct wireless_dev *pWdev = NULL;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (pRequest == NULL) {
+ 		MT_DEBUG_TRACE("pRequest is NULL!!\n");
+@@ -2413,10 +2406,8 @@
+ 	MT_DEBUG_TRACE("80211> %s ==>\n", pNdev->name);
+ 	ctrl_data_ptr->uint_val = pWdev->iftype;
+ 	ctrl_data_ptr->data = pRequest;
+-	mt_cfg80211_ops_ctrl(wiphy, pNdev, mtk_ops_scan,
++	return mt_cfg80211_ops_ctrl(wiphy, pNdev, mtk_ops_scan,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-
+-	return 0;
+ }
+ 
+ static void mt_cfg80211_ops_abort_scan(
+@@ -2439,7 +2430,7 @@
+ 	struct station_info *pSinfo)
+ {
+ 	struct mt_priv_ops_sta_info mtk_sta_info;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (netdev)
+ 		MT_DEBUG_TRACE("80211> ==> %s\n", netdev->name);
+@@ -2470,7 +2461,7 @@
+ 	struct station_info *pSinfo)
+ {
+ 	struct mt_priv_ops_sta_info mtk_sta_info;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (NULL == wiphy || NULL == pNdev || NULL == pSinfo) {
+ 		MT_DEBUG_TRACE("ERROR, Invalid data: pWiphy = %p; pNdev = %p; pSinfo = %p\n",
+@@ -2513,46 +2504,38 @@
+ #endif
+ 	u32 Changed)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+-
+-	MT_DEBUG_TRACE("80211> ==>\n");
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
++	const u32 supported = WIPHY_PARAM_RTS_THRESHOLD | WIPHY_PARAM_FRAG_THRESHOLD |
++			      WIPHY_PARAM_COVERAGE_CLASS;
++	int ret;
++
++	if (Changed & ~supported)
++		return -EOPNOTSUPP;
+ 	if (Changed & WIPHY_PARAM_RTS_THRESHOLD) {
+ 		ctrl_data_ptr->uint_val = pWiphy->rts_threshold;
+ 		ctrl_data_ptr->sub_id = MTK_OPS_SET_PARAM_RTS_THRESHOLD;
+-		mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_wiphy_params_set,
+-			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-		MT_DEBUG_TRACE("80211> ==> rts_threshold(%d)\n", pWiphy->rts_threshold);
+-		return 0;
+-	} else if (Changed & WIPHY_PARAM_FRAG_THRESHOLD) {
++		ret = mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_wiphy_params_set,
++			ctrl_data_ptr, sizeof(ctrl_data));
++		if (ret)
++			return ret;
++	}
++	if (Changed & WIPHY_PARAM_FRAG_THRESHOLD) {
+ 		ctrl_data_ptr->uint_val = pWiphy->frag_threshold;
+ 		ctrl_data_ptr->sub_id = MTK_OPS_SET_PARAM_FRAG_THRESHOLD;
+-		mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_wiphy_params_set,
+-			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-		MT_DEBUG_TRACE("80211> ==> frag_threshold(%d)\n", pWiphy->frag_threshold);
+-		return 0;
+-	} else if (Changed & WIPHY_PARAM_COVERAGE_CLASS) {
+-		unsigned int ack_time = 0;
+-
+-		if (pWiphy->coverage_class > 255) {
+-			MT_DEBUG_TRACE("80211> ==>COVERAGE_threshold(%d) is invalid!\n",
+-				pWiphy->coverage_class);
+-			return -EOPNOTSUPP;
+-		}
++		ret = mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_wiphy_params_set,
++			ctrl_data_ptr, sizeof(ctrl_data));
++		if (ret)
++			return ret;
++	}
++	if (Changed & WIPHY_PARAM_COVERAGE_CLASS) {
+ 		ctrl_data_ptr->sub_id = MTK_OPS_SET_PARAM_COVERAGE_CLASS;
+-		ack_time = (unsigned int) (pWiphy->coverage_class * 3);
+-		/* IEEE 802.11-2007 table 7-27*/
+-		if (0 == ack_time)
+-			ack_time = 1;
+-
+-		ctrl_data_ptr->uint_val = ack_time;
+-		MT_DEBUG_TRACE("80211> ==>distance or COVERAGE_threshold(%d), ack_time=%d us\n",
+-			pWiphy->coverage_class, ack_time);
+-		if (mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_wiphy_params_set,
+-			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl)) == 0)
+-			MT_DEBUG_TRACE("SET ACK TIMEOUT SUCCESS!\n");
+-		return 0;
+-	}
+-	return -EOPNOTSUPP;
++		ctrl_data_ptr->uint_val = max_t(unsigned int, 1, pWiphy->coverage_class * 3);
++		ret = mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_wiphy_params_set,
++			ctrl_data_ptr, sizeof(ctrl_data));
++		if (ret)
++			return ret;
++	}
++	return 0;
+ }
+ 
+ static int mt_cfg80211_ops_add_key(
+@@ -2567,7 +2550,7 @@
+ 	struct key_params *pParams)
+ {
+ 	struct mt_priv_ops_key_info KeyInfo;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	ctrl_data_ptr->uint_val = 0xFFFF;
+ 	if (pNdev) {
+@@ -2600,12 +2583,11 @@
+ 
+ 
+ 	if (pNdev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN)
+-		mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_add_key,
++		return mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_add_key,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+ 	else
+-		mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_add_key,
++		return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_add_key,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ static int mt_cfg80211_ops_get_key(
+@@ -2624,7 +2606,7 @@
+ 	struct key_params key_params;
+ 	u8 tx_tsc[MTK_MAX_TSC_SIZE] = {0};
+ 	bool b_get_tsc = false;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int ret = 0;
+ 
+ 	if (!pNdev)
+@@ -2660,7 +2642,7 @@
+ 	bool Pairwise,
+ 	const u8 *pMacAddr)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_key_info KeyInfo;
+ 
+ 	MT_DEBUG_TRACE("80211> ==>\n");
+@@ -2678,9 +2660,8 @@
+ 	ctrl_data_ptr->uint_val = pNdev->ieee80211_ptr->iftype;
+ 	ctrl_data_ptr->data = &KeyInfo;
+ 	ctrl_data_ptr->data_len = sizeof(KeyInfo);
+-	mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_del_key,
++	return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_del_key,
+ 		ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ static int mt_cfg80211_ops_set_default_key(
+@@ -2693,7 +2674,7 @@
+ 	bool Unicast,
+ 	bool Multicast)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_key_info KeyInfo;
+ 
+ 	memset(&KeyInfo, 0, sizeof(KeyInfo));
+@@ -2704,9 +2685,8 @@
+ 	ctrl_data_ptr->uint_val = pNdev->ieee80211_ptr->iftype;
+ 	ctrl_data_ptr->data = &KeyInfo;
+ 	ctrl_data_ptr->data_len = sizeof(KeyInfo);
+-	mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_set_default_key,
++	return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_set_default_key,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ } /* End of CFG80211_OpsKeyDefaultSet */
+ 
+ #if (KERNEL_VERSION(5, 7, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+@@ -2718,7 +2698,7 @@
+ #endif
+ 	u8 KeyIdx)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_key_info KeyInfo;
+ 
+ 	memset(&KeyInfo, 0, sizeof(KeyInfo));
+@@ -2729,9 +2709,8 @@
+ 	KeyInfo.pNetDev = pNdev;
+ 	ctrl_data_ptr->data = &KeyInfo;
+ 	ctrl_data_ptr->data_len = sizeof(KeyInfo);
+-	mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_set_default_beacon_key,
++	return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_set_default_beacon_key,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ } /* End of CFG80211_OpsKeyDefaultSet */
+ #endif
+ 
+@@ -2744,7 +2723,7 @@
+ 	u8 KeyIdx)
+ 
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_key_info KeyInfo;
+ 
+ 	memset(&KeyInfo, 0, sizeof(KeyInfo));
+@@ -2756,9 +2735,8 @@
+ 	KeyInfo.pNetDev = pNdev;
+ 	ctrl_data_ptr->data = &KeyInfo;
+ 	ctrl_data_ptr->data_len = sizeof(KeyInfo);
+-	mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_set_default_mgmt_key,
++	return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_set_default_mgmt_key,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ static int mt_cfg80211_ops_connect(
+@@ -2768,7 +2746,7 @@
+ {
+ 	struct cfg80211_crypto_settings *crypto = &pSme->crypto;
+ 	struct mt_priv_ops_connect_info ops_connect;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	void *wsc_ie = NULL;
+ 	u32 wps_oui = 0x0050F2;
+ 	u8 wps_oui_type = 4;
+@@ -2844,9 +2822,8 @@
+ 	ctrl_data_ptr->uint_val = pNdev->ieee80211_ptr->iftype;
+ 	ctrl_data_ptr->data = &ops_connect;
+ 	ctrl_data_ptr->data_len = sizeof(ops_connect);
+-	mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_connect,
++	return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_connect,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ static int mt_cfg80211_ops_disconnect(
+@@ -2854,12 +2831,16 @@
+ 	struct net_device *pNdev,
+ 	u16 ReasonCode)
+ {
++	int ret;
++
+ 	if (!pNdev || !pWiphy)
+ 		return -ENODEV;
+ 	MT_DEBUG_TRACE("80211> ==> %s\n", pNdev->name);
+ 	MT_DEBUG_TRACE("80211> ReasonCode = %d\n", ReasonCode);
+ 
+-	mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_disconnect, NULL, 0);
++	ret = mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_disconnect, NULL, 0);
++	if (ret)
++		return ret;
+ 	cfg80211_disconnected(pNdev, ReasonCode, NULL, 0, true, GFP_KERNEL);
+ 
+ 	return 0;
+@@ -2870,17 +2851,17 @@
+ 	struct net_device *pNdev,
+ 	struct cfg80211_external_auth_params *params)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!pWiphy || !pNdev || !params) {
+ 		MT_DEBUG_TRACE("pWiphy:%p, pNdev:%p, params:%p\n", pWiphy, pNdev, params);
+-		return 0;
++		return -EINVAL;
+ 	}
+ 	MT_DEBUG_TRACE("80211> ==> %s\n", pNdev->name);
+ 
+ 	if (pNdev->ieee80211_ptr->iftype != NL80211_IFTYPE_STATION) {
+ 		MT_DEBUG_TRACE("iftype:%d\n", pNdev->ieee80211_ptr->iftype);
+-		return 0;
++		return -EOPNOTSUPP;
+ 	}
+ 
+ 	MT_DEBUG_TRACE("action:%d, bssid:%pM, ssid:%s, ssid_len:%d\n",
+@@ -2891,16 +2872,15 @@
+ #endif /* BACKPORT_NOSTDINC */
+ 
+ 	ctrl_data_ptr->ushort_val = params->status;
+-	mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_external_auth,
++	return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_external_auth,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ static void mt_cfg80211_ops_rfkill_poll(
+ 	struct wiphy *pWiphy)
+ {
+ 	bool active = false;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (pWiphy) {
+ 		MT_DEBUG_TRACE("80211> ==>\n");
+@@ -2922,7 +2902,7 @@
+ 	struct ieee80211_supported_band *sband;
+ 	struct ieee80211_channel *chan;
+ 	struct mt_priv_chan_survey_info mt_chan_survey_info;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int ret = 0;
+ 
+ 	if (netdev)
+@@ -3003,7 +2983,7 @@
+ 	}
+ 
+ 	if (pNdev->ieee80211_ptr->iftype == NL80211_IFTYPE_STATION) {
+-		struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++		struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 		struct mt_priv_pmksa_info mt_priv_info;
+ 
+ 		memset(&mt_priv_info, 0, sizeof(mt_priv_info));
+@@ -3014,7 +2994,7 @@
+ 		ctrl_data_ptr->data = &mt_priv_info;
+ 		ctrl_data_ptr->data_len = sizeof(mt_priv_info);
+ 		MT_DEBUG_TRACE("80211> STA PMK Cache Set!\n");
+-		mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_pmksa_set,
++		return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_pmksa_set,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+ 	}
+ 
+@@ -3038,14 +3018,14 @@
+ 		return 0;
+ 	}
+ 	if (pNdev->ieee80211_ptr->iftype == NL80211_IFTYPE_STATION) {
+-		struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++		struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 		struct mt_priv_pmksa_info mt_priv_info;
+ 
+ 		mt_priv_info.Cmd = MTK_CMD_STA_IOCTL_PMA_SA_FLUSH;
+ 		mt_priv_info.pNetDev = pNdev;
+ 		ctrl_data_ptr->data = &mt_priv_info;
+ 		ctrl_data_ptr->data_len = sizeof(mt_priv_info);
+-		mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_pmksa_flush,
++		return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_pmksa_flush,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+ 	}
+ 	return 0;
+@@ -3059,7 +3039,7 @@
+ {
+ 	struct ieee80211_channel *pChan;
+ 	struct mt_priv_ops_mgmt_tx_info mt_priv_info;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct net_device *net_dev;
+ 	struct ieee80211_mgmt *mgmt;
+ 
+@@ -3101,10 +3081,8 @@
+ 	}
+ 	ctrl_data_ptr->data = &mt_priv_info;
+ 	ctrl_data_ptr->data_len = sizeof(mt_priv_info);
+-	mt_cfg80211_ops_ctrl(pWiphy, net_dev, mtk_ops_mgmt_tx,
++	return mt_cfg80211_ops_ctrl(pWiphy, net_dev, mtk_ops_mgmt_tx,
+ 		ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-
+-	return 0;
+ }
+ 
+ #ifdef BACKPORT_NOSTDINC
+@@ -3134,7 +3112,7 @@
+ 	};
+ 	unsigned int i;
+ 	struct net_device *dev;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int ret = 0;
+ 
+ 	if (!wdev)
+@@ -3199,7 +3177,7 @@
+ 	bool reg)
+ {
+ 	struct net_device *dev = NULL;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!pWiphy || !wdev || !wdev->netdev)
+ 		return;
+@@ -3236,7 +3214,7 @@
+ 	struct net_device *dev,
+ 	struct cfg80211_qos_map *qos_map)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!wiphy || !dev || !qos_map) {
+ 		MT_DEBUG_TRACE("80211> ==> wiphy = %p, dev = %p, qos_map = %p\n",
+@@ -3245,10 +3223,8 @@
+ 	}
+ 	MT_DEBUG_TRACE("80211> ==> %s\n", dev->name);
+ 	ctrl_data_ptr->data = qos_map;
+-	mt_cfg80211_ops_ctrl(wiphy, dev, mtk_ops_set_qos_map,
++	return mt_cfg80211_ops_ctrl(wiphy, dev, mtk_ops_set_qos_map,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-
+-	return 0;
+ }
+ 
+ static int mt_cfg80211_ops_set_antenna(
+@@ -3264,7 +3240,7 @@
+ 	u8 rx_ant_count = 0;
+ 	u32 ant_bitmap = 0;
+ 	struct mt_priv_ops_antenna_info ant_cnt;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	MT_DEBUG_TRACE("80211> ==>\n");
+ 
+@@ -3308,7 +3284,7 @@
+ {
+ 	int ret = 0;
+ 	struct mt_priv_ops_antenna_info ant_cnt;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	memset(&ant_cnt, 0, sizeof(ant_cnt));
+ 	MT_DEBUG_TRACE("80211> ==>\n");
+@@ -3329,7 +3305,7 @@
+ 	struct net_device *netdev,
+ 	struct bss_parameters *params)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (!pWiphy || !netdev || !params) {
+ 		MT_DEBUG_TRACE("pWiphy:%p, netdev:%p, params:%p\n", pWiphy, netdev, params);
+@@ -3343,9 +3319,8 @@
+ 	else if (params->ap_isolate == 0)
+ 		ctrl_data_ptr->u8_val = 0;
+ 
+-	mt_cfg80211_ops_ctrl(pWiphy, netdev, mtk_ops_change_bss,
++	return mt_cfg80211_ops_ctrl(pWiphy, netdev, mtk_ops_change_bss,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ static int mt_cfg80211_ops_sta_del(
+@@ -3355,7 +3330,7 @@
+ {
+ 	const u8 *pMacAddr = params->mac;
+ 	struct mt_priv_ops_sta_del_info mt_priv_info;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 
+ 	if (dev)
+ 		MT_DEBUG_TRACE("80211> ==> %s\n", dev->name);
+@@ -3369,9 +3344,8 @@
+ 	}
+ 	ctrl_data_ptr->data = &mt_priv_info;
+ 	ctrl_data_ptr->data_len = sizeof(mt_priv_info);
+-	mt_cfg80211_ops_ctrl(pWiphy, dev, mtk_ops_sta_del,
++	return mt_cfg80211_ops_ctrl(pWiphy, dev, mtk_ops_sta_del,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ static int mt_cfg80211_ops_sta_add(
+@@ -3459,7 +3433,7 @@
+ 	const u8 *pMacAddr,
+ 	struct station_parameters *params)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_change_sta_info mt_priv_info;
+ 
+ 	if (!pWiphy || !pNdev || !params || !pMacAddr) {
+@@ -3496,9 +3470,8 @@
+ #endif /* BACKPORT_NOSTDINC */
+ 	ctrl_data_ptr->data = &mt_priv_info;
+ 	ctrl_data_ptr->data_len = sizeof(mt_priv_info);
+-	mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_sta_chg,
++	return mt_cfg80211_ops_ctrl(pWiphy, pNdev, mtk_ops_sta_chg,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ 
+ #ifdef CONFIG_NL80211_TESTMODE
+@@ -3508,7 +3481,7 @@
+ 	void *data,
+ 	int datalen)
+ {
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_pmkid pmkid_entry = {0};
+ 
+ 	/*copy pentry details from data variable*/
+@@ -3520,9 +3493,8 @@
+ 	MT_DEBUG_TRACE("80211> datalen:%d==>\n", datalen);
+ 	ctrl_data_ptr->data = &pmkid_entry;
+ 	ctrl_data_ptr->data_len = datalen;
+-	mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_test_mode_cmd,
++	return mt_cfg80211_ops_ctrl(pWiphy, NULL, mtk_ops_test_mode_cmd,
+ 			ctrl_data_ptr, sizeof(struct mt_cfg80211_vndr_ctrl));
+-	return 0;
+ }
+ #endif /* CONFIG_NL80211_TESTMODE */
+ 
+@@ -3536,7 +3508,7 @@
+ 		int *dbm)
+ {
+ 	struct net_device *dev = NULL;
+-	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
++	struct mt_cfg80211_vndr_ctrl ctrl_data = {}, *ctrl_data_ptr = &ctrl_data;
+ 	int power, ret;
+ 
+ 	if (!wiphy || !wdev || !wdev->netdev)
+@@ -3702,7 +3674,7 @@
+ 	/*netlink vendor cmds and events*/
+ 	mtk_cfg80211_vndr_init(wiphy);
+ 
+-	if (!memcmp(mt_zero_mac_addr, net_dev_op_hook->permanent_addr, MT_MAC_ADDR_LEN))
++	if (is_valid_ether_addr(net_dev_op_hook->permanent_addr))
+ 		memcpy(wiphy->perm_addr, net_dev_op_hook->permanent_addr, MT_MAC_ADDR_LEN);
+ 
+ 	MT_DEBUG_TRACE("PermanentAddress MAC: ="MT_MACSTR"\n",

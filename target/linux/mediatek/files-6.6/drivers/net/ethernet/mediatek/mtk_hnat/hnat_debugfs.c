@@ -17,6 +17,8 @@
 #include <linux/netdevice.h>
 #include <linux/iopoll.h>
 #include <linux/inet.h>
+#include <linux/device.h>
+#include <linux/sched.h>
 #include <net/ipv6.h>
 #include "hnat.h"
 #include "nf_hnat_mtk.h"
@@ -34,6 +36,11 @@ int qos_ul_toggle = 1;
 int xlat_toggle;
 struct hnat_desc headroom[DEF_ETRY_NUM];
 unsigned int dbg_cpu_reason_cnt[MAX_CRSN_NUM];
+
+/* Legacy fallback only; owner-accounted reads use the ledger's per-PPE lock. */
+static spinlock_t hnat_mib_lock[MAX_PPE_NUM] = {
+	[0 ... MAX_PPE_NUM - 1] = __SPIN_LOCK_UNLOCKED(hnat_mib_lock),
+};
 
 static const char * const entry_state[] = { "INVALID", "UNBIND", "BIND", "FIN" };
 
@@ -1043,11 +1050,15 @@ struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
 	if (!hnat_priv->data->per_flow_accounting)
 		return NULL;
 
-	if (read_mib(h, ppe_id, index, &bytes, &packets))
+	spin_lock_bh(&hnat_mib_lock[ppe_id]);
+	if (read_mib(h, ppe_id, index, &bytes, &packets)) {
+		spin_unlock_bh(&hnat_mib_lock[ppe_id]);
 		return NULL;
+	}
 
 	h->acct[ppe_id][index].bytes += bytes;
 	h->acct[ppe_id][index].packets += packets;
+	spin_unlock_bh(&hnat_mib_lock[ppe_id]);
 
 	if (diff) {
 		diff->bytes = bytes;
@@ -1817,24 +1828,69 @@ void dbg_dump_entry(struct seq_file *m, struct foe_entry *entry,
 }
 static int hnat_stats_read(struct seq_file *m, void *private)
 {
-	struct mtk_hnat *h = hnat_priv;
-	struct foe_entry *entry, *end;
-	int cnt, i;
+	struct mtk_hnat *h = m->private;
+	bool locked;
+	int i;
 
-	seq_printf(m, "PPE_NUM=%d\n", CFG_PPE_NUM);
-
-	for (i = 0; i < CFG_PPE_NUM; i++) {
-		cnt = 0;
-		entry = h->foe_table_cpu[i];
-		end = h->foe_table_cpu[i] + hnat_priv->foe_etry_num;
-		while (entry < end) {
-			if (entry->bfib1.state == dbg_entry_state)
-				cnt++;
-			entry++;
-		}
-		seq_printf(m, "ALL_PPE%d=%d\n", i, hnat_priv->foe_etry_num);
-		seq_printf(m, "BIND_PPE%d=%d\n", i, cnt);
+	seq_printf(m, "STATS_VERSION=2\nPPE_NUM=%d\n", CFG_PPE_NUM);
+	if (!h || !h->dev) {
+		for (i = 0; i < CFG_PPE_NUM; i++)
+			seq_printf(m, "AVAILABLE_PPE%d=0\n", i);
+		return 0;
 	}
+
+	/* Probe/remove hold the device mutex. Never wait here: removal may be
+	 * waiting for an active debugfs read to finish.
+	 */
+	locked = device_trylock(h->dev);
+	for (i = 0; i < CFG_PPE_NUM; i++) {
+		struct foe_entry *table = locked ? READ_ONCE(h->foe_table_cpu[i]) : NULL;
+		unsigned int slot, size, bind, ipv4, ipv6, other;
+		union {
+			struct hnat_bind_info_blk bind;
+			u32 raw;
+		} ib1;
+
+		if (!table) {
+			seq_printf(m, "AVAILABLE_PPE%d=0\n", i);
+			continue;
+		}
+
+		size = READ_ONCE(h->foe_etry_num);
+		bind = ipv4 = ipv6 = other = 0;
+		for (slot = 0; slot < size; slot++) {
+			/* Read one coherent IB1 word; do not read MIB counters. */
+			ib1.raw = READ_ONCE(*(u32 *)&table[slot]);
+			if (ib1.bind.state == BIND) {
+				bind++;
+				switch (ib1.bind.pkt_type) {
+				case IPV4_HNAPT:
+				case IPV4_HNAT:
+					ipv4++;
+					break;
+				case IPV6_3T_ROUTE:
+				case IPV6_5T_ROUTE:
+				case IPV6_HNAPT:
+				case IPV6_HNAT:
+					ipv6++;
+					break;
+				default:
+					other++;
+					break;
+				}
+			}
+			if (!(slot & 255))
+				cond_resched();
+		}
+		seq_printf(m, "AVAILABLE_PPE%d=1\n", i);
+		seq_printf(m, "ALL_PPE%d=%u\n", i, size);
+		seq_printf(m, "BIND_PPE%d=%u\n", i, bind);
+		seq_printf(m, "IPV4_PPE%d=%u\n", i, ipv4);
+		seq_printf(m, "IPV6_PPE%d=%u\n", i, ipv6);
+		seq_printf(m, "OTHER_PPE%d=%u\n", i, other);
+	}
+	if (locked)
+		device_unlock(h->dev);
 
 	return 0;
 }
@@ -1956,7 +2012,7 @@ static const struct file_operations hnat_entry_fops = {
 
 static int hnat_stats_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, hnat_stats_read, file->private_data);
+	return single_open(file, hnat_stats_read, inode->i_private);
 }
 
 static const struct file_operations hnat_stats_fops = {

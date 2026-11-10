@@ -1,0 +1,91 @@
+Subject: osal: bound WEXT query lengths and retain private command ownership
+
+--- a/mt_osal_wifi.c
++++ b/mt_osal_wifi.c
+@@ -35,6 +35,8 @@
+ 	struct mt_os_wifi_ioctl_cmd_cfg IoctlConfig, *pIoctlConfig = &IoctlConfig;
+ 	struct mt_net_dev_priv *priv_info = NULL;
+ 	struct iw_point *erq;
++	void *input;
++	u16 essid_capacity;
+ 
+ 	priv_info = (struct mt_net_dev_priv *)netdev_priv((struct net_device *)net_dev);
+ 	if (!priv_info)
+@@ -65,11 +67,24 @@
+ 		break;
+ 	case SIOCGIWESSID:
+ 		erq = &wrqin->u.essid;
++		essid_capacity = erq->length;
+ 		pIoctlConfig->cmd = MT_IO_GET_ESSID;
+ 		status = priv_info->ioctl((void *)net_dev, pIoctlConfig);
+ 		if (status)
+ 			break;
++		if (pIoctlConfig->data_len > IW_ESSID_MAX_SIZE) {
++			status = -EOVERFLOW;
++			break;
++		}
+ 		erq->length = pIoctlConfig->data_len;
++		if (erq->length > essid_capacity) {
++			status = -E2BIG;
++			break;
++		}
++		if (erq->length && (!erq->pointer || !pIoctlConfig->data)) {
++			status = -EFAULT;
++			break;
++		}
+ 		erq->flags = 1;
+ 		if (erq->pointer && erq->length) {
+ 			if (copy_to_user(
+@@ -125,39 +140,23 @@
+ 		status = mt_os_get_priv_tab(wrqin);
+ 		break;
+ 	case MT_PRIV_IOCTL_SET:
++		if (!wrqin->u.data.pointer && wrqin->u.data.length)
++			return -EFAULT;
++		input = memdup_user_nul(wrqin->u.data.pointer, wrqin->u.data.length);
++		if (IS_ERR(input))
++			return PTR_ERR(input);
+ 		pIoctlConfig->cmd = MT_IO_SET_PRIV;
+ 		pIoctlConfig->subcmd = wrqin->u.data.flags;
+-#if (KERNEL_VERSION(5, 0, 0) > LINUX_VERSION_CODE)
+-		if (access_ok(VERIFY_READ, wrqin->u.data.pointer, wrqin->u.data.length) == true)
+-#else
+-		if (access_ok(wrqin->u.data.pointer, wrqin->u.data.length) == true)
+-#endif
+-		{
+-			pIoctlConfig->data_len = wrqin->u.data.length;
+-			if (wrqin->u.data.length) {
+-				pIoctlConfig->data = kmalloc(wrqin->u.data.length + 1, GFP_ATOMIC);
+-				if (pIoctlConfig->data) {
+-					if (copy_from_user(
+-						pIoctlConfig->data,
+-						wrqin->u.data.pointer,
+-						wrqin->u.data.length)) {
+-						kfree(pIoctlConfig->data);
+-						return -EFAULT;
+-					}
+-				} else
+-					return -ENOMEM;
+-			}
++		pIoctlConfig->data = input;
++		pIoctlConfig->data_len = wrqin->u.data.length;
++		status = priv_info->ioctl(net_dev, pIoctlConfig);
++		if (!status) {
++			if (pIoctlConfig->data_len > U16_MAX)
++				status = -EOVERFLOW;
+ 			else
+-				pIoctlConfig->data = NULL;
+-			status = priv_info->ioctl((void *)net_dev, pIoctlConfig);
++				wrqin->u.data.length = pIoctlConfig->data_len;
+ 		}
+-		if (status) {
+-			kfree(pIoctlConfig->data);
+-			break;
+-		}
+-		if (wrqin->u.data.length != pIoctlConfig->data_len)
+-			wrqin->u.data.length = pIoctlConfig->data_len;
+-		kfree(pIoctlConfig->data);
++		kfree(input);
+ 		break;
+ 	default:
+ 		status = -EOPNOTSUPP;

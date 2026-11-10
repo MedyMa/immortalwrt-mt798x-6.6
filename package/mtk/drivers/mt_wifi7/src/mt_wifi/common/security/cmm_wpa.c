@@ -27,6 +27,11 @@
 */
 #include "rt_config.h"
 
+static inline UCHAR *eapol_key_mic_data(PEAPOL_PACKET pkt)
+{
+	return (UCHAR *)pkt + offsetof(EAPOL_PACKET, KeyDesc.KeyMicAndData);
+}
+
 /* --------------------EddySEC Start---------------- */
 
 UCHAR SES_OUI[] = {0x00, 0x90, 0x4c};
@@ -3331,63 +3336,57 @@ VOID WPACalculateMIC(
 	IN UINT8 key_deri_alg,
 	OUT PEAPOL_PACKET pMsg)
 {
-	UCHAR *OutBuffer;
-	ULONG FrameLen = 0;
+	UCHAR *frame = (UCHAR *)pMsg;
+	ULONG FrameLen = CONV_ARRARY_TO_UINT16(pMsg->Body_Len) + LENGTH_EAPOL_H;
 	UCHAR	mic[LEN_KEY_DESC_MIC_MAX];
 	UCHAR	digest[80] = {0};
 	UINT8 mic_len = LEN_KEY_DESC_MIC;
-	/* allocate memory for MIC calculation*/
-	os_alloc_mem(NULL, (PUCHAR *)&OutBuffer, 512);
 
-	if (OutBuffer == NULL) {
+	if (FrameLen < MIN_LEN_OF_EAPOL_KEY_MSG + LENGTH_EAPOL_H ||
+	    FrameLen > TX_EAPOL_BUFFER) {
 		MTWF_DBG(NULL, DBG_CAT_SEC, CATSEC_WPA, DBG_LVL_ERROR,
-			"!!!CalculateMIC: no memory!!!\n");
+			"invalid EAPOL MIC frame length: %lu\n", FrameLen);
 		return;
 	}
 
-	/* make a frame for calculating MIC.*/
-	MakeOutgoingFrame(OutBuffer, &FrameLen,
-					  CONV_ARRARY_TO_UINT16(pMsg->Body_Len) + 4, pMsg,
-					  END_OF_ARGS);
 	NdisZeroMemory(mic, sizeof(mic));
 
-	/* Calculate MIC*/
+	/* The caller cleared the MIC; hash before writing the result. */
 	if (KeyDescVer == KEY_DESC_AES) {
-		RT_HMAC_SHA1(PTK, LEN_PTK_KCK, OutBuffer,  FrameLen, digest, SHA1_DIGEST_SIZE);
+		RT_HMAC_SHA1(PTK, LEN_PTK_KCK, frame,  FrameLen, digest, SHA1_DIGEST_SIZE);
 		NdisMoveMemory(mic, digest, LEN_KEY_DESC_MIC);
 	} else if (KeyDescVer == KEY_DESC_TKIP)
-		RT_HMAC_MD5(PTK, LEN_PTK_KCK, OutBuffer, FrameLen, mic, MD5_DIGEST_SIZE);
+		RT_HMAC_MD5(PTK, LEN_PTK_KCK, frame, FrameLen, mic, MD5_DIGEST_SIZE);
 	else if ((KeyDescVer == KEY_DESC_NOT_DEFINED) && IS_AKM_SHA384(AKMMap)) {
-		RT_HMAC_SHA384(PTK, LEN_PTK_KCK_SHA384, OutBuffer, FrameLen, mic, LEN_KEY_DESC_MIC_SHA384);
+		RT_HMAC_SHA384(PTK, LEN_PTK_KCK_SHA384, frame, FrameLen, mic, LEN_KEY_DESC_MIC_SHA384);
 		mic_len = LEN_KEY_DESC_MIC_SHA384;
 	} else if ((KeyDescVer == KEY_DESC_NOT_DEFINED) &&
 		   IS_AKM_OWE(AKMMap) &&
 		   (key_deri_alg == SEC_KEY_DERI_SHA256)) {
-		RT_HMAC_SHA256(PTK, LEN_PTK_KCK, OutBuffer, FrameLen, mic, LEN_KEY_DESC_MIC);
+		RT_HMAC_SHA256(PTK, LEN_PTK_KCK, frame, FrameLen, mic, LEN_KEY_DESC_MIC);
 		mic_len = LEN_KEY_DESC_MIC;
 #ifdef DPP_SUPPORT
 	} else if ((KeyDescVer == KEY_DESC_NOT_DEFINED) &&
 		  IS_AKM_DPP(AKMMap) &&
 		  (key_deri_alg == SEC_KEY_DERI_SHA256)) {
-		RT_HMAC_SHA256(PTK, LEN_PTK_KCK, OutBuffer, FrameLen, mic, LEN_KEY_DESC_MIC);
+		RT_HMAC_SHA256(PTK, LEN_PTK_KCK, frame, FrameLen, mic, LEN_KEY_DESC_MIC);
 		mic_len = LEN_KEY_DESC_MIC;
 #endif /* DPP_SUPPORT */
 	} else if ((KeyDescVer == KEY_DESC_NOT_DEFINED) &&
 		   IS_AKM_OWE(AKMMap) &&
 		   (key_deri_alg == SEC_KEY_DERI_SHA384)) {
 		/*TODO: OWE SHA521*/
-		RT_HMAC_SHA384(PTK, LEN_PTK_KCK_SHA384, OutBuffer, FrameLen, mic, LEN_KEY_DESC_MIC_SHA384);
+		RT_HMAC_SHA384(PTK, LEN_PTK_KCK_SHA384, frame, FrameLen, mic, LEN_KEY_DESC_MIC_SHA384);
 		mic_len = LEN_KEY_DESC_MIC_SHA384;
 	} else if ((KeyDescVer == KEY_DESC_EXT)
 		|| (KeyDescVer == KEY_DESC_NOT_DEFINED)) {
 		UINT mlen = AES_KEY128_LENGTH;
 
-		AES_CMAC(OutBuffer, FrameLen, PTK, LEN_PTK_KCK, mic, &mlen);
+		AES_CMAC(frame, FrameLen, PTK, LEN_PTK_KCK, mic, &mlen);
 	}
 
 	/* store the calculated MIC*/
 	NdisMoveMemory(pMsg->KeyDesc.KeyMicAndData, mic, mic_len);
-	os_free_mem(OutBuffer);
 }
 #endif /* RT_CFG80211_SUPPORT */
 
@@ -4241,9 +4240,9 @@ VOID WPAConstructEapolMsg(
 #endif /* OCE_FILS_SUPPORT */
 	{
 		if (IS_AKM_SHA384(pSecPairwise->AKMMap) || (pSecPairwise->key_deri_alg == SEC_KEY_DERI_SHA384))
-			NdisZeroMemory(pMsg->KeyDesc.KeyMicAndData, LEN_KEY_DESC_MIC_SHA384);
+			NdisZeroMemory(eapol_key_mic_data(pMsg), LEN_KEY_DESC_MIC_SHA384);
 		else
-			NdisZeroMemory(pMsg->KeyDesc.KeyMicAndData, LEN_KEY_DESC_MIC);
+			NdisZeroMemory(eapol_key_mic_data(pMsg), LEN_KEY_DESC_MIC);
 	}
 	WPAConstructEapolKeyData(pEntry,
 							 MsgType,
@@ -5237,7 +5236,7 @@ VOID WPABuildPairMsg1(
 		hex_dump("PMKID", pSecConfig->pmkid, LEN_PMKID);
 		hex_dump("PMK", pSecConfig->pmk_cache, pmk_len);
 
-		key_data_len_ptr = pEapolFrame->KeyDesc.KeyMicAndData + mic_len;
+		key_data_len_ptr = eapol_key_mic_data(pEapolFrame) + mic_len;
 		key_data_ptr = key_data_len_ptr + CONV_ARRARY_TO_UINT16(key_data_len_ptr) + 2;
 		/* Fill in value for KDE */
 		key_data_ptr[0] = 0xDD;
@@ -5270,7 +5269,7 @@ VOID WPABuildPairMsg1(
 			pmk_len = LEN_PMK_SHA384;
 		}
 
-		key_data_len_ptr = pEapolFrame->KeyDesc.KeyMicAndData + mic_len;
+		key_data_len_ptr = eapol_key_mic_data(pEapolFrame) + mic_len;
 		key_data_ptr = key_data_len_ptr + CONV_ARRARY_TO_UINT16(key_data_len_ptr) + 2;
 
 		key_data_ptr[0] = 0xDD;

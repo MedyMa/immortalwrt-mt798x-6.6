@@ -22,6 +22,11 @@
 #define __CMM_SR_CMD_H__
 
 #ifdef CFG_SUPPORT_FALCON_SR
+/* SR queue statistics are indexed by the four access categories. */
+#ifndef AC_NUM
+#define AC_NUM 4
+#endif
+
 /*******************************************************************************
  *    INCLUDED FILES
  ******************************************************************************/
