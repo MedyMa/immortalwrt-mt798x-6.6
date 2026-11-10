@@ -538,7 +538,7 @@ VOID UserCfgExit(RTMP_ADAPTER *pAd)
 
 #ifdef LINUX
 #if defined(DOT11_SAE_SUPPORT) || defined(CONFIG_OWE_SUPPORT)
-#ifndef RT_CFG80211_SUPPORT
+#if !defined(RT_CFG80211_SUPPORT) && !defined(HWIFI_SUPPORT)
 #ifdef MULTI_INF_SUPPORT
     /* The group info shared by all interface so make sure all interface down
      * before calling group_info_bi_deinit
@@ -546,7 +546,7 @@ VOID UserCfgExit(RTMP_ADAPTER *pAd)
 	if (multi_inf_active_cnt() == 0)
 #endif
 		group_info_bi_deinit();
-#endif /* RT_CFG80211_SUPPORT */
+#endif /* !RT_CFG80211_SUPPORT && !HWIFI_SUPPORT */
 #endif
 #endif /* LINUX */
 

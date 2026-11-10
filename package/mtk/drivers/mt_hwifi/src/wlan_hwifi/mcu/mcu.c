@@ -103,9 +103,9 @@ mcu_parse_response(struct mtk_hw_dev *dev,
 	if (mcu_txblk->uni_cmd && mcu_txblk->action == MCU_ACT_SET &&
 	    mcu_txblk->ack) {
 		result = rx_info.rx_data;
-		if (!result || rx_info.rx_len < sizeof(*result))
+		if (!result || rx_info.rx_len < (int)sizeof(*result))
 			return -EBADMSG;
-		if (mcu_txblk->cmd != get_unaligned_le16(&result->cid))
+		if (mcu_txblk->cmd != get_unaligned_le16(rx_info.rx_data))
 			return -EAGAIN;
 	}
 

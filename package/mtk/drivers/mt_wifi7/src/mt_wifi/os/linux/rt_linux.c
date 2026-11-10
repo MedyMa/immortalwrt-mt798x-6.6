@@ -4186,10 +4186,6 @@ VOID os_module_exit(VOID)
 	bss_mngr_deinit();
 
 	multi_hif_exit();
-/* Del out-of-memory notifier */
-#ifdef MEM_ALLOC_INFO_SUPPORT
-	MemInfoListExit();
-#endif /*MEM_ALLOC_INFO_SUPPORT*/
 #ifdef CONFIG_CONNINFRA_SUPPORT
 	conninfra_pwr_off(CONNDRV_TYPE_WIFI);
 #endif /* CONFIG_CONNINFRA_SUPPORT */
@@ -4199,4 +4195,14 @@ VOID os_module_exit(VOID)
 
 	/* All callback producers are stopped. Their code belongs to mt_wifi. */
 	mt_rcu_barrier();
+
+#if defined(HWIFI_SUPPORT) && !defined(RT_CFG80211_SUPPORT) && \
+	(defined(DOT11_SAE_SUPPORT) || defined(CONFIG_OWE_SUPPORT))
+	/* HWIFI bands share this cache and do not populate legacy adapt_list. */
+	group_info_bi_deinit();
+#endif
+#ifdef MEM_ALLOC_INFO_SUPPORT
+	/* Keep allocation tracking alive until all module-owned data is freed. */
+	MemInfoListExit();
+#endif /* MEM_ALLOC_INFO_SUPPORT */
 }
