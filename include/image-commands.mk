@@ -372,6 +372,8 @@ define Build/initrd_compression
 	$(if $(CONFIG_TARGET_INITRAMFS_COMPRESSION_ZSTD),.zstd)
 endef
 
+FIT_BUILD_KEY_DIR = $(if $(filter /%,$(call qstrip,$(CONFIG_SBC_KEY_DIR))),$(call qstrip,$(CONFIG_SBC_KEY_DIR)),$(TOPDIR)/$(call qstrip,$(CONFIG_SBC_KEY_DIR)))
+
 define Build/fit
 	$(call locked,$(TOPDIR)/scripts/mkits.sh \
 		-D $(DEVICE_NAME) -o $@.its -k $@ \
@@ -390,10 +392,22 @@ define Build/fit
 		$(if $(DEVICE_DTS_LOADADDR),-s $(DEVICE_DTS_LOADADDR)) \
 		$(if $(DEVICE_DTS_OVERLAY),$(foreach dtso,$(DEVICE_DTS_OVERLAY), -O $(dtso):$(KERNEL_BUILD_DIR)/image-$(dtso).dtbo)) \
 		-c $(if $(DEVICE_DTS_CONFIG),$(DEVICE_DTS_CONFIG),"config-1") \
-		-A $(LINUX_KARCH) -v $(LINUX_VERSION), gen-cpio$(if $(TARGET_PER_DEVICE_ROOTFS),.$(ROOTFS_ID/$(DEVICE_NAME))))
+		-A $(LINUX_KARCH) -v $(LINUX_VERSION) \
+		$(if $(CONFIG_MTK_SECURE_BOOT), \
+			-H $(word 1,$(subst $(comma), , \
+				$(call qstrip,$(if $(CONFIG_FIT_PQC_SIGN_KEY_NAME),$(CONFIG_FIT_PQC_SIGN_ALG),$(CONFIG_FIT_SIGN_ALG))))) \
+			$(if $(CONFIG_FIT_SIGN_KEY_NAME), \
+				-b $(call qstrip,$(CONFIG_FIT_SIGN_ALG)) -S $(call qstrip,$(CONFIG_FIT_SIGN_KEY_NAME))) \
+			$(if $(CONFIG_FIT_PQC_SIGN_KEY_NAME), \
+				-p $(call qstrip,$(CONFIG_FIT_PQC_SIGN_ALG)) -P $(call qstrip,$(CONFIG_FIT_PQC_SIGN_KEY_NAME)))), \
+		gen-cpio$(if $(TARGET_PER_DEVICE_ROOTFS),.$(ROOTFS_ID/$(DEVICE_NAME))))
 	$(call locked,PATH=$(LINUX_DIR)/scripts/dtc:$(PATH) mkimage $(if $(findstring external,$(word 3,$(1))),\
-		-E -B 0x1000 $(if $(findstring static,$(word 3,$(1))),-p 0x1000)) -f $@.its $@.new, \
+		-E -B 0x1000 $(if $(findstring static,$(word 3,$(1))),-p 0x1000)) \
+		$(if $(CONFIG_MTK_SECURE_BOOT),-k "$(FIT_BUILD_KEY_DIR)") -f $@.its $@.new, \
 	  gen-cpio$(if $(TARGET_PER_DEVICE_ROOTFS),.$(ROOTFS_ID/$(DEVICE_NAME))))
+	$(if $(CONFIG_MTK_SECURE_BOOT),$(TOPDIR)/scripts/fit-sign-verify.sh \
+		"$@.new" "$(TOPDIR)" "$(call qstrip,$(CONFIG_FIT_VERIFY_KEY_DTB))" \
+		"$(call qstrip,$(CONFIG_FIT_SIGN_KEY_NAME))" "$(call qstrip,$(CONFIG_FIT_PQC_SIGN_KEY_NAME))")
 	@mv $@.new $@
 endef
 

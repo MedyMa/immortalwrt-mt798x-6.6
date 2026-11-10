@@ -36,6 +36,10 @@ usage() {
 	printf "\n\t-o ==> create output file 'its_file'"
 	printf "\n\t-O ==> create config with dt overlay 'name:dtb'"
 	printf "\n\t-s ==> set FDT load address to 'addr' (hex)"
+	printf "\n\t-S ==> add signature at configurations with hint 'sign_key_name'"
+	printf "\n\t-b ==> set signature algorithm to 'sign_algo'"
+	printf "\n\t-P ==> add pqc signature at configurations with hint 'pqc_sign_key_name'"
+	printf "\n\t-p ==> set pqc signature algorithm to 'pqc_sign_algo'"
 	printf "\n\t\t(can be specified more than once)\n"
 	exit 1
 }
@@ -49,7 +53,7 @@ LOADABLES=
 DTOVERLAY=
 DTADDR=
 
-while getopts ":A:a:c:C:D:d:e:f:i:k:l:n:o:O:v:r:s:H:" OPTION
+while getopts ":A:a:c:C:D:d:e:f:i:k:l:n:o:O:v:r:s:H:S:b:P:p:" OPTION
 do
 	case $OPTION in
 		A ) ARCH=$OPTARG;;
@@ -70,10 +74,23 @@ do
 		s ) FDTADDR=$OPTARG;;
 		H ) HASH=$OPTARG;;
 		v ) VERSION=$OPTARG;;
+		S ) SIGN_KEY_NAME=$OPTARG;;
+		b ) SIGN_ALG=$OPTARG;;
+		P ) PQC_SIGN_KEY_NAME=$OPTARG;;
+		p ) PQC_SIGN_ALG=$OPTARG;;
 		* ) echo "Invalid option passed to '$0' (options:$*)"
 		usage;;
 	esac
 done
+
+# These names are interpolated into DTS strings and offline filenames.
+for key in "$SIGN_KEY_NAME" "$PQC_SIGN_KEY_NAME"; do
+	case "$key" in *[!a-zA-Z0-9_-]*) echo "Invalid FIT key name" >&2; exit 1 ;; esac
+done
+[ -z "$SIGN_KEY_NAME" ] || [ "$SIGN_KEY_NAME" != "$PQC_SIGN_KEY_NAME" ] || {
+	echo "Hybrid FIT requires distinct keys" >&2
+	exit 1
+}
 
 # Make sure user entered all required parameters
 if [ -z "${ARCH}" ] || [ -z "${COMPRESS}" ] || [ -z "${LOAD_ADDR}" ] || \
@@ -156,6 +173,113 @@ if [ -n "${ROOTFS}" ]; then
 	LOADABLES="${LOADABLES:+$LOADABLES, }\"rootfs${REFERENCE_CHAR}${ROOTFSNUM}\""
 fi
 
+# Conditionally create signature information
+if [ -n "${SIGN_KEY_NAME}" ]; then
+	if [ -z "${SIGN_ALG}" ]; then
+		SIGN_ALG="sha256,rsa2048"
+	fi
+
+	SIGN_OFFLINE=""
+	if echo "${SIGN_ALG}" | grep -q "offline"; then
+		SIGN_ALG=$(echo "${SIGN_ALG}" | sed "s/\(.*\),.*/\1/g")
+		SIGN_OFFLINE="sign-offline;"
+	fi
+
+	PADDING_PROP=""
+	if echo "${SIGN_ALG}" | grep -q "rsa"; then
+		PADDING_PROP="padding = \"pss\";"
+	fi
+
+	SIGN_IMAGES="sign-images = \"fdt\", \"kernel\""
+	if [ -n "${INITRD}" ]; then
+		SIGN_IMAGES="${SIGN_IMAGES}, \"ramdisk\""
+	fi
+
+	if [ -n "${ROOTFS}" ]; then
+		SIGN_IMAGES="${SIGN_IMAGES}, \"loadables\""
+	fi
+	SIGN_IMAGES="${SIGN_IMAGES};"
+
+	SIGNATURE="
+			signature {
+				algo = \"${SIGN_ALG}\";
+				${PADDING_PROP}
+				key-name-hint = \"${SIGN_KEY_NAME}\";
+				${SIGN_IMAGES}
+				${SIGN_OFFLINE}
+			};
+"
+
+	if [ -n "${DTOVERLAY}" ]; then
+		OVSIGN_IMAGES="sign-images = \"fdt\";"
+
+		OVSIGNATURE="
+			signature {
+				algo = \"${SIGN_ALG}\";
+				${PADDING_PROP}
+				key-name-hint = \"${SIGN_KEY_NAME}\";
+				${OVSIGN_IMAGES}
+				${SIGN_OFFLINE}
+			};
+"
+	fi
+fi
+
+# Conditionally PQC create signature information
+if [ -n "${PQC_SIGN_KEY_NAME}" ]; then
+	if [ -z "${PQC_SIGN_ALG}" ]; then
+		PQC_SIGN_ALG="mldsa87"
+	fi
+
+	PQC_SIGN_OFFLINE=""
+	if echo "${PQC_SIGN_ALG}" | grep -q "offline"; then
+		PQC_SIGN_ALG=$(echo "${PQC_SIGN_ALG}" | sed "s/\(.*\),.*/\1/g")
+		PQC_SIGN_OFFLINE="sign-offline;"
+	fi
+
+	case "${PQC_SIGN_ALG}" in
+		*,mldsa*) PQC_SIGN_ALG="${PQC_SIGN_ALG##*,}";;
+	esac
+
+	if [ -n "${SIGN_KEY_NAME}" ]; then
+		PQC_SIGN_NODE="signature${REFERENCE_CHAR}2"
+	else
+		PQC_SIGN_NODE="signature"
+	fi
+
+	PQC_SIGN_IMAGES="sign-images = \"fdt\", \"kernel\""
+	if [ -n "${INITRD}" ]; then
+		PQC_SIGN_IMAGES="${PQC_SIGN_IMAGES}, \"ramdisk\""
+	fi
+
+	if [ -n "${ROOTFS}" ]; then
+		PQC_SIGN_IMAGES="${PQC_SIGN_IMAGES}, \"loadables\""
+	fi
+	PQC_SIGN_IMAGES="${PQC_SIGN_IMAGES};"
+
+	PQC_SIGNATURE="
+			${PQC_SIGN_NODE} {
+				algo = \"${PQC_SIGN_ALG}\";
+				key-name-hint = \"${PQC_SIGN_KEY_NAME}\";
+				${PQC_SIGN_IMAGES}
+				${PQC_SIGN_OFFLINE}
+			};
+"
+
+	if [ -n "${DTOVERLAY}" ]; then
+		PQC_OVSIGN_IMAGES="sign-images = \"fdt\";"
+
+		PQC_OVSIGNATURE="
+			${PQC_SIGN_NODE} {
+				algo = \"${PQC_SIGN_ALG}\";
+				key-name-hint = \"${PQC_SIGN_KEY_NAME}\";
+				${PQC_OVSIGN_IMAGES}
+				${PQC_SIGN_OFFLINE}
+			};
+"
+	fi
+fi
+
 # add DT overlay blobs
 FDTOVERLAY_NODE=""
 OVCONFIGS=""
@@ -188,6 +312,8 @@ OVCONFIGS=""
 			description = \"OpenWrt ${DEVICE} overlay $ovname\";
 			fdt = \"$ovnode\";
 			${COMPATIBLE_PROP}
+			${OVSIGNATURE}
+			${PQC_OVSIGNATURE}
 		};
 	"
 done
@@ -231,6 +357,8 @@ ${ROOTFS_NODE}
 			${LOADABLES:+loadables = ${LOADABLES};}
 			${COMPATIBLE_PROP}
 			${INITRD_PROP}
+			${SIGNATURE}
+			${PQC_SIGNATURE}
 		};
 		${OVCONFIGS}
 	};

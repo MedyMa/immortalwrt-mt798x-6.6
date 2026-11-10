@@ -1,24 +1,72 @@
 menuconfig MTK_SECURE_BOOT
-	bool "Enable Secure Boot"
+	bool "Enable MediaTek FIT signing"
+	depends on TARGET_mediatek
 	select PACKAGE_dmsetup
 	select PACKAGE_cryptsetup
 	default n
 	help
-	  Select mtk secure boot
+	  Sign FIT images and verify them with a trusted U-Boot control DTB.
+	  The target bootloader must implement the selected algorithms and
+	  enforce the same required keys. This does not provision BL2/FIP keys,
+	  enable BootROM authentication, burn eFuses, or enable anti-rollback.
+	  Only payloads inside the FIT are covered. A separate rootfs needs its
+	  own verification mechanism.
 
 if MTK_SECURE_BOOT
 
 config SBC_KEY_DIR
-	string "secure boot key directory"
+	string "FIT signing key directory"
 	default "../../keys"
+	help
+	  Absolute path or path relative to the build root. Never commit keys.
+
+config FIT_VERIFY_KEY_DTB
+	string "Trusted U-Boot control DTB for FIT verification"
+	help
+	  Must contain the keys enforced by the installed target bootloader,
+	  marked required = "conf". Hybrid requires required-mode = "all".
+	  Missing keys or signatures cause the image build to fail.
+
+choice
+	prompt "FIT signing profile"
+	default SBC_PROFILE_CLASSICAL
+
+config SBC_PROFILE_CLASSICAL
+	bool "Classical (RSA/ECC)"
+
+config SBC_PROFILE_PQC
+	bool "PQC (ML-DSA-87; requires a compatible target verifier)"
+
+config SBC_PROFILE_HYBRID
+	bool "Hybrid (Classical and ML-DSA-87; requires both target verifiers)"
+endchoice
+
+if SBC_PROFILE_CLASSICAL || SBC_PROFILE_HYBRID
 
 config FIT_SIGN_KEY_NAME
-	string "FIT sign key name"
+	string "FIT classical key name"
 	default "fit_key"
 
 config FIT_SIGN_ALG
-	string "FIT sign algorithm"
+	string "FIT classical signing algorithm"
 	default "sha256,rsa2048"
+	help
+	  For example sha256,rsa2048 or sha512,ecdsa521. Append ,offline
+	  for external RSA signatures. Offline mode exports a digest under
+	  KEY_DIR/fit-signatures and requires its verified .sig on the next
+	  build, with the same SOURCE_DATE_EPOCH. It never uses a private key.
+endif
+
+if SBC_PROFILE_PQC || SBC_PROFILE_HYBRID
+
+config FIT_PQC_SIGN_KEY_NAME
+	string "FIT ML-DSA-87 key name"
+	default "fit_pqc_key"
+
+config FIT_PQC_SIGN_ALG
+	string "FIT ML-DSA-87 signing algorithm"
+	default "sha512,mldsa87"
+endif
 
 menuconfig MTK_FW_ENC
 	bool "Enable firmware encryption"

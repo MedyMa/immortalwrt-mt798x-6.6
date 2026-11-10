@@ -1,0 +1,585 @@
+From: MedyMa <75345465+MedyMa@users.noreply.github.com>
+Subject: [PATCH] tools: backport upstream ECDSA public-key verification and P-521
+
+Adapt MediaTek 84b00fc11 and the upstream U-Boot 2025.10 ECDSA
+prerequisites to the 2024.07 host tools. Preserve rounded coordinate sizes.
+
+--- a/lib/ecdsa/ecdsa-libcrypto.c
++++ b/lib/ecdsa/ecdsa-libcrypto.c
+@@ -26,6 +26,8 @@
+ #include <openssl/ec.h>
+ #include <openssl/bn.h>
+ 
++#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
++
+ /* Image signing context for openssl-libcrypto */
+ struct signer {
+ 	EVP_PKEY *evp_key;	/* Pointer to EVP_PKEY object */
+@@ -34,6 +36,181 @@
+ 	void *signature;	/* Pointer to output signature. Do not free()!*/
+ };
+ 
++struct ecdsa_public_key {
++	const char *curve_name;
++	const uint8_t *x;
++	const uint8_t *y;
++	int size_bits;
++};
++
++/*
++ * This function returns a valid pointer so
++ * the caller must then free this pointer.
++ */
++static char *memdup(const void *src, size_t len)
++{
++	char *p;
++
++	p = malloc(len);
++	if (!p)
++		return NULL;
++
++	memcpy(p, src, len);
++
++	return p;
++}
++
++/*
++ * This function fills keys with valid pointers (x and y) so
++ * the caller must then free those pointers with fdt_free_key().
++ */
++static int fdt_get_key(struct ecdsa_public_key *key, const void *fdt, int node)
++{
++	const char *x;
++	const char *y;
++	int x_len;
++	int y_len;
++	int expected_len;
++
++	memset(key, 0, sizeof(*key));
++
++	key->curve_name = fdt_getprop(fdt, node, "ecdsa,curve", NULL);
++	if (!key->curve_name)
++		return -ENOMSG;
++
++	if (!strcmp(key->curve_name, "prime256v1"))
++		key->size_bits = 256;
++	else if (!strcmp(key->curve_name, "secp384r1"))
++		key->size_bits = 384;
++	else if (!strcmp(key->curve_name, "secp521r1"))
++		key->size_bits = 521;
++	else
++		return -EINVAL;
++
++	key->x = fdt_getprop(fdt, node, "ecdsa,x-point", &x_len);
++	key->y = fdt_getprop(fdt, node, "ecdsa,y-point", &y_len);
++
++	if (!key->x || !key->y)
++		return -EINVAL;
++
++	/*
++	 * The public key is stored as an array of u32, so if the key size is
++	 * not a multiple of 32 (for example 521), we may have extra bytes.
++	 * To avoid any issue later, we shift the x and y pointer to the first
++	 * useful byte.
++	 */
++	expected_len = DIV_ROUND_UP(key->size_bits, 8);
++
++	if (x_len < expected_len || y_len < expected_len)
++		return -EINVAL;
++
++	x = memdup(key->x + (x_len - expected_len), expected_len);
++	if (!x) {
++		fprintf(stderr, "Cannot allocate memory for point X");
++		return -ENOMEM;
++	}
++	key->x = (const uint8_t *)x;
++
++	y = memdup(key->y + (y_len - expected_len), expected_len);
++	if (!y) {
++		fprintf(stderr, "Cannot allocate memory for point Y");
++		free((char *)x);
++		return -ENOMEM;
++	}
++	key->y = (const uint8_t *)y;
++
++	return 0;
++}
++
++static void fdt_free_key(struct ecdsa_public_key *key)
++{
++	if (!key)
++		return;
++	if (key->x)
++		free((char *)key->x);
++	if (key->y)
++		free((char *)key->y);
++}
++
++static int read_key_from_fdt(struct signer *ctx, const void *fdt, int node)
++{
++	struct ecdsa_public_key pubkey;
++	const EC_GROUP *group;
++	EC_POINT *point;
++	EC_KEY *ec_key;
++	int ret;
++	int nid;
++	int len;
++
++	ret = fdt_get_key(&pubkey, fdt, node);
++	if (ret) {
++		fprintf(stderr, "Failed to parse ECDSA key from FDT node %d (ret=%d)\n", node, ret);
++		return ret;
++	}
++
++	if (!strcmp(pubkey.curve_name, "prime256v1")) {
++		nid = NID_X9_62_prime256v1;
++	} else if (!strcmp(pubkey.curve_name, "secp384r1")) {
++		nid = NID_secp384r1;
++	} else if (!strcmp(pubkey.curve_name, "secp521r1")) {
++		nid = NID_secp521r1;
++	} else {
++		fprintf(stderr, "Unsupported curve name: '%s'\n", pubkey.curve_name);
++		fdt_free_key(&pubkey);
++		return -EINVAL;
++	}
++
++	fprintf(stderr, "Loading ECDSA key: curve=%s, bits=%d\n", pubkey.curve_name,
++		pubkey.size_bits);
++
++	ec_key = EC_KEY_new_by_curve_name(nid);
++	if (!ec_key) {
++		fprintf(stderr, "Failed to allocate EC_KEY for curve %s\n", pubkey.curve_name);
++		fdt_free_key(&pubkey);
++		return -ENOMEM;
++	}
++
++	group = EC_KEY_get0_group(ec_key);
++	point = EC_POINT_new(group);
++	if (!point) {
++		fprintf(stderr, "Failed to allocate EC_POINT\n");
++		EC_KEY_free(ec_key);
++		fdt_free_key(&pubkey);
++		return -ENOMEM;
++	}
++
++	len = DIV_ROUND_UP(pubkey.size_bits, 8);
++
++	uint8_t buf[1 + len * 2];
++
++	/* uncompressed */
++	buf[0] = 0x04;
++	memcpy(&buf[1], pubkey.x, len);
++	memcpy(&buf[1 + len], pubkey.y, len);
++	if (!EC_POINT_oct2point(group, point, buf, sizeof(buf), NULL)) {
++		fprintf(stderr, "Failed to convert (x,y) point to EC_POINT\n");
++		EC_POINT_free(point);
++		EC_KEY_free(ec_key);
++		fdt_free_key(&pubkey);
++		return -EINVAL;
++	}
++
++	if (!EC_KEY_set_public_key(ec_key, point)) {
++		fprintf(stderr, "Failed to set EC_POINT as public key\n");
++		EC_POINT_free(point);
++		EC_KEY_free(ec_key);
++		fdt_free_key(&pubkey);
++		return -EINVAL;
++	}
++
++	fprintf(stderr, "Successfully loaded ECDSA key from FDT node %d\n", node);
++	EC_POINT_free(point);
++	fdt_free_key(&pubkey);
++	ctx->ecdsa_key = ec_key;
++
++	return 0;
++}
++
+ static int alloc_ctx(struct signer *ctx, const struct image_sign_info *info)
+ {
+ 	memset(ctx, 0, sizeof(*ctx));
+@@ -108,7 +285,7 @@
+ 	const EC_GROUP *group;
+ 
+ 	group = EC_KEY_get0_group(key);
+-	return EC_GROUP_order_bits(group) / 8;
++	return (EC_GROUP_order_bits(group) + 7) / 8;
+ }
+ 
+ static int default_password(char *buf, int size, int rwflag, void *u)
+@@ -153,6 +330,72 @@
+ 	return (ctx->ecdsa_key) ? 0 : -EINVAL;
+ }
+ 
++static int load_key_from_fdt(struct signer *ctx, const struct image_sign_info *info)
++{
++	const void *fdt = info->fdt_blob;
++	char name[128];
++	int sig_node;
++	int key_node;
++	int key_len;
++	int ret;
++
++	if (!fdt)
++		return -EINVAL;
++
++	ret = alloc_ctx(ctx, info);
++	if (ret)
++		return ret;
++
++	sig_node = fdt_subnode_offset(fdt, 0, FIT_SIG_NODENAME);
++	if (sig_node < 0) {
++		fprintf(stderr, "No /signature node found\n");
++		return -ENOENT;
++	}
++
++	/* Case 1: explicitly specified key node */
++	if (info->required_keynode >= 0) {
++		ret = read_key_from_fdt(ctx, fdt, info->required_keynode);
++		if (ret == 0)
++			goto check_key_len;
++
++		fprintf(stderr, "Failed to load required keynode %d\n", info->required_keynode);
++		return ret;
++	}
++
++	/* Case 2: use keyname hint */
++	if (info->keyname) {
++		snprintf(name, sizeof(name), "%s", info->keyname);
++		key_node = fdt_subnode_offset(fdt, sig_node, name);
++		if (key_node >= 0) {
++			ret = read_key_from_fdt(ctx, fdt, key_node);
++			if (ret == 0)
++				goto check_key_len;
++
++			fprintf(stderr, "Key hint '%s' found but failed to load\n", info->keyname);
++		}
++	}
++
++	/* Case 3: try all subnodes */
++	fdt_for_each_subnode(key_node, fdt, sig_node) {
++		ret = read_key_from_fdt(ctx, fdt, key_node);
++		if (ret == 0)
++			goto check_key_len;
++	}
++
++	fprintf(stderr, "Failed to load any usable ECDSA key from FDT\n");
++	return -EINVAL;
++
++check_key_len:
++	key_len = ecdsa_key_size_bytes(ctx->ecdsa_key);
++	if (key_len != info->crypto->key_len) {
++		fprintf(stderr, "Expected %u-bit key, got %u-bit key\n",
++			info->crypto->key_len * 8, key_len * 8);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ /* Prepare a 'signer' context that's ready to sign and verify. */
+ static int prepare_ctx(struct signer *ctx, const struct image_sign_info *info)
+ {
+@@ -161,7 +404,9 @@
+ 
+ 	memset(ctx, 0, sizeof(*ctx));
+ 
+-	if (info->keyfile) {
++	if (info->fdt_blob) {
++		return load_key_from_fdt(ctx, info);
++	} else if (info->keyfile) {
+ 		snprintf(kname,  sizeof(kname), "%s", info->keyfile);
+ 	} else if (info->keydir && info->keyname) {
+ 		snprintf(kname, sizeof(kname), "%s/%s.pem", info->keydir,
+@@ -272,7 +517,8 @@
+ 	return ret;
+ }
+ 
+-static int do_add(struct signer *ctx, void *fdt, const char *key_node_name)
++static int do_add(struct signer *ctx, void *fdt, const char *key_node_name,
++		  struct image_sign_info *info)
+ {
+ 	int signature_node, key_node, ret, key_bits;
+ 	const char *curve_name;
+@@ -281,16 +527,35 @@
+ 	BIGNUM *x, *y;
+ 
+ 	signature_node = fdt_subnode_offset(fdt, 0, FIT_SIG_NODENAME);
+-	if (signature_node < 0) {
+-		fprintf(stderr, "Could not find 'signature node: %s\n",
++	if (signature_node == -FDT_ERR_NOTFOUND) {
++		signature_node = fdt_add_subnode(fdt, 0, FIT_SIG_NODENAME);
++		if (signature_node < 0) {
++			if (signature_node != -FDT_ERR_NOSPACE) {
++				fprintf(stderr, "Couldn't create signature node: %s\n",
++					fdt_strerror(signature_node));
++			}
++			return signature_node;
++		}
++	} else if (signature_node < 0) {
++		fprintf(stderr, "Cannot select keys signature_node: %s\n",
+ 			fdt_strerror(signature_node));
+ 		return signature_node;
+ 	}
+ 
+-	key_node = fdt_add_subnode(fdt, signature_node, key_node_name);
+-	if (key_node < 0) {
+-		fprintf(stderr, "Could not create '%s' node: %s\n",
+-			key_node_name, fdt_strerror(key_node));
++	/* Either create or overwrite the named key node */
++	key_node = fdt_subnode_offset(fdt, signature_node, key_node_name);
++	if (key_node == -FDT_ERR_NOTFOUND) {
++		key_node = fdt_add_subnode(fdt, signature_node, key_node_name);
++		if (key_node < 0) {
++			if (key_node != -FDT_ERR_NOSPACE) {
++				fprintf(stderr, "Could not create key subnode: %s\n",
++					fdt_strerror(key_node));
++			}
++			return key_node;
++		}
++	} else if (key_node < 0) {
++		fprintf(stderr, "Cannot select keys key_node: %s\n",
++			fdt_strerror(key_node));
+ 		return key_node;
+ 	}
+ 
+@@ -303,6 +568,11 @@
+ 	point = EC_KEY_get0_public_key(ctx->ecdsa_key);
+ 	EC_POINT_get_affine_coordinates(group, point, x, y, NULL);
+ 
++	ret = fdt_setprop_string(fdt, key_node, FIT_KEY_HINT,
++				 info->keyname);
++	if (ret < 0)
++		return ret;
++
+ 	ret = fdt_setprop_string(fdt, key_node, "ecdsa,curve", curve_name);
+ 	if (ret < 0)
+ 		return ret;
+@@ -314,6 +584,18 @@
+ 	ret = fdt_add_bignum(fdt, key_node, "ecdsa,y-point", y, key_bits);
+ 	if (ret < 0)
+ 		return ret;
++
++	ret = fdt_setprop_string(fdt, key_node, FIT_ALGO_PROP,
++				 info->name);
++	if (ret < 0)
++		return ret;
++
++	if (info->require_keys) {
++		ret = fdt_setprop_string(fdt, key_node, FIT_KEY_REQUIRED,
++					 info->require_keys);
++		if (ret < 0)
++			return ret;
++	}
+ 
+ 	return key_node;
+ }
+@@ -326,8 +608,13 @@
+ 
+ 	fdt_key_name = info->keyname ? info->keyname : "default-key";
+ 	ret = prepare_ctx(&ctx, info);
+-	if (ret >= 0)
+-		ret = do_add(&ctx, fdt, fdt_key_name);
++	if (ret >= 0) {
++		ret = do_add(&ctx, fdt, fdt_key_name, info);
++		if (ret < 0) {
++			free_ctx(&ctx);
++			return ret == -FDT_ERR_NOSPACE ? -ENOSPC : -EIO;
++		}
++	}
+ 
+ 	free_ctx(&ctx);
+ 	return ret;
+--- a/lib/ecdsa/ecdsa-verify.c
++++ b/lib/ecdsa/ecdsa-verify.c
+@@ -10,6 +10,7 @@
+ 
+ #include <crypto/ecdsa-uclass.h>
+ #include <dm/uclass.h>
++#include <malloc.h>
+ #include <u-boot/ecdsa.h>
+ 
+ /*
+@@ -22,13 +23,25 @@
+ {
+ 	if (!strcmp(curve_name, "prime256v1"))
+ 		return 256;
+-	else
+-		return 0;
+-}
+-
++	else if (!strcmp(curve_name, "secp384r1"))
++		return 384;
++	else if (!strcmp(curve_name, "secp521r1"))
++		return 521;
++
++	return 0;
++}
++
++/*
++ * This function fills keys with valid pointers (x and y) so
++ * the caller must then free those pointers with fdt_free_key().
++ */
+ static int fdt_get_key(struct ecdsa_public_key *key, const void *fdt, int node)
+ {
+-	int x_len, y_len;
++	int expected_read, expected_len, x_len, y_len;
++	const char *x;
++	const char *y;
++
++	memset(key, 0, sizeof(*key));
+ 
+ 	key->curve_name = fdt_getprop(fdt, node, "ecdsa,curve", NULL);
+ 	if (!key->curve_name) {
+@@ -48,13 +61,48 @@
+ 	if (!key->x || !key->y)
+ 		return -EINVAL;
+ 
+-	if (x_len != (key->size_bits / 8) || y_len != (key->size_bits / 8)) {
++	expected_read = DIV_ROUND_UP(key->size_bits, 32) * 4;
++	if (x_len != expected_read || y_len != expected_read) {
+ 		printf("%s: node=%d, curve@%p x@%p+%i y@%p+%i\n", __func__,
+ 		       node, key->curve_name, key->x, x_len, key->y, y_len);
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * The public key is stored as an array of u32, so if the key size is
++	 * not a multiple of 32 (for example 521), we may have extra bytes.
++	 * To avoid any issue later, we shift the x and y pointer to the first
++	 * useful byte.
++	 */
++	expected_len = DIV_ROUND_UP(key->size_bits, 8);
++
++	x = memdup(key->x + (x_len - expected_len), expected_len);
++	if (!x) {
++		debug("Cannot allocate memory for point X\n");
++		return -ENOMEM;
++	}
++	key->x = (const uint8_t *)x;
++
++	y = memdup(key->y + (y_len - expected_len), expected_len);
++	if (!y) {
++		debug("Cannot allocate memory for point Y\n");
++		free((char *)x);
++		key->x = NULL;
++		return -ENOMEM;
++	}
++	key->y = (const uint8_t *)y;
++
+ 	return 0;
++}
++
++static void fdt_free_key(struct ecdsa_public_key *key)
++{
++	if (!key)
++		return;
++	if (key->x)
++		free((char *)key->x);
++	if (key->y)
++		free((char *)key->y);
+ }
+ 
+ static int ecdsa_verify_hash(struct udevice *dev,
+@@ -74,8 +122,11 @@
+ 		if (ret < 0)
+ 			return ret;
+ 
+-		return ops->verify(dev, &key, hash, algo->checksum_len,
+-				   sig, sig_len);
++		ret = ops->verify(dev, &key, hash, algo->checksum_len,
++				  sig, sig_len);
++		fdt_free_key(&key);
++
++		return ret;
+ 	}
+ 
+ 	sig_node = fdt_subnode_offset(info->fdt_blob, 0, FIT_SIG_NODENAME);
+@@ -91,6 +142,8 @@
+ 		ret = ops->verify(dev, &key, hash, algo->checksum_len,
+ 				  sig, sig_len);
+ 
++		fdt_free_key(&key);
++
+ 		/* On success, don't worry about remaining keys */
+ 		if (!ret)
+ 			return 0;
+@@ -121,9 +174,27 @@
+ 	return ecdsa_verify_hash(dev, info, hash, sig, sig_len);
+ }
+ 
+-U_BOOT_CRYPTO_ALGO(ecdsa) = {
++U_BOOT_CRYPTO_ALGO(ecdsa256) = {
+ 	.name = "ecdsa256",
+ 	.key_len = ECDSA256_BYTES,
++	.verify = ecdsa_verify,
++};
++
++U_BOOT_CRYPTO_ALGO(ecdsa384) = {
++	.name = "ecdsa384",
++	.key_len = ECDSA384_BYTES,
++	.verify = ecdsa_verify,
++};
++
++U_BOOT_CRYPTO_ALGO(ecdsa521) = {
++	.name = "ecdsa521",
++	.key_len = ECDSA521_BYTES,
++	.verify = ecdsa_verify,
++};
++
++U_BOOT_CRYPTO_ALGO(secp521r1) = {
++	.name = "secp521r1",
++	.key_len = ECDSA521_BYTES,
+ 	.verify = ecdsa_verify,
+ };
+ 
+--- a/include/u-boot/ecdsa.h
++++ b/include/u-boot/ecdsa.h
+@@ -65,5 +65,7 @@
+ /** @} */
+ 
+ #define ECDSA256_BYTES	(256 / 8)
++#define ECDSA384_BYTES	(384 / 8)
++#define ECDSA521_BYTES	((521 + 7) / 8)
+ 
+ #endif
+--- a/lib/fdt-libcrypto.c
++++ b/lib/fdt-libcrypto.c
+@@ -10,7 +10,7 @@
+ int fdt_add_bignum(void *blob, int noffset, const char *prop_name,
+ 		   BIGNUM *num, int num_bits)
+ {
+-	int nwords = num_bits / 32;
++	int nwords = (num_bits + 31) / 32;
+ 	int size;
+ 	uint32_t *buf, *ptr;
+ 	BIGNUM *tmp, *big2, *big32, *big2_32;
+--- a/tools/image-sig-host.c
++++ b/tools/image-sig-host.c
+@@ -78,6 +78,27 @@
+ 		.verify = ecdsa_verify,
+ 	},
+ 	{
++		.name = "ecdsa384",
++		.key_len = ECDSA384_BYTES,
++		.sign = ecdsa_sign,
++		.add_verify_data = ecdsa_add_verify_data,
++		.verify = ecdsa_verify,
++	},
++	{
++		.name = "ecdsa521",
++		.key_len = ECDSA521_BYTES,
++		.sign = ecdsa_sign,
++		.add_verify_data = ecdsa_add_verify_data,
++		.verify = ecdsa_verify,
++	},
++	{
++		.name = "secp521r1",
++		.key_len = ECDSA521_BYTES,
++		.sign = ecdsa_sign,
++		.add_verify_data = ecdsa_add_verify_data,
++		.verify = ecdsa_verify,
++	},
++	{
+ 		.name = "mldsa87",
+ 		.key_len = MLDSA87_PK_BYTES,
+ 		.no_checksum = true,

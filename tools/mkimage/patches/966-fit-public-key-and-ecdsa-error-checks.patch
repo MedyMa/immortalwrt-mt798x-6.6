@@ -1,0 +1,79 @@
+From: MedyMa <75345465+MedyMa@users.noreply.github.com>
+Subject: [PATCH] tools: initialize public-key hashing and reject ECDSA errors
+
+--- a/tools/fdt_add_pubkey.c
++++ b/tools/fdt_add_pubkey.c
+@@ -74,6 +74,9 @@
+ 	info->name = algo_name;
+ 	info->require_keys = require_keys;
+ 	info->crypto = image_get_crypto_algo(algo_name);
++	info->checksum = image_get_checksum_algo(algo_name);
++	if (info->crypto && !info->crypto->no_checksum && !info->checksum)
++		print_usage("Missing or unsupported hash algorithm");
+ 
+ 	if (!info->crypto) {
+ 		fprintf(stderr, "Unsupported signature algorithm '%s'\n",
+--- a/tools/image-host.c
++++ b/tools/image-host.c
+@@ -1382,7 +1382,7 @@
+ 	int ret;
+ 
+ 	cfg_noffset = fit_conf_get_node(fit, fit_uname_config);
+-	if (!cfg_noffset)
++	if (cfg_noffset < 0)
+ 		return -1;
+ 
+ 	printf("Verifying Hash Integrity for node '%s'... ",
+--- a/lib/ecdsa/ecdsa-libcrypto.c
++++ b/lib/ecdsa/ecdsa-libcrypto.c
+@@ -239,6 +239,7 @@
+ 
+ 	if (ctx->hash)
+ 		free(ctx->hash);
++	free(ctx->signature);
+ }
+ 
+ /*
+@@ -442,8 +443,11 @@
+ 
+ 	algo->calculate(algo->name, region, region_count, ctx->hash);
+ 	sig = ECDSA_do_sign(ctx->hash, algo->checksum_len, ctx->ecdsa_key);
++	if (!sig)
++		return -EIO;
+ 
+ 	ecdsa_sig_encode_raw(ctx->signature, sig, info->crypto->key_len);
++	ECDSA_SIG_free(sig);
+ 
+ 	return 0;
+ }
+@@ -463,7 +467,7 @@
+ 		fprintf(stderr, "WARNING: Signature is fake news!\n");
+ 
+ 	ECDSA_SIG_free(sig);
+-	return !okay;
++	return okay == 1 ? 0 : -EACCES;
+ }
+ 
+ static int do_verify(struct signer *ctx, struct image_sign_info *info,
+@@ -491,13 +495,18 @@
+ 
+ 	ret = prepare_ctx(&ctx, info);
+ 	if (ret >= 0) {
+-		do_sign(&ctx, info, region, region_count);
++		ret = do_sign(&ctx, info, region, region_count);
++		if (ret)
++			goto out;
+ 		*sigp = ctx.signature;
+ 		*sig_len = info->crypto->key_len * 2;
+ 
+ 		ret = ecdsa_check_signature(&ctx, info);
+-	}
+-
++		if (!ret)
++			ctx.signature = NULL;
++	}
++
++out:
+ 	free_ctx(&ctx);
+ 	return ret;
+ }

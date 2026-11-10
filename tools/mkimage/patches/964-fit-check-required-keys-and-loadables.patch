@@ -1,0 +1,172 @@
+From: MedyMa <75345465+MedyMa@users.noreply.github.com>
+Subject: [PATCH] tools: fail closed on absent required keys and verify all FIT payloads
+
+--- a/tools/fit_check_sign.c
++++ b/tools/fit_check_sign.c
+@@ -23,12 +23,87 @@
+ #include <image.h>
+ #include <u-boot/crc.h>
+ 
++static int check_key_policy(const void *keys, const char **required,
++                            int count, bool all)
++{
++        int sig = fdt_path_offset(keys, "/signature"), node, len, found = 0, i;
++        const char *value;
++
++        if (sig < 0)
++                return -EINVAL;
++        if (all) {
++                value = fdt_getprop(keys, sig, "required-mode", &len);
++                if (!value || len != 4 || memcmp(value, "all", 4))
++                        return -EINVAL;
++        }
++        fdt_for_each_subnode(node, keys, sig) {
++                value = fdt_getprop(keys, node, "required", &len);
++                if (value && len == 5 && !memcmp(value, "conf", 5))
++                        found++;
++        }
++        if (!found)
++                return -EINVAL;
++        for (i = 0; i < count; i++) {
++                int matched = 0;
++
++                fdt_for_each_subnode(node, keys, sig) {
++                        value = fdt_getprop(keys, node, FIT_KEY_HINT, &len);
++                        if (!value || len != strlen(required[i]) + 1 ||
++                            memcmp(value, required[i], len))
++                                continue;
++                        value = fdt_getprop(keys, node, "required", &len);
++                        if (!value || len != 5 || memcmp(value, "conf", 5))
++                                return -EINVAL;
++                        matched++;
++                }
++                if (matched != 1)
++                        return -EINVAL;
++        }
++        return 0;
++}
++
++/* Validate external data bounds before any hash routine dereferences them.
++ * Check every image, including rootfs loadables omitted by bootm_host_load_images.
++ */
++static int check_image_data(const void *fit, size_t file_size)
++{
++        int images = fdt_path_offset(fit, "/images"), node, hash, len;
++        const void *data;
++        size_t size;
++        uintptr_t base = (uintptr_t)fit, ptr;
++        bool has_hash;
++
++        if (images < 0)
++                return -EINVAL;
++        fdt_for_each_subnode(node, fit, images) {
++                if (fit_image_get_data_and_size(fit, node, &data, &size))
++                        return -EINVAL;
++                ptr = (uintptr_t)data;
++                if (ptr < base || ptr - base > file_size ||
++                    size > file_size - (ptr - base))
++                        return -EINVAL;
++                has_hash = false;
++                fdt_for_each_subnode(hash, fit, node) {
++                        const char *name = fdt_get_name(fit, hash, &len);
++
++                        if (name && len >= 4 && !strncmp(name, "hash", 4))
++                                has_hash = true;
++                }
++                if (!has_hash || !fit_image_verify(fit, node))
++                        return -EINVAL;
++        }
++        return 0;
++}
++
+ void usage(char *cmdname)
+ {
+ 	fprintf(stderr, "Usage: %s -f fit file -k key file -c config name\n"
+ 			 "          -f ==> set fit file which should be checked'\n"
+ 			 "          -k ==> set key .dtb file which contains the key'\n"
+-			 "          -c ==> set the configuration name'\n",
++			 "          -c ==> set the configuration name'\n"
++                         "          -a ==> verify every configuration (including overlays)\n"
++                         "          -R ==> require a named configuration public key (repeatable)\n"
++                         "          -A ==> require required-mode=all in the trusted key DTB\n",
+ 		cmdname);
+ 	exit(EXIT_FAILURE);
+ }
+@@ -47,12 +122,27 @@
+ 	int ret;
+ 	void *key_blob;
+ 	int c;
++        const char *required[16];
++        int required_count = 0;
++        bool require_all = false;
++        bool all_configs = false;
+ 
+ 	strncpy(cmdname, *argv, sizeof(cmdname) - 1);
+ 	cmdname[sizeof(cmdname) - 1] = '\0';
+-	while ((c = getopt(argc, argv, "f:k:c:")) != -1)
++	while ((c = getopt(argc, argv, "af:k:c:R:A")) != -1)
+ 		switch (c) {
+-		case 'f':
++		case 'a':
++                        all_configs = true;
++                        break;
++                case 'A':
++                        require_all = true;
++                        break;
++                case 'R':
++                        if (required_count == ARRAY_SIZE(required))
++                                usage(cmdname);
++                        required[required_count++] = optarg;
++                        break;
++                case 'f':
+ 			fdtfile = optarg;
+ 			break;
+ 		case 'k':
+@@ -66,7 +156,7 @@
+ 			break;
+ 	}
+ 
+-	if (!fdtfile) {
++	if (!fdtfile || !keyfile) {
+ 		fprintf(stderr, "%s: Missing fdt file\n", *argv);
+ 		usage(*argv);
+ 	}
+@@ -82,8 +172,36 @@
+ 	if (kfd < 0)
+ 		return EXIT_FAILURE;
+ 
+-	image_set_host_blob(key_blob);
+-	ret = fit_check_sign(fit_blob, key_blob, config_name);
++	if (fdt_check_full(fit_blob, fsbuf.st_size) ||
++            fdt_check_full(key_blob, ksbuf.st_size) ||
++            check_key_policy(key_blob, required, required_count, require_all)) {
++                fprintf(stderr, "Invalid FIT data or trusted required-key policy\n");
++                return EXIT_FAILURE;
++        }
++        image_set_host_blob(key_blob);
++        if (check_image_data(fit_blob, fsbuf.st_size)) {
++                fprintf(stderr, "Invalid FIT payload or hash\n");
++                return EXIT_FAILURE;
++        }
++	if (all_configs) {
++                int configs = fdt_path_offset(fit_blob, "/configurations");
++                int node, count = 0;
++
++                ret = -EINVAL;
++                if (configs >= 0) {
++                        fdt_for_each_subnode(node, fit_blob, configs) {
++                                count++;
++                                ret = fit_check_sign(fit_blob, key_blob,
++                                                     fdt_get_name(fit_blob, node, NULL));
++                                if (ret)
++                                        break;
++                        }
++                }
++                if (!count)
++                        ret = -EINVAL;
++        } else {
++                ret = fit_check_sign(fit_blob, key_blob, config_name);
++        }
+ 	if (!ret) {
+ 		ret = EXIT_SUCCESS;
+ 		fprintf(stderr, "Signature check OK\n");

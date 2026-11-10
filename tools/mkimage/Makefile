@@ -20,12 +20,16 @@ HOST_BUILD_DIR:=$(BUILD_DIR_HOST)/u-boot-$(PKG_VERSION)
 
 include $(INCLUDE_DIR)/host-build.mk
 
+TOOLS_LIBCRYPTO_DIR:=$(STAGING_DIR_HOST)/openssl
+HOST_CFLAGS:=-I$(TOOLS_LIBCRYPTO_DIR)/include $(HOST_CFLAGS)
+
 define Host/Configure
 	$(MAKE) -C $(HOST_BUILD_DIR) \
 		HOSTCFLAGS="$(HOST_CFLAGS)" \
 		HOSTLDFLAGS="$(HOST_LDFLAGS)" \
 		PKG_CONFIG_EXTRAARGS="--static" \
 		V=$(if $(findstring c,$(OPENWRT_VERBOSE)),1) \
+		TOOLS_LIBCRYPTO_DIR="$(TOOLS_LIBCRYPTO_DIR)" \
 		tools-only_config
 
 	sed -i 's/CONFIG_TOOLS_MKEFICAPSULE=y/# CONFIG_TOOLS_MKEFICAPSULE is not set/' $(HOST_BUILD_DIR)/.config
@@ -37,17 +41,21 @@ define Host/Compile
 		HOSTLDFLAGS="$(HOST_LDFLAGS)" \
 		PKG_CONFIG_EXTRAARGS="--static" \
 		V=$(if $(findstring c,$(OPENWRT_VERBOSE)),1) \
+		TOOLS_LIBCRYPTO_DIR="$(TOOLS_LIBCRYPTO_DIR)" \
 		tools-only
 endef
 
 define Host/Install
 	$(CP) $(HOST_BUILD_DIR)/tools/mkimage $(STAGING_DIR_HOST)/bin/
 	$(CP) $(HOST_BUILD_DIR)/tools/mkenvimage $(STAGING_DIR_HOST)/bin/
+	$(CP) $(HOST_BUILD_DIR)/tools/fit_check_sign $(STAGING_DIR_HOST)/bin/
+	$(CP) $(HOST_BUILD_DIR)/tools/fdt_add_pubkey $(STAGING_DIR_HOST)/bin/
 endef
 
 define Host/Clean
 	rm -f $(STAGING_DIR_HOST)/bin/mkimage
 	rm -f $(STAGING_DIR_HOST)/bin/mkenvimage
+	rm -f $(STAGING_DIR_HOST)/bin/fit_check_sign $(STAGING_DIR_HOST)/bin/fdt_add_pubkey
 endef
 
 $(eval $(call HostBuild))

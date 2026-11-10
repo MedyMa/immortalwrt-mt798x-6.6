@@ -1,0 +1,172 @@
+From: MedyMa <75345465+MedyMa@users.noreply.github.com>
+Subject: [PATCH] tools: import MediaTek offline FIT protocol with verified external RSA signatures
+
+Based on MediaTek 980-mkimage-add-offline-sign-support.patch. Keep the
+standard algorithm in the FIT, never invoke a shell or local private key,
+and verify the exact external signature against the supplied certificate.
+
+--- /dev/null
++++ b/tools/signoffline.c
+@@ -0,0 +1,107 @@
++// SPDX-License-Identifier: GPL-2.0+
++/* MediaTek offline FIT signing protocol, with external signatures only. */
++#include "mkimage.h"
++#include <image.h>
++#include <ctype.h>
++#include <sys/stat.h>
++#include <openssl/pem.h>
++#include <openssl/rsa.h>
++#include <openssl/x509.h>
++
++int fit_offline_sign(struct image_sign_info *info,
++                     const struct image_region region[], int count,
++                     uint8_t **sigp, uint *sig_len)
++{
++        unsigned char digest[EVP_MAX_MD_SIZE], sig[512 + 1];
++        char stem[PATH_MAX], path[PATH_MAX], hex[EVP_MAX_MD_SIZE * 2 + 1];
++        EVP_PKEY_CTX *ctx = NULL;
++        EVP_PKEY *key = NULL;
++        X509 *cert = NULL;
++        FILE *fp;
++        const char *p;
++        size_t len;
++        int i, n, ret = -EINVAL;
++
++        /* The official offline protocol currently supports RSA only. */
++        if (!info->checksum || !info->keydir || !info->keyname ||
++            strncmp(info->crypto->name, "rsa", 3) ||
++            !getenv("SOURCE_DATE_EPOCH"))
++                return -EINVAL;
++        for (p = info->keyname; *p; p++)
++                if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_')
++                        return -EINVAL;
++        n = info->checksum->checksum_len;
++        if (n <= 0 || n > sizeof(digest) ||
++            info->checksum->calculate(info->checksum->name, region, count, digest))
++                return -EINVAL;
++        for (i = 0; i < n; i++)
++                sprintf(hex + i * 2, "%02x", digest[i]);
++        if (snprintf(path, sizeof(path), "%s/fit-signatures", info->keydir) >= sizeof(path))
++                return -ENAMETOOLONG;
++        if (mkdir(path, 0700) && errno != EEXIST)
++                return -errno;
++        if (snprintf(stem, sizeof(stem), "%s/%s-%s", path, info->keyname, hex) >= sizeof(stem))
++                return -ENAMETOOLONG;
++        if (snprintf(path, sizeof(path), "%s.msg", stem) >= sizeof(path))
++                return -ENAMETOOLONG;
++        fp = fopen(path, "wb");
++        if (!fp)
++                return -errno;
++        len = fwrite(digest, 1, n, fp);
++        ret = fclose(fp);
++        if (len != n || ret)
++                return -EIO;
++        if (snprintf(path, sizeof(path), "%s.sig", stem) >= sizeof(path))
++                return -ENAMETOOLONG;
++        fp = fopen(path, "rb");
++        if (!fp) {
++                fprintf(stderr, "Offline digest exported to %s.msg; supply %s (RSA %s, %s padding)\n",
++                        stem, path, info->checksum->name,
++                        info->padding ? info->padding->name : "pkcs-1.5");
++                return -EINPROGRESS;
++        }
++        len = fread(sig, 1, sizeof(sig), fp);
++        ret = ferror(fp);
++        fclose(fp);
++        if (ret || len != info->crypto->key_len)
++                return -EINVAL;
++        if (snprintf(path, sizeof(path), "%s/%s.crt", info->keydir, info->keyname) >= sizeof(path))
++                return -ENAMETOOLONG;
++        fp = fopen(path, "rb");
++        if (!fp)
++                return -EINVAL;
++        ret = -EINVAL;
++        cert = PEM_read_X509(fp, NULL, NULL, NULL);
++        fclose(fp);
++        if (!cert)
++                goto out;
++        key = X509_get_pubkey(cert);
++        if (!key || !EVP_PKEY_is_a(key, "RSA") || EVP_PKEY_get_size(key) != len)
++                goto out;
++        ctx = EVP_PKEY_CTX_new(key, NULL);
++        if (!ctx || EVP_PKEY_verify_init(ctx) <= 0 ||
++            EVP_PKEY_CTX_set_signature_md(ctx, info->checksum->calculate_sign()) <= 0)
++                goto out;
++        i = info->padding && !strcmp(info->padding->name, "pss") ?
++                RSA_PKCS1_PSS_PADDING : RSA_PKCS1_PADDING;
++        if (EVP_PKEY_CTX_set_rsa_padding(ctx, i) <= 0)
++                goto out;
++        if (i == RSA_PKCS1_PSS_PADDING &&
++            EVP_PKEY_CTX_set_rsa_pss_saltlen(ctx, n) <= 0)
++                goto out;
++        if (EVP_PKEY_verify(ctx, sig, len, digest, n) != 1)
++                goto out;
++        *sigp = malloc(len);
++        if (!*sigp) {
++                ret = -ENOMEM;
++                goto out;
++        }
++        memcpy(*sigp, sig, len);
++        *sig_len = len;
++        ret = 0;
++out:
++        EVP_PKEY_CTX_free(ctx);
++        EVP_PKEY_free(key);
++        X509_free(cert);
++        return ret;
++}
+--- a/tools/Makefile
++++ b/tools/Makefile
+@@ -159,7 +159,8 @@
+ 			gpimage-common.o \
+ 			mtk_image.o \
+ 			mtk_nand_headers.o \
+-			$(ECDSA_OBJS-y) \
++			signoffline.o \
++                        $(ECDSA_OBJS-y) \
+ 			$(MLDSA_OBJS-y) \
+ 			$(RSA_OBJS-y) \
+ 			$(AES_OBJS-y)
+--- a/tools/image-host.c
++++ b/tools/image-host.c
+@@ -1041,6 +1041,10 @@
+  * @return keydest node if @keydest is non-NULL, else 0 if none; -ve error code
+  *	on failure
+  */
++int fit_offline_sign(struct image_sign_info *info,
++                     const struct image_region region[], int count,
++                     uint8_t **sigp, uint *sig_len);
++
+ static int fit_config_process_sig(const char *keydir, const char *keyfile,
+ 		void *keydest, void *fit, const char *conf_name,
+ 		int conf_noffset, int noffset, const char *comment,
+@@ -1056,6 +1060,10 @@
+ 	uint8_t *value;
+ 	uint value_len;
+ 	int ret;
++        bool offline = fdt_getprop(fit, noffset, "sign-offline", NULL);
++
++        if (offline && fdt_delprop(fit, noffset, "sign-offline"))
++                return -EINVAL;
+ 
+ 	node_name = fit_get_name(fit, noffset, NULL);
+ 	if (fit_config_get_regions(fit, conf_noffset, noffset, &region,
+@@ -1068,15 +1076,15 @@
+ 				algo_name))
+ 		return -1;
+ 
+-	ret = info.crypto->sign(&info, region, region_count, &value,
+-				&value_len);
++	ret = offline ? fit_offline_sign(&info, region, region_count, &value, &value_len) :
++                info.crypto->sign(&info, region, region_count, &value, &value_len);
+ 	free(region);
+ 	if (ret) {
+ 		fprintf(stderr, "Failed to sign '%s' signature node in '%s' conf node\n",
+ 			node_name, conf_name);
+ 
+ 		/* We allow keys to be missing */
+-		if (ret == -ENOENT)
++		if (ret == -ENOENT && !offline)
+ 			return 0;
+ 		return -1;
+ 	}

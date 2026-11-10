@@ -1,0 +1,26 @@
+--- a/tools/Makefile
++++ b/tools/Makefile
+@@ -74,6 +74,14 @@
+ FIT_OBJS-y := fit_common.o fit_image.o image-host.o generated/boot/image-fit.o
+ FIT_SIG_OBJS-$(CONFIG_TOOLS_LIBCRYPTO) := image-sig-host.o generated/boot/image-fit-sig.o
+ FIT_CIPHER_OBJS-$(CONFIG_TOOLS_LIBCRYPTO) := generated/boot/image-cipher.o
++
++ifneq ($(TOOLS_LIBCRYPTO_DIR),)
++TOOLS_LIBCRYPTO_LIBS := $(TOOLS_LIBCRYPTO_DIR)/lib/libssl.a \
++			$(TOOLS_LIBCRYPTO_DIR)/lib/libcrypto.a -lpthread -ldl
++else
++TOOLS_LIBCRYPTO_LIBS := \
++	$(shell pkg-config --libs libssl libcrypto 2> /dev/null || echo "-lssl -lcrypto")
++endif
+ 
+ # The following files are synced with upstream DTC.
+ # Use synced versions from scripts/dtc/libfdt/.
+@@ -177,7 +185,7 @@
+ HOSTCFLAGS_kwbimage.o += \
+ 	$(shell pkg-config --cflags libssl libcrypto 2> /dev/null || echo "")
+ HOSTLDLIBS_mkimage += \
+-	$(shell pkg-config --libs libssl libcrypto 2> /dev/null || echo "-lssl -lcrypto")
++	$(TOOLS_LIBCRYPTO_LIBS)
+ 
+ # OS X deprecate openssl in favour of CommonCrypto, supress deprecation
+ # warnings on those systems

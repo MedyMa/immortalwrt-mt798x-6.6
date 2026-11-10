@@ -1,0 +1,17 @@
+From: MedyMa <75345465+MedyMa@users.noreply.github.com>
+Subject: [PATCH] tools: accept checksum-free ML-DSA in FIT verification
+
+Use the same crypto capability check during signing and verification.
+
+--- a/boot/image-fit-sig.c
++++ b/boot/image-fit-sig.c
+@@ -96,7 +96,8 @@
+ 	info->required_keynode = required_keynode;
+ 	printf("%s:%s", algo_name, info->keyname);
+ 
+-	if (!info->checksum || !info->crypto || !info->padding) {
++	if (!info->crypto || (!info->checksum && !info->crypto->no_checksum) ||
++	    !info->padding) {
+ 		*err_msgp = "Unknown signature algorithm";
+ 		return -1;
+ 	}
