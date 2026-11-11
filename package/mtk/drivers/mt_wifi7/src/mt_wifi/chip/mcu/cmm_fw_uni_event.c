@@ -8003,9 +8003,12 @@ static BOOLEAN uni_event_validate_all_sta_tlv(
 
 			wcid = uni_event_all_sta_record_wcid(record);
 			if (!IS_WCID_VALID(pAd, wcid)) {
-				pr_warn_once("mt_wifi: dropping malformed ALL_STA event: tag=%u record=%u WCID=%u WTBL_MAX=%u\n",
+				pr_warn_ratelimited("mt_wifi: dropping malformed ALL_STA event: tag=%u record=%u WCID=%u WTBL_MAX=%u "
+					"stations=%u tlv_len=%u available=%u record_len=%u\n",
 					(unsigned int)tag, (unsigned int)idx, (unsigned int)wcid,
-					(unsigned int)WTBL_MAX_NUM(pAd));
+					(unsigned int)WTBL_MAX_NUM(pAd), (unsigned int)sta_num,
+					(unsigned int)tlv_len, (unsigned int)tlv_available,
+					(unsigned int)record_len);
 				return FALSE;
 			}
 		}

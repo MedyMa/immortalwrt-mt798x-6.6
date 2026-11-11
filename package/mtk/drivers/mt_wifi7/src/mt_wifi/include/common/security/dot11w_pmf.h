@@ -87,7 +87,7 @@ typedef struct GNU_PACKED _PMF_MMIE {
 typedef struct GNU_PACKED _PMF_IGTK_KDE {
 	UINT8 KeyID[2];		/* identifies the IGTK used to compute the MIC */
 	UINT8 IPN[6];		/* indicates the receive sequence counter for the IGTK being installed */
-	UINT8 IGTK[0];		/* The length of the IGTK */
+	UINT8 IGTK[];		/* 16 or 32 bytes, depending on the BIP cipher */
 } PMF_IGTK_KDE, *PPMF_IGTK_KDE;
 
 
