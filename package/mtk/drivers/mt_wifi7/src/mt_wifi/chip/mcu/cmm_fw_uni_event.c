@@ -7946,12 +7946,13 @@ static UINT32 uni_event_all_sta_adm_record_len(UINT32 payload_len, UINT16 sta_nu
 {
 	UINT32 v1_len = sizeof(struct UNI_EVENT_ONE_STA_TXRX_ADM_STAT_T);
 	UINT32 v2_len = sizeof(struct UNI_EVENT_ONE_STA_TXRX_ADM_STAT_V2_T);
-	UINT32 max_sta = UNI_EVENT_ALL_STA_TXRX_ADM_STAT_PER_EVENT;
+	UINT32 v1_capacity = UNI_EVENT_ALL_STA_TXRX_ADM_STAT_PER_EVENT;
 
-	/* Firmware may send the full array or only the reported stations. */
-	if (payload_len == max_sta * v1_len || payload_len == sta_num * v1_len)
+	/* V1 has a fixed array; also preserve compact legacy events. */
+	if (payload_len == v1_capacity * v1_len || payload_len == sta_num * v1_len)
 		return v1_len;
-	if (payload_len == max_sta * v2_len || payload_len == sta_num * v2_len)
+	/* V2 capacity varies: MT7990 also reports 25-record padded arrays. */
+	if (payload_len % v2_len == 0)
 		return v2_len;
 
 	return 0;
