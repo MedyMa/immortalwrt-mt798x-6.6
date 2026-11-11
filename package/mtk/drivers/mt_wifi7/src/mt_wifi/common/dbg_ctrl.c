@@ -164,12 +164,8 @@ NTSTATUS fw_log_open_close_file(IN PRTMP_ADAPTER pAd, IN PCmdQElmt CMDQelmt)
 
 	NdisMoveMemory(&LogType, CMDQelmt->buffer, sizeof(UINT32));
 	if (LogType == 0) {
-		if (pAd->srcf.Status) {
-			MTWF_DBG(pAd, DBG_CAT_CFG, CATCFG_DBGLOG, DBG_LVL_ERROR,
-				"Close file \"%s\" failed!\n",
-				pAd->physical_dev->fw_log_ctrl.fw_log_dest_dir);
-			return NDIS_STATUS_FAILURE;
-		}
+		if (pAd->srcf.Status)
+			return NDIS_STATUS_SUCCESS;
 
 		Ret = os_file_close(pAd->srcf);
 		if (Ret) {

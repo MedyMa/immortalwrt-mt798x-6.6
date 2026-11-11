@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mt_wifi7
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 P4REV:=
 PKG_VERSION:=TEST
 PKG_SOURCE_URL:=
