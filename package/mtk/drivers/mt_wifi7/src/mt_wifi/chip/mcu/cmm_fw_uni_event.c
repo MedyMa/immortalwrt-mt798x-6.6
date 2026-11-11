@@ -7521,9 +7521,9 @@ static VOID uni_event_parse_all_sta_txrx_adm_stat(
 	struct _RTMP_ADAPTER *pAd,
 	UINT8 *Data,
 	UINT16 StaNum,
-	UINT32 Length)
+	UINT32 RecordLength)
 {
-	struct UNI_EVENT_ALL_STA_TXRX_ADM_STAT_T *prEventResult;
+	const struct UNI_EVENT_ONE_STA_TXRX_ADM_STAT_T *prStat;
 	PMAC_TABLE_ENTRY pEntry = NULL;
 	UINT32 Idx, k;
 	ULONG tx_bytes, rx_bytes;
@@ -7532,10 +7532,10 @@ static VOID uni_event_parse_all_sta_txrx_adm_stat(
 	UINT32 rx_bytes_adm[MAX_ACCESS_CAT_NUM] = {0};
 	UINT16 wcid;
 
-	prEventResult = (struct UNI_EVENT_ALL_STA_TXRX_ADM_STAT_T *)Data;
-
 	for (Idx = 0; Idx < StaNum; Idx++) {
-		wcid = uni_event_all_sta_record_wcid(&prEventResult->arTxRxAdmStatResult[Idx]);
+		/* V2 appends failed-byte counters to the unchanged V1 prefix. */
+		prStat = (const struct UNI_EVENT_ONE_STA_TXRX_ADM_STAT_T *)(Data + Idx * RecordLength);
+		wcid = uni_event_all_sta_record_wcid(prStat);
 		pEntry = entry_get(pAd, wcid);
 
 		if (pEntry && pEntry->wdev && (IS_ENTRY_CLIENT(pEntry) ||
@@ -7543,10 +7543,10 @@ static VOID uni_event_parse_all_sta_txrx_adm_stat(
 			tx_bytes = 0;
 			rx_bytes = 0;
 			for (k = 0; k < MAX_ACCESS_CAT_NUM; k++) {
-				tx_bytes_adm[k] += prEventResult->arTxRxAdmStatResult[Idx].au4TxBytesAdm[k];
-				rx_bytes_adm[k] += prEventResult->arTxRxAdmStatResult[Idx].au4RxBytesAdm[k];
-				tx_bytes += prEventResult->arTxRxAdmStatResult[Idx].au4TxBytesAdm[k];
-				rx_bytes += prEventResult->arTxRxAdmStatResult[Idx].au4RxBytesAdm[k];
+				tx_bytes_adm[k] = le2cpu32(get_unaligned(&prStat->au4TxBytesAdm[k]));
+				rx_bytes_adm[k] = le2cpu32(get_unaligned(&prStat->au4RxBytesAdm[k]));
+				tx_bytes += tx_bytes_adm[k];
+				rx_bytes += rx_bytes_adm[k];
 			}
 
 			/* sta counter by mpdu, per link */
@@ -7942,15 +7942,31 @@ static VOID uni_event_parse_all_sta_data_tx_retry_count(
 }
 #endif /* TXRX_STAT_SUPPORT */
 
+static UINT32 uni_event_all_sta_adm_record_len(UINT32 payload_len, UINT16 sta_num)
+{
+	UINT32 v1_len = sizeof(struct UNI_EVENT_ONE_STA_TXRX_ADM_STAT_T);
+	UINT32 v2_len = sizeof(struct UNI_EVENT_ONE_STA_TXRX_ADM_STAT_V2_T);
+	UINT32 max_sta = UNI_EVENT_ALL_STA_TXRX_ADM_STAT_PER_EVENT;
+
+	/* Firmware may send the full array or only the reported stations. */
+	if (payload_len == max_sta * v1_len || payload_len == sta_num * v1_len)
+		return v1_len;
+	if (payload_len == max_sta * v2_len || payload_len == sta_num * v2_len)
+		return v2_len;
+
+	return 0;
+}
+
 static BOOLEAN uni_event_validate_all_sta_tlv(
 	struct _RTMP_ADAPTER *pAd,
 	struct UNI_EVENT_ALL_STA_INFO_COMMON_T *tlv,
 	UINT32 tlv_available,
 	UINT16 *tag_out,
 	UINT16 *sta_num_out,
-	UINT32 *payload_len_out)
+	UINT32 *payload_len_out,
+	UINT32 *record_len_out)
 {
-	UINT16 tag, sta_num, tlv_len;
+	UINT16 tag = 0, sta_num = 0, tlv_len = 0;
 	UINT32 record_len = 0, payload_len, idx;
 	UINT16 wcid;
 	const char *reason = "invalid TLV";
@@ -7977,7 +7993,11 @@ static BOOLEAN uni_event_validate_all_sta_tlv(
 		record_len = sizeof(struct UNI_EVENT_ONE_STA_TX_STAT_T);
 		break;
 	case UNI_EVENT_ALL_STA_TXRX_ADM_STAT:
-		record_len = sizeof(struct UNI_EVENT_ONE_STA_TXRX_ADM_STAT_T);
+		record_len = uni_event_all_sta_adm_record_len(payload_len, sta_num);
+		if (!record_len) {
+			reason = "unsupported ADM record layout";
+			goto invalid;
+		}
 		break;
 	case UNI_EVENT_ALL_STA_TXRX_AIR_TIME:
 		record_len = sizeof(struct UNI_EVENT_ONE_STA_TXRX_AIR_TIME_T);
@@ -8017,10 +8037,14 @@ static BOOLEAN uni_event_validate_all_sta_tlv(
 	*tag_out = tag;
 	*sta_num_out = sta_num;
 	*payload_len_out = payload_len;
+	*record_len_out = record_len;
 	return TRUE;
 
 invalid:
-	pr_warn_ratelimited("mt_wifi: dropping malformed ALL_STA event: %s\n", reason);
+	pr_warn_ratelimited("mt_wifi: dropping malformed ALL_STA event: %s "
+		"tag=%u stations=%u tlv_len=%u available=%u record_len=%u\n", reason,
+		(unsigned int)tag, (unsigned int)sta_num, (unsigned int)tlv_len,
+		(unsigned int)tlv_available, (unsigned int)record_len);
 	return FALSE;
 }
 
@@ -8034,7 +8058,7 @@ VOID UniEventAllStaUnsolicitHandler(
 	struct UNI_EVENT_ALL_STA_INFO_COMMON_T *tlv;
 	struct _RTMP_ADAPTER *pAd;
 	UINT16 tag, sta_num;
-	UINT32 payload_len;
+	UINT32 payload_len, record_len;
 	UINT32 fixed_len = sizeof(*event);
 
 	if (!physical_dev || !pData) {
@@ -8056,7 +8080,7 @@ VOID UniEventAllStaUnsolicitHandler(
 	}
 
 	if (!uni_event_validate_all_sta_tlv(pAd, tlv, Length - fixed_len,
-			&tag, &sta_num, &payload_len))
+			&tag, &sta_num, &payload_len, &record_len))
 		return;
 
 	switch (tag) {
@@ -8069,7 +8093,7 @@ VOID UniEventAllStaUnsolicitHandler(
 		break;
 
 	case UNI_EVENT_ALL_STA_TXRX_ADM_STAT:
-		uni_event_parse_all_sta_txrx_adm_stat(pAd, &(tlv->au1AllStaContent[0]), sta_num, payload_len);
+		uni_event_parse_all_sta_txrx_adm_stat(pAd, &(tlv->au1AllStaContent[0]), sta_num, record_len);
 		break;
 
 	case UNI_EVENT_ALL_STA_TXRX_AIR_TIME:

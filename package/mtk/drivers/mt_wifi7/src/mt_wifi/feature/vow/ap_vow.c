@@ -1817,6 +1817,9 @@ VOID vow_mbss_grp_band_map(PRTMP_ADAPTER pad, struct wifi_dev *wdev)
 		/* MBSS <--> group 1 to 1 mapping, ex: SSID0 --> Group0 */
 		vow_group_band_map(pad, band_idx, group_idx);
 		pad->vow_bss_cfg[group_idx].band_idx = band_idx;
+		/* Match the generation limit in set_vow_group2band_map(). */
+		if (pad->vow_gen.VOW_GEN >= VOW_GEN_BESRA)
+			return;
 #ifdef WIFI_UNIFIED_COMMAND
 		if (pChipCap->uni_cmd_support)
 			uni_cmd_vow_set_at_estimator_group(pad, ENUM_AT_PROC_EST_GROUP_TO_BAND_MAPPING, group_idx);
