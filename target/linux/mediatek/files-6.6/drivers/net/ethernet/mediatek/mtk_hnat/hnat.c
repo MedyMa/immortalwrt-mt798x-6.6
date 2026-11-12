@@ -35,12 +35,15 @@
 
 struct mtk_hnat *hnat_priv;
 
+#define HNAT_ROAM_MAX_PENDING 128U
+
 struct hnat_roam_work {
 	struct work_struct work;
 	u8 mac[ETH_ALEN];
 };
 
 static struct workqueue_struct *hnat_roam_wq;
+static struct work_struct hnat_roam_recovery_work;
 static bool hnat_roam_enabled;
 static int hnat_roam_error;
 static atomic_t hnat_roam_pending = ATOMIC_INIT(0);
@@ -49,7 +52,10 @@ static atomic64_t hnat_roam_queued = ATOMIC64_INIT(0);
 static atomic64_t hnat_roam_completed = ATOMIC64_INIT(0);
 static atomic64_t hnat_roam_alloc_failed = ATOMIC64_INIT(0);
 static atomic64_t hnat_roam_queue_failed = ATOMIC64_INIT(0);
-static atomic64_t hnat_roam_deleted = ATOMIC64_INIT(0);
+static atomic64_t hnat_roam_matches = ATOMIC64_INIT(0);
+static atomic64_t hnat_roam_overflows = ATOMIC64_INIT(0);
+static atomic64_t hnat_roam_recovery_requests = ATOMIC64_INIT(0);
+static atomic64_t hnat_roam_recovery_runs = ATOMIC64_INIT(0);
 static bool hnat_pack_registered;
 static bool hnat_netdevice_registered;
 static bool hnat_netevent_registered;
@@ -471,7 +477,7 @@ static int entry_delete_by_mac_body(u8 *mac)
 					memset(entry, 0, sizeof(*entry));
 				hnat_cache_ebl(1);
 				if (debug_level >= 2)
-					pr_info("delete entry idx = %d\n", index);
+					pr_info("matched entry idx = %d\n", index);
 				ret++;
 			}
 		}
@@ -494,15 +500,31 @@ int entry_delete_by_mac(u8 *mac)
 	return ret;
 }
 
+static void hnat_roam_recovery_handler(struct work_struct *work)
+{
+	/* This existing path retires accounting owners and tunnel shadows before
+	 * invalidating cached bindings. Its timer restores hardware learning.
+	 */
+	foe_clear_all_bind_entries();
+	atomic64_inc(&hnat_roam_recovery_runs);
+}
+
+static void hnat_roam_recover(void)
+{
+	/* A fixed work item coalesces lost events without another allocation. */
+	atomic64_inc(&hnat_roam_recovery_requests);
+	queue_work(hnat_roam_wq, &hnat_roam_recovery_work);
+}
+
 static void hnat_roam_work_handler(struct work_struct *work)
 {
 	struct hnat_roam_work *roam = container_of(work, struct hnat_roam_work, work);
-	int deleted;
+	int matched;
 
-	/* Retain the callback admission and accounting-generation protections. */
-	deleted = entry_delete_by_mac(roam->mac);
-	if (deleted > 0)
-		atomic64_add(deleted, &hnat_roam_deleted);
+	/* Generation fencing may skip a matching slot that has been relearned. */
+	matched = entry_delete_by_mac(roam->mac);
+	if (matched > 0)
+		atomic64_add(matched, &hnat_roam_matches);
 	atomic64_inc(&hnat_roam_completed);
 	atomic_dec(&hnat_roam_pending);
 	kfree(roam);
@@ -529,24 +551,32 @@ static int hnat_roam_switchdev_event(struct notifier_block *nb,
 	if (debug_level >= 2)
 		pr_info("hnat: FDB delete mac=%pM port=%s\n", fdb_info->addr, dev->name);
 
+	if (!atomic_add_unless(&hnat_roam_pending, 1, HNAT_ROAM_MAX_PENDING)) {
+		atomic64_inc(&hnat_roam_overflows);
+		hnat_roam_recover();
+		return NOTIFY_DONE;
+	}
+
 	/* The notifier is atomic; own the MAC instead of retaining FDB/dev pointers. */
 	roam = kmalloc(sizeof(*roam), GFP_ATOMIC);
 	if (!roam) {
+		atomic_dec(&hnat_roam_pending);
 		atomic64_inc(&hnat_roam_alloc_failed);
-		pr_warn_ratelimited("hnat: FDB roaming event dropped: allocation failed\n");
+		hnat_roam_recover();
+		pr_warn_ratelimited("hnat: FDB roaming allocation failed; requesting recovery\n");
 		return NOTIFY_DONE;
 	}
 
 	ether_addr_copy(roam->mac, fdb_info->addr);
 	INIT_WORK(&roam->work, hnat_roam_work_handler);
-	atomic_inc(&hnat_roam_pending);
 	atomic64_inc(&hnat_roam_queued);
 	if (!queue_work(hnat_roam_wq, &roam->work)) {
 		atomic64_dec(&hnat_roam_queued);
 		atomic_dec(&hnat_roam_pending);
 		atomic64_inc(&hnat_roam_queue_failed);
 		kfree(roam);
-		pr_warn_ratelimited("hnat: FDB roaming event could not be queued\n");
+		hnat_roam_recover();
+		pr_warn_ratelimited("hnat: FDB roaming work could not be queued; requesting recovery\n");
 	}
 
 	return NOTIFY_DONE;
@@ -576,6 +606,7 @@ static int hnat_roaming_enable(void)
 		goto fail;
 	}
 
+	INIT_WORK(&hnat_roam_recovery_work, hnat_roam_recovery_handler);
 	ret = register_switchdev_notifier(&hnat_roam_switchdev_nb);
 	if (ret) {
 		destroy_workqueue(hnat_roam_wq);
@@ -614,9 +645,13 @@ void hnat_roaming_stats(struct seq_file *s)
 	seq_printf(s, "queued %lld\n", atomic64_read(&hnat_roam_queued));
 	seq_printf(s, "completed %lld\n", atomic64_read(&hnat_roam_completed));
 	seq_printf(s, "pending %d\n", atomic_read(&hnat_roam_pending));
+	seq_printf(s, "pending_limit %u\n", HNAT_ROAM_MAX_PENDING);
+	seq_printf(s, "overflow_events %lld\n", atomic64_read(&hnat_roam_overflows));
+	seq_printf(s, "recovery_requests %lld\n", atomic64_read(&hnat_roam_recovery_requests));
+	seq_printf(s, "recovery_work_runs %lld\n", atomic64_read(&hnat_roam_recovery_runs));
 	seq_printf(s, "allocation_failures %lld\n", atomic64_read(&hnat_roam_alloc_failed));
 	seq_printf(s, "queue_failures %lld\n", atomic64_read(&hnat_roam_queue_failed));
-	seq_printf(s, "entries_deleted %lld\n", atomic64_read(&hnat_roam_deleted));
+	seq_printf(s, "matched_entries %lld\n", atomic64_read(&hnat_roam_matches));
 }
 
 static int hnat_hw_init(u32 ppe_id)
