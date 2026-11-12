@@ -1044,6 +1044,9 @@ function buildForm(features, config) {
 	if (showShortcutFeCm)
 		o.value('shortcut_fe_cm', _('SFE connection manager'));
 	o.value('mediatek_hnat', features.hasMEDIATEKHNAT ? _('MediaTek HNAT') : _('MediaTek HNAT (try after save)'));
+	o.validate = function(section, value) {
+		return !features.hqosActive || value === 'mediatek_hnat' || _('请先关闭 HQoS 限速服务。');
+	};
 	o.default = config.fastpath || 'disabled';
 	o.widget = 'select';
 	o.rmempty = false;
@@ -1198,6 +1201,9 @@ function buildForm(features, config) {
 	if (showMediatekHnat) {
 		o = s.taboption('hnat', form.Flag, 'fastpath_mh_eth_hnat', _('Enable ethernet HNAT'),
 			_('Enable MediaTek HNAT hook_toggle; turboacc service writes kernel toggle after save & apply.'));
+		o.validate = function(section, value) {
+			return !features.hqosActive || value === '1' || _('请先关闭 HQoS 限速服务。');
+		};
 		o.default = o.enabled;
 		o.rmempty = false;
 		o.depends('fastpath', 'mediatek_hnat');

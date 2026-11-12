@@ -1,0 +1,137 @@
+From: MedyMa <75345465+MedyMa@users.noreply.github.com>
+Subject: [PATCH] net: mediatek: preserve and serialize the MT7988 HQoS queues
+
+Keep all 64 MT7988 hardware queues across FE recovery instead of only the
+16 native ring queues. Serialize debugfs page/MIB access with save, restore,
+DMA initialization and per-port shaping; release the lock before user copies.
+
+Signed-off-by: MedyMa <75345465+MedyMa@users.noreply.github.com>
+
+---
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -27,6 +27,8 @@
+ #define MTK_DSA_PORT_MASK	GENMASK(2, 0)
+ 
+ #define MTK_QDMA_NUM_QUEUES	16
++/* Native ring queues and MT7988 HQoS hardware queues are different spaces. */
++#define MTK_QDMA_HW_QUEUES	64
+ #define MTK_QDMA_QUEUE_MASK	((1ULL << MTK_QDMA_NUM_QUEUES) - 1)
+ #define MTK_QDMA_PAGE_SIZE	2048
+ #define MTK_MAX_RX_LENGTH	1536
+@@ -1214,8 +1216,8 @@
+ 				rate control for the Tx Scheduler
+  */
+ struct mtk_qdma_params {
+-	u32	qtx_cfg[MTK_QDMA_NUM_QUEUES];
+-	u32	qtx_sch[MTK_QDMA_NUM_QUEUES];
++	u32	qtx_cfg[MTK_QDMA_HW_QUEUES];
++	u32	qtx_sch[MTK_QDMA_HW_QUEUES];
+ 	u32	tx_sch[2];
+ };
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -1329,7 +1329,10 @@
+ 
+ out:
+ 	ofs = MTK_QTX_OFFSET * idx;
++	spin_lock_bh(&eth->page_lock);
++	mtk_w32(eth, 0, soc->reg_map->qdma.page);
+ 	mtk_w32(eth, val, soc->reg_map->qdma.qtx_sch + ofs);
++	spin_unlock_bh(&eth->page_lock);
+ }
+ 
+ static void mtk_gdm_mac_setup_eee(struct mtk_mac *mac, bool enable)
+@@ -3395,6 +3398,8 @@
+ 			soc->reg_map->qdma.crx_ptr);
+ 		mtk_w32(eth, ring->last_free_ptr, soc->reg_map->qdma.drx_ptr);
+ 
++		spin_lock_bh(&eth->page_lock);
++		mtk_w32(eth, 0, soc->reg_map->qdma.page);
+ 		for (i = 0, ofs = 0; i < MTK_QDMA_NUM_QUEUES; i++) {
+ 			val = (QDMA_RES_THRES << 8) | QDMA_RES_THRES;
+ 			mtk_w32(eth, val, soc->reg_map->qdma.qtx_cfg + ofs);
+@@ -3415,6 +3420,7 @@
+ 			mtk_w32(eth, val, soc->reg_map->qdma.qtx_sch + ofs);
+ 			ofs += MTK_QTX_OFFSET;
+ 		}
++		spin_unlock_bh(&eth->page_lock);
+ 		val = MTK_QDMA_TX_SCH_MAX_WFQ | (MTK_QDMA_TX_SCH_MAX_WFQ << 16);
+ 		mtk_w32(eth, val, soc->reg_map->qdma.tx_sch_rate);
+ 		if (mtk_is_netsys_v2_or_greater(eth))
+@@ -5002,17 +5008,28 @@
+ static void mtk_hw_dump_all(struct mtk_eth *eth)
+ {
+ 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+-	u32 id;
++	u32 id, regs[0x100 / sizeof(u32)];
++	unsigned int i;
+ 
+ 	mtk_hw_dump_reg(eth, "FE", 0x0, 0x600);
+ 	mtk_hw_dump_reg(eth, "FE", 0x1400, 0x300);
+ 	mtk_hw_dump_reg(eth, "ADMA", reg_map->pdma.rx_ptr, 0x300);
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA)) {
+ 		for (id = 0; id < MTK_QDMA_NUM_QUEUES / 16; id++) {
++			/* Snapshot the bank while locked; printing can take much longer. */
++			spin_lock_bh(&eth->page_lock);
+ 			mtk_w32(eth, id, reg_map->qdma.page);
+-			pr_info("\nQDMA PAGE:%x ", mtk_r32(eth, reg_map->qdma.page));
+-			mtk_hw_dump_reg(eth, "QDMA", reg_map->qdma.qtx_cfg, 0x100);
++			for (i = 0; i < ARRAY_SIZE(regs); i++)
++				regs[i] = mtk_r32(eth, reg_map->qdma.qtx_cfg + i * 4);
+ 			mtk_w32(eth, 0, reg_map->qdma.page);
++			spin_unlock_bh(&eth->page_lock);
++
++			pr_info("\nQDMA PAGE:%x ", id);
++			pr_info("\n==================== QDMA ====================\n");
++			for (i = 0; i < ARRAY_SIZE(regs); i += 4)
++				pr_info("0x%08x: %08x %08x %08x %08x\n",
++					reg_map->qdma.qtx_cfg + i * 4,
++					regs[i], regs[i + 1], regs[i + 2], regs[i + 3]);
+ 		}
+ 		mtk_hw_dump_reg(eth, "QDMA", reg_map->qdma.rx_ptr, 0x300);
+ 	}
+@@ -5780,9 +5797,12 @@
+ {
+ 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+ 	struct mtk_qdma_params *params = &eth->qdma_params;
++	unsigned int count = eth->soc->caps == MT7988_CAPS ?
++		MTK_QDMA_HW_QUEUES : MTK_QDMA_NUM_QUEUES;
+ 	int i;
+ 
+-	for (i = 0; i < MTK_QDMA_NUM_QUEUES; i++) {
++	spin_lock_bh(&eth->page_lock);
++	for (i = 0; i < count; i++) {
+ 		mtk_w32(eth, (i / MTK_QTX_PER_PAGE), reg_map->qdma.page);
+ 
+ 		params->qtx_cfg[i] =
+@@ -5798,15 +5818,19 @@
+ 	if (mtk_is_netsys_v2_or_greater(eth))
+ 		params->tx_sch[1] =
+ 			mtk_r32(eth, reg_map->qdma.tx_sch_rate + 0x4);
++	spin_unlock_bh(&eth->page_lock);
+ }
+ 
+ void mtk_restore_qdma_cfg(struct mtk_eth *eth)
+ {
+ 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+ 	struct mtk_qdma_params *params = &eth->qdma_params;
++	unsigned int count = eth->soc->caps == MT7988_CAPS ?
++		MTK_QDMA_HW_QUEUES : MTK_QDMA_NUM_QUEUES;
+ 	int i;
+ 
+-	for (i = 0; i < MTK_QDMA_NUM_QUEUES; i++) {
++	spin_lock_bh(&eth->page_lock);
++	for (i = 0; i < count; i++) {
+ 		mtk_w32(eth, (i / MTK_QTX_PER_PAGE), reg_map->qdma.page);
+ 
+ 		mtk_w32(eth, params->qtx_cfg[i],
+@@ -5822,6 +5846,7 @@
+ 	if (mtk_is_netsys_v2_or_greater(eth))
+ 		mtk_w32(eth, params->tx_sch[1],
+ 			reg_map->qdma.tx_sch_rate + 0x4);
++	spin_unlock_bh(&eth->page_lock);
+ }
+ 
+ static void mtk_prepare_for_reset(struct mtk_eth *eth)

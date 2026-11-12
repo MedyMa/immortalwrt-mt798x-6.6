@@ -1128,7 +1128,9 @@ static void mtk_hnat_nf_update(struct sk_buff *skb)
 	if (unlikely(!skb_hnat_is_hashed(skb)))
 		return ;
 		
-	if (unlikely(skb->mark == HNAT_EXCEPTION_TAG))
+	if (unlikely(skb->mark == HNAT_EXCEPTION_TAG ||
+		     (IS_HQOS_MODE && READ_ONCE(qos_user_owned) &&
+		      (skb->mark & HNAT_QOS_SOFTWARE_MARK))))
 		return ;
  
 	ct = nf_ct_get(skb, &ctinfo);
@@ -2278,7 +2280,7 @@ static u32 hnat_select_qid(const struct sk_buff *skb,
 			   const struct net_device *dev, int port_id,
 			   u8 dscp, u16 h_proto)
 {
-	u32 mark = skb->mark & MTK_QDMA_TX_MASK;
+	u32 mark = hnat_qos_queue_mark(skb) & MTK_QDMA_TX_MASK;
 	u32 qid;
 
 	/* A selected queue (including a routing mark's low bits) is already a
@@ -2286,7 +2288,8 @@ static u32 hnat_select_qid(const struct sk_buff *skb,
 	 * can exceed MTK_QDMA_TX_MASK, e.g. 0x50535731 + GMAC3 selects QID 64.
 	 */
 	if (IS_HQOS_MODE)
-		return dscp && hnat_priv->dscp_en ? (dscp >> 2) & MTK_QDMA_TX_MASK : mark;
+		return READ_ONCE(qos_user_owned) ? mark :
+		       dscp && hnat_priv->dscp_en ? (dscp >> 2) & MTK_QDMA_TX_MASK : mark;
 	/* PPPQ uses the Ethernet driver's queue map, not the wider manual
 	 * HNAT/HQoS namespace. Keep unrelated high routing-mark bits out of it.
 	 */
@@ -2736,7 +2739,8 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 						 MTK_HNAT_V2 ||
 						 hnat_priv->data->version ==
 						 MTK_HNAT_V3) ?
-						 skb->mark & 0x7f : skb->mark & 0xf;
+						 hnat_qos_queue_mark(skb) & 0x7f :
+						 hnat_qos_queue_mark(skb) & 0xf;
 #if defined(CONFIG_MEDIATEK_NETSYS_V3)
 					if ((IS_HQOS_UL_MODE && IS_WAN(dev)) ||
 					    (IS_HQOS_DL_MODE &&
@@ -4444,7 +4448,9 @@ static unsigned int mtk_hnat_nf_post_routing(
 	if (unlikely(!skb_hnat_is_hashed(skb)))
 		return hnat_diag_skip(skb, HNAT_DIAG_NO_FLOW_HASH);
 
-	if (unlikely(skb->mark == HNAT_EXCEPTION_TAG))
+	if (unlikely(skb->mark == HNAT_EXCEPTION_TAG ||
+		     (IS_HQOS_MODE && READ_ONCE(qos_user_owned) &&
+		      (skb->mark & HNAT_QOS_SOFTWARE_MARK))))
 		return hnat_diag_skip(skb, HNAT_DIAG_MARK_EXCLUDED);
 
 #if defined(CONFIG_MEDIATEK_NETSYS_V3)

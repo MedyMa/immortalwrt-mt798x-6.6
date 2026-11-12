@@ -832,7 +832,7 @@ define Device/hiveton-h5000m
   DEVICE_DTS_DIR := ../dts
   KERNEL_LOADADDR := 0x40080000
   DEVICE_PACKAGES := \
-	mt798x-2p5g-phy-firmware-internal wireless-regdb kmod-mediatek_hnat kmod-warp kmod-mt_wifi7 kmod-mt_hwifi kmod-mtk_pci kmod-mtk_wed kmod-connac_if kmod-mt7992 kmod-mt799a mtwifi-cfg luci-app-mtwifi-cfg luci-app-eqos-mtk luci-app-turboacc-mtk \
+	mt798x-2p5g-phy-firmware-internal wireless-regdb kmod-mediatek_hnat kmod-warp kmod-mt_wifi7 kmod-mt_hwifi kmod-mtk_pci kmod-mtk_wed kmod-connac_if kmod-mt7992 kmod-mt799a mtwifi-cfg luci-app-mtwifi-cfg luci-app-hqos-mtk luci-app-turboacc-mtk \
 	kmod-gpio-button-hotplug kmod-leds-gpio kmod-hwmon-pwmfan luci-light luci-app-Airpifanctrl \
 	kmod-crypto-hw-safexcel \
 	kmod-usb3 luci-app-modem sms-tool quectel-CM-5G kmod-usb-acm kmod-usb-net kmod-usb-net-cdc-ether kmod-usb-net-cdc-mbim kmod-usb-net-cdc-ncm kmod-usb-net-huawei-cdc-ncm kmod-usb-net-qmi-wwan kmod-usb-net-rndis kmod-usb-serial kmod-usb-serial-option kmod-usb-serial-qualcomm kmod-usb-serial-wwan kmod-usb-wdm

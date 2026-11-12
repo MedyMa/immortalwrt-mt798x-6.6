@@ -131,6 +131,8 @@ static ssize_t qdma_sched_show(struct file *file, char __user *user_buf,
 	if (!buf)
 		return -ENOMEM;
 
+	spin_lock_bh(&eth->page_lock);
+
 	if (mtk_is_netsys_v2_or_greater(eth))
 		qdma_tx_sch = mtk_r32(eth, soc->reg_map->qdma.tx_sch_rate + (id >> 1) * 0x4);
 	else
@@ -166,6 +168,9 @@ static ssize_t qdma_sched_show(struct file *file, char __user *user_buf,
 	len += scnprintf(buf + len, buf_len - len, "\n");
 	if (len > buf_len)
 		len = buf_len;
+
+	mtk_w32(eth, 0, soc->reg_map->qdma.page);
+	spin_unlock_bh(&eth->page_lock);
 
 	ret_cnt = simple_read_from_buffer(user_buf, count, ppos, buf, len);
 
@@ -218,6 +223,7 @@ static ssize_t qdma_sched_write(struct file *file, const char __user *buf,
 	if (id & 0x1)
 		shift = 16;
 
+	spin_lock_bh(&eth->page_lock);
 	if (mtk_is_netsys_v2_or_greater(eth))
 		qdma_tx_sch = mtk_r32(eth, soc->reg_map->qdma.tx_sch_rate + (id >> 1) * 0x4);
 	else
@@ -229,6 +235,8 @@ static ssize_t qdma_sched_write(struct file *file, const char __user *buf,
 		mtk_w32(eth, qdma_tx_sch, soc->reg_map->qdma.tx_sch_rate + (id >> 1) * 0x4);
 	else
 		mtk_w32(eth, qdma_tx_sch, soc->reg_map->qdma.tx_sch_rate);
+
+	spin_unlock_bh(&eth->page_lock);
 
 	size = strlen(line);
 	*offset += size;
@@ -260,6 +268,8 @@ static ssize_t qdma_queue_show(struct file *file, char __user *user_buf,
 	buf = kzalloc(buf_len, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
+
+	spin_lock_bh(&eth->page_lock);
 
 	mtk_w32(eth, (id / MTK_QTX_PER_PAGE), soc->reg_map->qdma.page);
 	qtx_cfg = mtk_r32(eth, soc->reg_map->qdma.qtx_cfg +
@@ -328,6 +338,9 @@ static ssize_t qdma_queue_show(struct file *file, char __user *user_buf,
 	if (len > buf_len)
 		len = buf_len;
 
+	mtk_w32(eth, 0, soc->reg_map->qdma.page);
+	spin_unlock_bh(&eth->page_lock);
+
 	ret_cnt = simple_read_from_buffer(user_buf, count, ppos, buf, len);
 
 	kfree(buf);
@@ -350,7 +363,6 @@ static ssize_t qdma_queue_write(struct file *file, const char __user *buf,
 	size_t size;
 	u32 qtx_sch = 0, qtx_cfg = 0;
 
-	mtk_w32(eth, (id / MTK_QTX_PER_PAGE), soc->reg_map->qdma.page);
 	if (length >= sizeof(line))
 		return -EINVAL;
 
@@ -409,6 +421,8 @@ static ssize_t qdma_queue_write(struct file *file, const char __user *buf,
 		qtx_sch |= FIELD_PREP(MTK_QTX_SCH_MAX_RATE_MAN, max_rate);
 		qtx_sch |= FIELD_PREP(MTK_QTX_SCH_MAX_RATE_EXP, max_exp);
 	}
+	spin_lock_bh(&eth->page_lock);
+	mtk_w32(eth, (id / MTK_QTX_PER_PAGE), soc->reg_map->qdma.page);
 	mtk_w32(eth, qtx_sch, soc->reg_map->qdma.qtx_sch +
 			      (id % MTK_QTX_PER_PAGE) * MTK_QTX_OFFSET);
 
@@ -419,6 +433,9 @@ static ssize_t qdma_queue_write(struct file *file, const char __user *buf,
 	qtx_cfg |= FIELD_PREP(MTK_QTX_CFG_SW_RESV, resv);
 	mtk_w32(eth, qtx_cfg, soc->reg_map->qdma.qtx_cfg +
 			      (id % MTK_QTX_PER_PAGE) * MTK_QTX_OFFSET);
+
+	mtk_w32(eth, 0, soc->reg_map->qdma.page);
+	spin_unlock_bh(&eth->page_lock);
 
 	size = strlen(line);
 	*offset += size;

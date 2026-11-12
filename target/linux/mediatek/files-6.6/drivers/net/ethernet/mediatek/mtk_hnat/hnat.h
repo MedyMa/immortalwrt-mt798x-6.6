@@ -900,6 +900,11 @@ struct hnat_flow_entry {
  * for the packet flow.
  */
 #define HNAT_EXCEPTION_TAG	0x99
+/* Shared with userspace HQoS: preserve routing bits while excluding software
+ * shaped flows from HNAT. This bit is active only in owned HQoS mode.
+ */
+#define HNAT_QOS_SOFTWARE_MARK	0x80
+#define HNAT_QOS_PACKET_MARK	0x4000
 
 struct mib_entry {
 	u32 byt_cnt_l;
@@ -1387,6 +1392,21 @@ extern int qos_ul_toggle;
 extern int hook_toggle;
 extern int mape_toggle;
 extern int qos_toggle;
+extern bool qos_user_owned;
+
+/* Only the explicit userspace packet namespace may select a managed QID.
+ * Unrelated proxy/PBR marks retain their routing meaning and use Q0.
+ */
+static inline u32 hnat_qos_queue_mark(const struct sk_buff *skb)
+{
+	u32 mark = skb->mark;
+
+	if (READ_ONCE(qos_user_owned) &&
+	    (mark & (0xffffU & ~MTK_QDMA_TX_MASK)) != HNAT_QOS_PACKET_MARK)
+		return 0;
+	return mark;
+}
+
 
 int ext_if_add(struct extdev_entry *ext_entry);
 int ext_if_del(struct extdev_entry *ext_entry);

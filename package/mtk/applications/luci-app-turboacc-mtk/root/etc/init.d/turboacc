@@ -90,13 +90,26 @@ default_fullcone_mode() {
 # ---------------------------------------------------------------------------
 # procd lifecycle
 # ---------------------------------------------------------------------------
+hqos_active() {
+	[ -f /var/run/mtk-hqos/baseline.json ] ||
+		[ -f /var/run/eqos.active ] || [ -f /var/run/eqos/mode ]
+}
+
+hnat_control_lock() {
+	[ "${MTK_HNAT_LOCK_HELD:-0}" = 1 ] && return 0
+	exec 9>/var/lock/mtk-hnat.lock || return 1
+	flock -x 9 || return 1
+	export MTK_HNAT_LOCK_HELD=1
+}
+
 stop_service() {
+	hnat_control_lock || return 1
 	local hnat_path="/sys/kernel/debug/hnat"
 
 	ensure_debugfs
 
-	# disable HNAT hook if still accessible
-	disable_hnat_runtime "$hnat_path"
+	# disable HNAT only when no QoS owner depends on its hooks
+	if ! hqos_active; then disable_hnat_runtime "$hnat_path"; fi
 
 	# restore fullcone to a safe default
 	if [ -w "/proc/sys/net/netfilter/nf_conntrack_nat_mode" ]; then
@@ -110,6 +123,7 @@ stop_service() {
 }
 
 start_service() {
+	hnat_control_lock || return 1
 	config_load "turboacc"
 
 	local fastpath
@@ -117,6 +131,13 @@ start_service() {
 	local fastpath_mh_eth_hnat="0"
 	config_get fastpath "config" "fastpath"
 	[ -n "$fastpath" ] || fastpath="none"
+	if hqos_active; then
+		config_get_bool fastpath_mh_eth_hnat config fastpath_mh_eth_hnat 1
+		if [ "$fastpath" != mediatek_hnat ] || [ "$fastpath_mh_eth_hnat" -ne 1 ]; then
+			logger -t turboacc "Stop HQoS before disabling HNAT or switching acceleration engines"
+			return 1
+		fi
+	fi
 
 	# ---------- pre-clean conflicting engines ----------
 	if [ "$fastpath" != "fast_classifier" ] && lsmod | grep -q "fast_classifier"; then

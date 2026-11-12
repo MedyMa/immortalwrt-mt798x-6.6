@@ -12,6 +12,8 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/capability.h>
+#include <linux/kstrtox.h>
 #include <linux/slab.h>
 #include <linux/dma-mapping.h>
 #include <linux/netdevice.h>
@@ -31,6 +33,7 @@ int dbg_cpu_reason;
 int hook_toggle;
 int mape_toggle;
 int qos_toggle;
+bool qos_user_owned;
 int qos_dl_toggle = 1;
 int qos_ul_toggle = 1;
 int xlat_toggle;
@@ -2618,24 +2621,22 @@ static void hnat_qos_toggle_usage(void)
 
 static int hnat_qos_toggle_read(struct seq_file *m, void *private)
 {
-	if (qos_toggle == 0) {
-		pr_info("HQoS is disabled now!\n");
-	} else if (qos_toggle == 1) {
-		pr_info("HQoS is enabled now!\n");
-		pr_info("HQoS uplink is %s now!\n",
-				qos_ul_toggle ? "enabled" : "disabled");
-		pr_info("HQoS downlink is %s now!\n",
-				qos_dl_toggle ? "enabled" : "disabled");
-	} else if (qos_toggle == 2) {
-		pr_info("Per-port-per-queue mode is enabled!\n");
-	}
+	struct mtk_hnat *h = m->private;
 
+	if (!h)
+		return -ENODEV;
+	seq_printf(m, "mode=%d\nuplink=%d\ndownlink=%d\ndscp_mapping=%d\n",
+		   READ_ONCE(qos_toggle), READ_ONCE(qos_ul_toggle),
+		   READ_ONCE(qos_dl_toggle), !!h->dscp_en);
+	seq_printf(m, "control_abi=1\nqueue_mask=%u\nqueue_first=%u\nsoftware_mark=%u\npacket_mark=%u\npacket_owned=%u\n",
+		   MTK_QDMA_TX_MASK, MTK_QDMA_NUM_QUEUES, HNAT_QOS_SOFTWARE_MARK,
+		   HNAT_QOS_PACKET_MARK, READ_ONCE(qos_user_owned));
 	return 0;
 }
 
 static int hnat_qos_toggle_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, hnat_qos_toggle_read, file->private_data);
+	return single_open(file, hnat_qos_toggle_read, inode->i_private);
 }
 
 void hnat_qos_shaper_ebl(u32 id, u32 enable)
@@ -2719,6 +2720,9 @@ static ssize_t hnat_qos_toggle_write(struct file *file, const char __user *buffe
 
 	buf[len] = '\0';
 
+	if (buf[0] == '0' || buf[0] == '1' || buf[0] == '2')
+		WRITE_ONCE(qos_user_owned, false);
+
 	if (buf[0] == '0') {
 		pr_info("HQoS is going to be disabled!\n");
 		qos_toggle = 0;
@@ -2775,6 +2779,60 @@ static const struct file_operations hnat_qos_toggle_fops = {
 	.llseek = seq_lseek,
 	.write = hnat_qos_toggle_write,
 	.release = single_release,
+};
+
+static const struct file_operations hnat_qos_status_fops = {
+	.owner = THIS_MODULE,
+	.open = hnat_qos_toggle_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+/* Userspace owns its QDMA snapshot. Do not reset unrelated queues when
+ * entering or leaving HQoS. A same-mode write only retires stale FOE bindings;
+ * it preserves conntrack state and never restarts the HNAT hooks.
+ */
+static ssize_t hnat_qos_control_write(struct file *file,
+				    const char __user *buffer, size_t count,
+				    loff_t *offset)
+{
+	struct mtk_hnat *h = file->private_data;
+	unsigned int mode;
+	int ret;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+	if (!count || count > 2)
+		return -EINVAL;
+	ret = kstrtouint_from_user(buffer, count, 10, &mode);
+	if (ret || mode > 2)
+		return ret ? ret : -EINVAL;
+
+	hnat_account_admin_lock();
+	/* drvdata is published after timer/accounting initialization and cleared
+	 * before debugfs removal. Removal drains active file operations first.
+	 */
+	if (!h || h != READ_ONCE(hnat_priv) || dev_get_drvdata(h->dev) != h) {
+		ret = -ENODEV;
+		goto out;
+	}
+	WRITE_ONCE(qos_user_owned, mode == 1);
+	WRITE_ONCE(qos_toggle, mode);
+	WRITE_ONCE(qos_ul_toggle, mode != 0);
+	WRITE_ONCE(qos_dl_toggle, mode != 0);
+	if (READ_ONCE(hook_toggle))
+		foe_clear_all_bind_entries();
+	ret = count;
+out:
+	hnat_account_admin_unlock();
+	return ret;
+}
+
+static const struct file_operations hnat_qos_control_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = hnat_qos_control_write,
 };
 
 static int hnat_version_read(struct seq_file *m, void *private)
@@ -3284,6 +3342,10 @@ int hnat_init_debugfs(struct mtk_hnat *h)
 			    &hnat_mape_toggle_fops);
 	debugfs_create_file("qos_toggle", 0444, root, h,
 			    &hnat_qos_toggle_fops);
+	debugfs_create_file("qos_status", 0444, root, h,
+			    &hnat_qos_status_fops);
+	debugfs_create_file("qos_control", 0200, root, h,
+			    &hnat_qos_control_fops);
 	debugfs_create_file("hnat_version", 0444, root, h,
 			    &hnat_version_fops);
 	debugfs_create_file("hnat_ppd_if", 0444, root, h,
