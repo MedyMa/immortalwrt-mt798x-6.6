@@ -1,0 +1,633 @@
+From: MedyMa <75345465+MedyMa@users.noreply.github.com>
+Subject: [PATCH] net: mediatek: complete FE recovery and preserve mux ownership
+
+Match the WiFi stop and N9-normal recovery phases, wait for an explicitly
+registered NPU client, and leave DMA untouched after missing quiesce ACKs.
+Bound all waits and make them cancelable before device teardown. A failed
+stop-to-reset fallback must resume WiFi with RESET_DONE, not START_TRAFFIC.
+
+Track each MAC's successful open so a failed mux/reset reopen cannot close
+another port's DMA reference. Retry failed mux opens and exclude switches
+during FE recovery. Keep diagnostic readers alive until their nodes drain,
+and handle an absent switch mapping without an uninitialized MMIO pointer.
+Serialize reset producers against teardown and drain failed probe paths
+with HNAT enabled as well. The proprietary HNAT owner remains independent
+of the upstream PPE.
+
+Signed-off-by: MedyMa <75345465+MedyMa@users.noreply.github.com>
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_dbg.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_dbg.c
+@@ -815,7 +815,7 @@
+ 		if (atomic_read(&eth->reset.force) && !test_bit(MTK_RESETTING, &eth->state))
+ 		{
+ 			eth->reset.event = MTK_FE_START_RESET;
+-			schedule_work(&eth->pending_work);
++			mtk_eth_queue_reset(eth);
+ 		}
+ 		else
+ 			pr_info(" stat:disable\n");
+@@ -826,7 +826,7 @@
+ 	case 3:
+ 		if (atomic_read(&eth->reset.force) && !test_bit(MTK_RESETTING, &eth->state)) {
+ 			eth->reset.event = MTK_FE_STOP_TRAFFIC;
+-			schedule_work(&eth->pending_work);
++			mtk_eth_queue_reset(eth);
+ 		} else
+ 			pr_info(" stat:disable\n");
+ 		break;
+@@ -892,6 +892,9 @@
+ {
+ 	debugfs_remove_recursive(eth_debug.root);
+ 	eth_debug.root = NULL;
++	/* proc users are drained by debug_proc_exit() before this call. */
++	if (READ_ONCE(g_eth) == eth)
++		WRITE_ONCE(g_eth, NULL);
+ }
+ 
+ int mtketh_debugfs_init(struct mtk_eth *eth)
+@@ -899,6 +902,8 @@
+ 	char name[16];
+ 	int i, ret = 0;
+ 
++	/* Queue files use this pointer: publish before exposing any file. */
++	WRITE_ONCE(g_eth, eth);
+ 	eth_debug.root = debugfs_create_dir("mtketh", NULL);
+ 	if (IS_ERR_OR_NULL(eth_debug.root)) {
+ 		ret = eth_debug.root ? PTR_ERR(eth_debug.root) : -ENOMEM;
+--- a/drivers/net/ethernet/mediatek/mtk_eth_reset.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_reset.c
+@@ -37,49 +37,107 @@
+ }
+ EXPORT_SYMBOL(mtk_set_pse_drop);
+ 
++/* Serialize the final queue operation with teardown, including atomic TX
++ * timeout producers that cannot be drained through the notifier chain.
++ */
++void mtk_eth_queue_reset(struct mtk_eth *eth)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&eth->reset.lock, flags);
++	if (!test_bit(MTK_STOPPING, &eth->state) &&
++	    !test_bit(MTK_RESETTING, &eth->state))
++		schedule_work(&eth->pending_work);
++	spin_unlock_irqrestore(&eth->reset.lock, flags);
++}
++
++bool mtk_eth_reset_stop(struct mtk_eth *eth)
++{
++	unsigned long flags;
++	bool stopping;
++
++	spin_lock_irqsave(&eth->reset.lock, flags);
++	stopping = test_and_set_bit(MTK_STOPPING, &eth->state);
++	spin_unlock_irqrestore(&eth->reset.lock, flags);
++	return stopping;
++}
++
++/* The notifier and its callers serialize reset phase changes with RTNL. */
++void mtk_eth_reset_prepare(struct mtk_eth *eth, u8 phase)
++{
++	ASSERT_RTNL();
++	eth->reset.wait_phase = phase;
++	mtk_rest_cnt = mtk_wifi_num;
++	if (phase == MTK_WIFI_WAIT_FINISH)
++		reinit_completion(&wait_ack_done);
++	else {
++		reinit_completion(&wait_ser_done);
++		mtk_stop_fail = false;
++	}
++}
++
+ int mtk_eth_netdevice_event(struct notifier_block *n, unsigned long event, void *ptr)
+ {
+ 	struct mtk_eth *eth = container_of(n, struct mtk_eth, reset.netdevice_notifier);
+ 
+ 	switch (event) {
++	case MTK_TOPS_ONLINE:
++		WRITE_ONCE(eth->reset.npu_present, true);
++		break;
++	case MTK_TOPS_OFFLINE:
++		WRITE_ONCE(eth->reset.npu_present, false);
++		break;
++	case MTK_TOPS_RESET_FAILED:
++		if (eth->reset.npu_waiting)
++			WRITE_ONCE(eth->reset.npu_failed, true);
++		break;
+ 	case MTK_TOPS_DUMP_DONE:
+-		complete(&wait_tops_done);
++		if (eth->reset.npu_waiting)
++			complete(&wait_tops_done);
+ 		break;
+ 	case MTK_WIFI_RESET_DONE:
+ 	case MTK_FE_STOP_TRAFFIC_DONE:
++		if ((event == MTK_WIFI_RESET_DONE &&
++		     eth->reset.wait_phase != MTK_WIFI_WAIT_RESET) ||
++		    (event == MTK_FE_STOP_TRAFFIC_DONE &&
++		     eth->reset.wait_phase != MTK_WIFI_WAIT_STOP) ||
++		    mtk_rest_cnt <= 0)
++			break;
+ 		pr_info("%s rcv done event:%lx\n", __func__, event);
+-		mtk_rest_cnt--;
+-		if (!mtk_rest_cnt) {
++		if (!--mtk_rest_cnt)
+ 			complete(&wait_ser_done);
+-			mtk_rest_cnt = mtk_wifi_num;
+-		}
+ 		break;
+ 	case MTK_WIFI_CHIP_ONLINE:
+ 		mtk_wifi_num++;
+-		mtk_rest_cnt = mtk_wifi_num;
+ 		break;
+ 	case MTK_WIFI_CHIP_OFFLINE:
+-		mtk_wifi_num--;
+-		mtk_rest_cnt = mtk_wifi_num;
++		if (mtk_wifi_num > 0)
++			mtk_wifi_num--;
++		/* Do not mistake unregistering a client for a DMA-stop ACK. */
+ 		break;
+ 	case MTK_FE_STOP_TRAFFIC_DONE_FAIL:
++		if (eth->reset.wait_phase != MTK_WIFI_WAIT_STOP)
++			break;
+ 		mtk_stop_fail = true;
+ 		mtk_reset_flag = MTK_FE_START_RESET;
+ 		pr_info("%s rcv done event:%lx\n", __func__, event);
+ 		complete(&wait_ser_done);
+-		mtk_rest_cnt = mtk_wifi_num;
+ 		break;
+ 	case MTK_FE_START_RESET_INIT:
+ 		pr_info("%s rcv fe start reset init event:%lx\n", __func__, event);
+ 		if (!test_bit(MTK_RESETTING, &eth->state) &&
+ 		    !test_bit(MTK_STOPPING, &eth->state)) {
+ 			mtk_reset_flag = MTK_FE_START_RESET;
+-			schedule_work(&eth->pending_work);
++			mtk_eth_queue_reset(eth);
+ 		}
+ 		break;
+ 	case MTK_WIFI_L1SER_DONE:
++		if (eth->reset.wait_phase != MTK_WIFI_WAIT_FINISH ||
++		    mtk_rest_cnt <= 0)
++			break;
+ 		pr_info("%s rcv wifi done ack :%lx\n", __func__, event);
+-		complete(&wait_ack_done);
++		if (!--mtk_rest_cnt)
++			complete(&wait_ack_done);
+ 		break;
+ 	default:
+ 		break;
+@@ -107,6 +165,4 @@
+ 		unregister_netdevice_notifier(&eth->reset.netdevice_notifier);
+ 		eth->reset.notifier_registered = false;
+ 	}
+-	if (READ_ONCE(g_eth) == eth)
+-		WRITE_ONCE(g_eth, NULL);
+ }
+--- a/drivers/net/ethernet/mediatek/mtk_eth_reset.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_reset.h
+@@ -20,7 +20,21 @@
+ #define MTK_FE_START_RESET_INIT		(0x2009)
+ #define MTK_WIFI_L1SER_DONE		(0x200a)
+ #define MTK_TOPS_DUMP_DONE		(0x3001)
++#define MTK_TOPS_ONLINE			(0x3002)
++#define MTK_TOPS_OFFLINE		(0x3003)
++#define MTK_TOPS_RESET_FAILED		(0x3004)
+ #define MTK_FE_RESET_NAT_DONE		(0x4001)
++
++enum mtk_wifi_wait_phase {
++	MTK_WIFI_WAIT_NONE,
++	MTK_WIFI_WAIT_STOP,
++	MTK_WIFI_WAIT_RESET,
++	MTK_WIFI_WAIT_FINISH,
++};
++
++void mtk_eth_queue_reset(struct mtk_eth *eth);
++bool mtk_eth_reset_stop(struct mtk_eth *eth);
++void mtk_eth_reset_prepare(struct mtk_eth *eth, u8 phase);
+ 
+ extern struct completion wait_ser_done;
+ extern struct completion wait_ack_done;
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -1091,7 +1091,7 @@
+ 			     mac->interface == PHY_INTERFACE_MODE_NA) &&
+ 			    !mtk_check_gmac23_idle(mac) &&
+ 			    !test_bit(MTK_RESETTING, &eth->state))
+-				schedule_work(&eth->pending_work);
++				mtk_eth_queue_reset(eth);
+ 		}
+ 	}
+ 
+@@ -4418,7 +4418,7 @@
+ 	netif_err(eth, tx_err, dev, "transmit timed out\n");
+ 
+ 	if (atomic_read(&eth->reset.force))
+-		schedule_work(&eth->pending_work);
++		mtk_eth_queue_reset(eth);
+ }
+ 
+ static irqreturn_t mtk_handle_irq_rx(int irq, void *priv)
+@@ -4632,6 +4632,11 @@
+ 	struct mtk_eth *eth = mac->hw;
+ 	struct mtk_mac *target_mac;
+ 	int i, err, ppe_num, mtu;
++
++	if (test_bit(MTK_STOPPING, &eth->state))
++		return -ENODEV;
++	if (mac->started)
++		return 0;
+ 
+ 	ppe_num = eth->soc->ppe_num;
+ 
+@@ -4708,6 +4713,7 @@
+ 		refcount_inc(&eth->dma_refcnt);
+ 	}
+ 
++	WRITE_ONCE(mac->started, true);
+ 	phylink_start(mac->phylink);
+ 	netif_tx_start_all_queues(dev);
+ 
+@@ -4779,6 +4785,10 @@
+ 	struct mtk_eth *eth = mac->hw;
+ 	int i;
+ 
++	/* A failed internal reopen owns neither DMA nor an enabled NAPI. */
++	if (!mac->started)
++		return 0;
++	WRITE_ONCE(mac->started, false);
+ 	phylink_stop(mac->phylink);
+ 
+ 	netif_tx_disable(dev);
+@@ -5435,7 +5445,7 @@
+ 
+ 	/* DMA stuck checks */
+ 	if (mtk_hw_check_dma_hang(eth) && atomic_read(&eth->reset.force))
+-		schedule_work(&eth->pending_work);
++		mtk_eth_queue_reset(eth);
+ 
+ out:
+ 	if (!test_bit(MTK_STOPPING, &eth->state))
+@@ -5757,24 +5767,17 @@
+ static void mt7988_esw_iomap(struct mtk_eth *eth)
+ {
+ 	struct device_node *np;
+-	void __iomem *base;
+ 
+ 	np = of_find_compatible_node(NULL, NULL, "mediatek,mt7988-switch");
+-	if (!np) {
+-		/* check the GSW node if the DSA node does not exist */
+-		of_find_compatible_node(NULL, NULL, "mediatek,mt7988-gsw-switch");
+-	}
+-
+-	if (np) {
+-		base = of_iomap(np, 0);
+-		if (IS_ERR(base)) {
+-			dev_err(eth->dev, "failed to map esw base address\n");
+-			goto out;
+-		}
+-	}
+-
+-	eth->esw_base = base;
+-out:
++	if (!np)
++		np = of_find_compatible_node(NULL, NULL,
++					     "mediatek,mt7988-gsw-switch");
++	if (!np)
++		return;
++
++	eth->esw_base = of_iomap(np, 0);
++	if (!eth->esw_base)
++		dev_warn(eth->dev, "failed to map esw base address\n");
+ 	of_node_put(np);
+ }
+ 
+@@ -5890,29 +5893,66 @@
+ 	}
+ }
+ 
++/* Never free DMA after a missing WiFi stop ACK. Teardown can cancel a wait
++ * promptly; a live timeout leaves RESETTING set and requires explicit recovery.
++ */
++static bool mtk_wait_for_reset_ack(struct mtk_eth *eth, struct completion *done,
++			      const char *phase)
++{
++	unsigned long deadline = jiffies + msecs_to_jiffies(30000);
++
++	while (!test_bit(MTK_STOPPING, &eth->state)) {
++		if (done == &wait_tops_done &&
++		    (!READ_ONCE(eth->reset.npu_present) || READ_ONCE(eth->reset.npu_failed)))
++			return false;
++		if (wait_for_completion_timeout(done, msecs_to_jiffies(100)))
++			return !test_bit(MTK_STOPPING, &eth->state);
++		if (time_after_eq(jiffies, deadline)) {
++			dev_err(eth->dev, "FE reset timed out waiting for %s; keeping reset blocked\n",
++				phase);
++			break;
++		}
++	}
++	return false;
++}
++
+ static void mtk_pending_work(struct work_struct *work)
+ {
+ 	struct mtk_eth *eth = container_of(work, struct mtk_eth, pending_work);
+ 	unsigned long restart = 0;
++	bool wait_wifi;
++	u32 reset_event;
++	unsigned long flags;
+ 	int i;
+ 
+ 	rtnl_lock();
++	spin_lock_irqsave(&eth->reset.lock, flags);
+ 	if (test_bit(MTK_STOPPING, &eth->state)) {
++		spin_unlock_irqrestore(&eth->reset.lock, flags);
+ 		rtnl_unlock();
+ 		return;
+ 	}
+ 	set_bit(MTK_RESETTING, &eth->state);
++	reset_event = READ_ONCE(eth->reset.event);
++	spin_unlock_irqrestore(&eth->reset.lock, flags);
+ 
+ 	mtk_hw_dump_all(eth);
+ 
+ 	mtk_save_qdma_cfg(eth);
++	eth->reset.npu_failed = false;
++	eth->reset.npu_waiting = eth->reset.npu_present;
++	if (eth->reset.npu_waiting)
++		reinit_completion(&wait_tops_done);
+ 	mtk_prepare_for_reset(eth);
+ 	for (i = 0; i < MTK_MAX_DEVS; i++) {
+ 		if (!eth->netdev[i])
+ 			continue;
+ 
+-		pr_info("send event:%x !\n", eth->reset.event);
+-		if (eth->reset.event == MTK_FE_STOP_TRAFFIC)
++		mtk_eth_reset_prepare(eth, reset_event == MTK_FE_STOP_TRAFFIC ?
++				      MTK_WIFI_WAIT_STOP : MTK_WIFI_WAIT_RESET);
++		wait_wifi = mtk_wifi_num > 0;
++		pr_info("send event:%x !\n", reset_event);
++		if (reset_event == MTK_FE_STOP_TRAFFIC)
+ 			call_netdevice_notifiers(MTK_FE_STOP_TRAFFIC,
+ 						 eth->netdev[i]);
+ 		else
+@@ -5920,23 +5960,38 @@
+ 						 eth->netdev[i]);
+ 
+ 		rtnl_unlock();
+-		if (mtk_wifi_num > 0) {
++		if (wait_wifi) {
+ 			pr_info("waiting event from wifi\n");
+-			wait_for_completion(&wait_ser_done);
++			if (!mtk_wait_for_reset_ack(eth, &wait_ser_done, "WiFi DMA stop"))
++				goto reset_wait_failed;
+ 			if (mtk_is_netsys_v3_or_greater(eth) && mtk_stop_fail) {
+ 				rtnl_lock();
++				if (test_bit(MTK_STOPPING, &eth->state))
++					goto reset_aborted;
++				reset_event = MTK_FE_START_RESET;
++				WRITE_ONCE(eth->reset.event, reset_event);
++				mtk_eth_reset_prepare(eth, MTK_WIFI_WAIT_RESET);
+ 				call_netdevice_notifiers(MTK_FE_START_RESET,
+ 							 eth->netdev[i]);
+ 				rtnl_unlock();
+ 				pr_info("waiting event when stop fail\n");
+-				wait_for_completion(&wait_ser_done);
++				if (!mtk_wait_for_reset_ack(eth, &wait_ser_done, "WiFi fallback DMA stop"))
++					goto reset_wait_failed;
+ 				mtk_stop_fail = 0;
+ 			}
+ 		}
+-		if (!try_wait_for_completion(&wait_tops_done))
+-			pr_warn("wait for TOPS response timeout !\n");
++		if (eth->reset.npu_waiting &&
++		    !mtk_wait_for_reset_ack(eth, &wait_tops_done, "NPU quiesce"))
++			goto reset_wait_failed;
+ 		rtnl_lock();
++		if (test_bit(MTK_STOPPING, &eth->state))
++			goto reset_aborted;
+ 		break;
++	}
++	if (eth->reset.npu_waiting &&
++	    (!eth->reset.npu_present || eth->reset.npu_failed)) {
++		dev_err(eth->dev, "NPU quiesce no longer valid; aborting FE reset\n");
++		goto reset_aborted;
+ 	}
+ 	//mtk_wed_fe_reset();
+ 	/* Run again reset preliminary configuration in order to avoid any
+@@ -5991,11 +6046,12 @@
+ 		if (!eth->netdev[i])
+ 			continue;
+ 
+-		if (eth->reset.event == MTK_FE_STOP_TRAFFIC) {
++		if (reset_event == MTK_FE_STOP_TRAFFIC) {
+ 			pr_info("send MTK_FE_START_TRAFFIC event !\n");
+ 			call_netdevice_notifiers(MTK_FE_START_TRAFFIC,
+ 						 eth->netdev[i]);
+ 		} else {
++			mtk_eth_reset_prepare(eth, MTK_WIFI_WAIT_FINISH);
+ 			pr_info("send MTK_FE_RESET_DONE event !\n");
+ 			call_netdevice_notifiers(MTK_FE_RESET_DONE,
+ 						 eth->netdev[i]);
+@@ -6003,19 +6059,37 @@
+ 			if (mtk_is_netsys_v3_or_greater(eth) && mtk_wifi_num > 0) {
+ 				pr_info("waiting done ack from wifi\n");
+ 				rtnl_unlock();
+-				wait_for_completion(&wait_ack_done);
++				if (!mtk_wait_for_reset_ack(eth, &wait_ack_done, "WiFi recovery complete"))
++					goto reset_wait_failed;
+ 				rtnl_lock();
++				if (test_bit(MTK_STOPPING, &eth->state))
++					goto reset_aborted;
+ 			}
+ 		}
+ 		call_netdevice_notifiers(MTK_FE_RESET_NAT_DONE,
+ 					 eth->netdev[i]);
+ 		break;
+ 	}
++	eth->reset.wait_phase = MTK_WIFI_WAIT_NONE;
++	eth->reset.npu_waiting = false;
+ 	clear_bit(MTK_RESETTING, &eth->state);
+ 
+ 	mtk_wed_fe_reset_complete();
+ 	mtk_restore_qdma_cfg(eth);
+ 
++	rtnl_unlock();
++	return;
++
++reset_wait_failed:
++	rtnl_lock();
++reset_aborted:
++	eth->reset.wait_phase = MTK_WIFI_WAIT_NONE;
++	eth->reset.npu_waiting = false;
++	/* No forced DMA teardown or success notification after a failed ACK. */
++	for (i = 0; i < MTK_MAX_DEVS; i++) {
++		if (eth->netdev[i])
++			netif_tx_stop_all_queues(eth->netdev[i]);
++	}
+ 	rtnl_unlock();
+ }
+ 
+@@ -6522,7 +6596,8 @@
+ 	struct mtk_eth *eth = mac->hw;
+ 	struct net_device *dev = eth->netdev[mac->id];
+ 	unsigned int new_channel;
+-	int sfp_present;
++	unsigned long delay = msecs_to_jiffies(100);
++	int sfp_present, err;
+ 
+ 	if (test_bit(MTK_STOPPING, &eth->state))
+ 		return;
+@@ -6535,11 +6610,12 @@
+ 		goto reschedule;
+ 	new_channel = sfp_present ? mux->sfp_present_channel : !mux->sfp_present_channel;
+ 
+-	if (mux->channel == new_channel || !netif_running(dev))
++	if ((mux->channel == new_channel && READ_ONCE(mac->started)) || !netif_running(dev))
+ 		goto reschedule;
+ 
+ 	rtnl_lock();
+-	if (test_bit(MTK_STOPPING, &eth->state) || !netif_running(dev)) {
++	if (test_bit(MTK_STOPPING, &eth->state) ||
++	    test_bit(MTK_RESETTING, &eth->state) || !netif_running(dev)) {
+ 		rtnl_unlock();
+ 		goto reschedule;
+ 	}
+@@ -6553,15 +6629,18 @@
+ 
+ 	gpiod_set_value_cansleep(mux->chan_sel_gpio, new_channel);
+ 
+-	mtk_open(dev);
+-
++	err = mtk_open(dev);
++	if (err) {
++		netdev_err(dev, "mux channel %u reopen failed: %d; retrying\n",
++			   new_channel, err);
++		delay = msecs_to_jiffies(1000);
++	}
++	mux->channel = new_channel;
+ 	rtnl_unlock();
+-
+-	mux->channel = new_channel;
+ 
+ reschedule:
+ 	if (!test_bit(MTK_STOPPING, &eth->state))
+-		mod_delayed_work(system_wq, &mux->poll, msecs_to_jiffies(100));
++		mod_delayed_work(system_wq, &mux->poll, delay);
+ }
+ 
+ static int mtk_add_mux_channel(struct mtk_mux *mux, struct device_node *np)
+@@ -7065,6 +7144,22 @@
+ 	}
+ }
+ 
++static void mtk_quiesce_work(struct mtk_eth *eth)
++{
++	int i;
++
++	if (mtk_eth_reset_stop(eth))
++		return;
++	mtk_unregister_notifier(eth);
++	mtk_eth_netdevice_event_deinit(eth);
++	for (i = 0; i < MTK_MAX_DEVS; i++) {
++		if (eth->mux[i])
++			cancel_delayed_work_sync(&eth->mux[i]->poll);
++	}
++	cancel_delayed_work_sync(&eth->reset.monitor_work);
++	cancel_work_sync(&eth->pending_work);
++}
++
+ static int mtk_probe(struct platform_device *pdev)
+ {
+ 	struct resource *res = NULL, *res_sram;
+@@ -7120,6 +7215,7 @@
+ 	}
+ 
+ 	spin_lock_init(&eth->page_lock);
++	spin_lock_init(&eth->reset.lock);
+ 	spin_lock_init(&eth->tx_irq_lock);
+ 	spin_lock_init(&eth->rx_irq_lock);
+ 	spin_lock_init(&eth->dim_lock);
+@@ -7477,20 +7573,26 @@
+ 	return 0;
+ 
+ err_unreg_netdev:
++	mtk_quiesce_work(eth);
+ 	mtk_unreg_dev(eth);
+ #if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
+-	cancel_work_sync(&eth->pending_work);
+ 	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
+ 		mtk_ppe_stop(eth->ppe[i]);
+ #endif
+-	mtk_napi_del(eth);
+-	free_netdev(eth->dummy_dev);
++	if (eth->dummy_dev) {
++		mtk_napi_del(eth);
++		free_netdev(eth->dummy_dev);
++		eth->dummy_dev = NULL;
++	}
+ err_deinit_ppe:
++	mtk_quiesce_work(eth);
++#if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
+ 	mtk_ppe_deinit(eth);
++#endif
+ 	mtk_release_all_muxes(eth);
+ 	mtk_mdio_cleanup(eth);
+ err_free_dev:
+-	mtk_unregister_notifier(eth);
++	mtk_quiesce_work(eth);
+ 	mtk_free_dev(eth);
+ 	if (eth->esw_base)
+ 		iounmap(eth->esw_base);
+@@ -7509,17 +7611,9 @@
+ 	int i;
+ 
+ 	/* Drain producers before unregistering ports or releasing PCS objects. */
+-	set_bit(MTK_STOPPING, &eth->state);
++	mtk_quiesce_work(eth);
+ 	debug_proc_exit();
+ 	mtketh_debugfs_exit(eth);
+-	mtk_unregister_notifier(eth);
+-	for (i = 0; i < MTK_MAX_DEVS; i++) {
+-		if (eth->mux[i])
+-			cancel_delayed_work_sync(&eth->mux[i]->poll);
+-	}
+-	cancel_delayed_work_sync(&eth->reset.monitor_work);
+-	cancel_work_sync(&eth->pending_work);
+-	mtk_eth_netdevice_event_deinit(eth);
+ 
+ 	/* unregister_netdev() closes each running port under RTNL, while its
+ 	 * NAPI, phylink and PCS dependencies are still alive.
+@@ -7534,7 +7628,9 @@
+ 	mtk_wed_exit();
+ 	mtk_cleanup(eth);
+ 	free_netdev(eth->dummy_dev);
++#if !defined(CONFIG_NET_MEDIATEK_HNAT) && !defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
+ 	mtk_ppe_deinit(eth);
++#endif
+ 	mtk_mdio_cleanup(eth);
+ 	mtk_hw_deinit(eth);
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1691,8 +1691,13 @@
+ 
+ 	struct {
+ 		struct delayed_work monitor_work;
++		spinlock_t lock;
+ 		struct notifier_block netdevice_notifier;
+ 		bool notifier_registered;
++		u8 wait_phase;
++		bool npu_present;
++		bool npu_waiting;
++		bool npu_failed;
+ 		atomic_t force;
+ 		u32 event;
+ 		u32 wdidx[3];
+@@ -1741,6 +1746,7 @@
+ 	u32				tx_lpi_timer;
+ 	struct notifier_block		device_notifier;
+ 	bool				notifier_registered;
++	bool				started;
+ };
+ 
+ /* struct mtk_mux_data -	the structure that holds the private data about the

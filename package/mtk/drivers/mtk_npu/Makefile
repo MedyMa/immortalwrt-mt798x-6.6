@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mtk_npu
-PKG_RELEASE:=12
+PKG_RELEASE:=13
 PKG_BUILD_DEPENDS:=pce
 PKG_FILE_DEPENDS:=$(CURDIR)/src/ $(CURDIR)/firmware/
 SCAN_DEPS = *.mk Config*.in

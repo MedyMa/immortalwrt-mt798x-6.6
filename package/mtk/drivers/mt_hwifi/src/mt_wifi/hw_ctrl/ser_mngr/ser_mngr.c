@@ -306,16 +306,31 @@ void ser_ack_event(
 
 	if (ack_event > BIT(10)) {
 #ifdef MTK_FE_RESET_RECOVER
-		pAd2 = ser_get_fe_pAd_by_mainpAd(main_pAd);
 		rtnl_lock();
+		pAd2 = ser_get_fe_pAd_by_mainpAd(main_pAd);
+		if (!pAd2 || !pAd2->net_dev)
+			goto fe_unlock;
+		if (ack_event == MTK_WIFI_L1SER_DONE) {
+			struct mtk_notifier_block *nb =
+				&main_pAd->physical_dev->ErrRecoveryCtl.mtk_nb;
+
+			if (nb->reset_pending) {
+				nb->reset_pending = FALSE;
+				call_netdevice_notifiers(MTK_WIFI_L1SER_DONE, pAd2->net_dev);
+			}
+			goto fe_unlock;
+		}
 		if (ack_event == FE_WIFI_RESET_DONE)
 			call_netdevice_notifiers(MTK_WIFI_RESET_DONE, pAd2->net_dev);
 		if (ack_event == FE_WIFI_TARFFIC_DONE)
 			call_netdevice_notifiers(MTK_FE_STOP_TRAFFIC_DONE, pAd2->net_dev);
 		if (ack_event == FE_WIFI_TARFFIC_DONE_FAIL)
 			call_netdevice_notifiers(MTK_FE_STOP_TRAFFIC_DONE_FAIL, pAd2->net_dev);
-		if (ack_event == FE_WIFI_WDMA_FAIL_RESET)
+		if (ack_event == FE_WIFI_WDMA_FAIL_RESET) {
+			main_pAd->physical_dev->ErrRecoveryCtl.mtk_nb.reset_pending = FALSE;
 			call_netdevice_notifiers(MTK_FE_START_RESET_INIT, pAd2->net_dev);
+		}
+fe_unlock:
 		rtnl_unlock();
 #endif
 	} else {
@@ -838,6 +853,16 @@ static int ser_handler(
 	if (_ser_handler)
 		_ser_handler(ser_cb);
 
+#ifdef MTK_FE_RESET_RECOVER
+	/* The FE waits for this host ACK after resuming the stopped L1 SER.
+	 * Only an actual N9-normal transition counts, never a timeout/re-entry.
+	 */
+	if (level == SER_LV_1_0 && state == SER_LV_1_0_STATE_WAIT_N9_NORMAL &&
+	    (event & SER_LV_1_0_EVT_N9_NORMAL_STATE) &&
+	    !(event & SER_LV_1_0_EVT_STOP_PDMA) &&
+	    ser_get_ser_state(ser_cb) == SER_LV_1_0_STATE_STOP_IDLE)
+		ser_ack_event(ser_cb, MTK_WIFI_L1SER_DONE);
+#endif
 	return NDIS_STATUS_SUCCESS;
 }
 

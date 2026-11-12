@@ -338,8 +338,13 @@ static int mtk_fe_event(struct notifier_block *this, unsigned long event, void *
 {
 	struct mtk_notifier_block *nb = (struct mtk_notifier_block *)this;
 	RTMP_ADAPTER *pAd = nb->priv;
-	struct physical_device *device = pAd->physical_dev;
-	P_ERR_RECOVERY_CTRL_T pErrRecoveryCtrl = &device->ErrRecoveryCtl;
+	struct physical_device *device;
+	P_ERR_RECOVERY_CTRL_T pErrRecoveryCtrl;
+
+	if (!pAd)
+		return NOTIFY_DONE;
+	device = pAd->physical_dev;
+	pErrRecoveryCtrl = &device->ErrRecoveryCtl;
 
 	if (!RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_START_UP))
 		return NOTIFY_DONE;
@@ -348,8 +353,11 @@ static int mtk_fe_event(struct notifier_block *this, unsigned long event, void *
 	case MTK_FE_START_RESET:
 		MTWF_DBG(pAd, DBG_CAT_HW, CATHW_SER, DBG_LVL_ERROR,
 			"receive fe reset(hang) event, trigger ser by FE\n");
+		nb->reset_pending = TRUE;
 		atomic_set(&pErrRecoveryCtrl->notify_fe, 1);
-		ser_event_enq(device->chip_id, FE_WDMA_RESET, SER_FE_STOP, device->hw_id);
+		if (ser_event_enq(device->chip_id, FE_WDMA_RESET, SER_FE_STOP,
+				  device->hw_id) != NDIS_STATUS_SUCCESS)
+			nb->reset_pending = FALSE;
 		break;
 
 	case MTK_FE_RESET_DONE:
@@ -386,36 +394,48 @@ unsigned int mtk_fe_reset_notifier_init(struct physical_device *device)
 	struct mtk_notifier_block *mtk_nb = &pErrRecoveryCtrl->mtk_nb;
 	struct _RTMP_ADAPTER *pAd = physical_device_get_first_mac_adapter(device);
 
+	if (mtk_nb->registered)
+		return NDIS_STATUS_SUCCESS;
+	if (!pAd || !pAd->net_dev)
+		return NDIS_STATUS_FAILURE;
 	atomic_set(&pErrRecoveryCtrl->notify_fe, 0);
-
+	mtk_nb->reset_pending = FALSE;
 	mtk_nb->priv = pAd;
 	mtk_nb->nb.notifier_call = mtk_fe_event;
 	err = register_netdevice_notifier(&mtk_nb->nb);
 
-	if (err)
+	if (err) {
+		mtk_nb->priv = NULL;
 		return err;
+	}
 
 	rtnl_lock();
+	mtk_nb->registered = TRUE;
 	call_netdevice_notifiers(MTK_WIFI_CHIP_ONLINE, pAd->net_dev);
 	rtnl_unlock();
 
 	return err;
 }
 
-void  mtk_fe_reset_notifier_exit(struct physical_device *device)
+void mtk_fe_reset_notifier_exit(struct physical_device *device)
 {
 	P_ERR_RECOVERY_CTRL_T pErrRecoveryCtrl = &device->ErrRecoveryCtl;
 	struct mtk_notifier_block *mtk_nb = &pErrRecoveryCtrl->mtk_nb;
-	struct _RTMP_ADAPTER *pAd = physical_device_get_first_mac_adapter(device);
+	struct _RTMP_ADAPTER *pAd;
 
-	rtnl_lock();
-	call_netdevice_notifiers(MTK_WIFI_CHIP_OFFLINE, pAd->net_dev);
-	rtnl_unlock();
+	if (!mtk_nb->registered)
+		return;
 	unregister_netdevice_notifier(&mtk_nb->nb);
-
+	rtnl_lock();
+	pAd = mtk_nb->priv;
+	if (pAd && pAd->net_dev)
+		call_netdevice_notifiers(MTK_WIFI_CHIP_OFFLINE, pAd->net_dev);
+	mtk_nb->reset_pending = FALSE;
+	mtk_nb->registered = FALSE;
 	mtk_nb->priv = NULL;
-
+	rtnl_unlock();
 }
+
 #endif
 
 #endif /* ERR_RECOVERY */

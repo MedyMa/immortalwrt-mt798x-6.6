@@ -896,10 +896,13 @@ void mtk_fe_reset_notifier_exit(struct physical_device *device);
 #define MTK_FE_START_TRAFFIC	0x2007
 #define MTK_FE_STOP_TRAFFIC_DONE_FAIL 0x2008
 #define MTK_FE_START_RESET_INIT 0x2009
+#define MTK_WIFI_L1SER_DONE 0x200a
 
 struct mtk_notifier_block {
 	struct notifier_block nb;
 	void *priv;
+	BOOLEAN registered;
+	BOOLEAN reset_pending;
 
 };
 #endif
