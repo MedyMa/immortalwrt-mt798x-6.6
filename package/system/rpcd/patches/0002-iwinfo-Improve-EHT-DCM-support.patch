@@ -1,9 +1,12 @@
+Subject: rpcd: retain MTK EHT DCM reporting on the current iwinfo layout
+
 --- a/iwinfo.c
 +++ b/iwinfo.c
-@@ -498,5 +498,6 @@ rpc_iwinfo_add_rateinfo(struct iwinfo_rate_entry *r)
+@@ -498,6 +498,7 @@
  		blobmsg_add_u32(&buf, "mcs", r->mcs);
  		blobmsg_add_u32(&buf, "nss", r->nss);
  		blobmsg_add_u32(&buf, "eht_gi", r->eht_gi);
 +		blobmsg_add_u32(&buf, "eht_dcm", r->eht_dcm);
  	}
  }
+ 
