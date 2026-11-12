@@ -15,6 +15,7 @@
 #include <linux/atomic.h>
 #include <linux/dma-mapping.h>
 #include <linux/delay.h>
+#include <linux/etherdevice.h>
 #include <linux/if.h>
 #include <linux/log2.h>
 #include <linux/io.h>
@@ -22,20 +23,33 @@
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
-#include <linux/rtnetlink.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
-#include <net/netlink.h>
+#include <linux/workqueue.h>
+#include <net/switchdev.h>
 
 #include "nf_hnat_mtk.h"
 #include "hnat.h"
 #include "hnat_api.h"
 
 struct mtk_hnat *hnat_priv;
-static struct socket *_hnat_roam_sock;
-static struct delayed_work _hnat_roam_work;
-static bool _hnat_roam_stopping;
+
+struct hnat_roam_work {
+	struct work_struct work;
+	u8 mac[ETH_ALEN];
+};
+
+static struct workqueue_struct *hnat_roam_wq;
+static bool hnat_roam_enabled;
+static int hnat_roam_error;
+static atomic_t hnat_roam_pending = ATOMIC_INIT(0);
+static atomic64_t hnat_roam_events = ATOMIC64_INIT(0);
+static atomic64_t hnat_roam_queued = ATOMIC64_INIT(0);
+static atomic64_t hnat_roam_completed = ATOMIC64_INIT(0);
+static atomic64_t hnat_roam_alloc_failed = ATOMIC64_INIT(0);
+static atomic64_t hnat_roam_queue_failed = ATOMIC64_INIT(0);
+static atomic64_t hnat_roam_deleted = ATOMIC64_INIT(0);
 static bool hnat_pack_registered;
 static bool hnat_netdevice_registered;
 static bool hnat_netevent_registered;
@@ -480,97 +494,129 @@ int entry_delete_by_mac(u8 *mac)
 	return ret;
 }
 
-static void hnat_roam_handler(struct work_struct *work)
+static void hnat_roam_work_handler(struct work_struct *work)
 {
-	struct kvec iov;
-	struct msghdr msg;
-	struct nlmsghdr *nlh;
-	struct ndmsg *ndm;
-	struct nlattr *nla;
-	u8 rcv_buf[512];
-	int len;
+	struct hnat_roam_work *roam = container_of(work, struct hnat_roam_work, work);
+	int deleted;
 
-	if (READ_ONCE(_hnat_roam_stopping) || !_hnat_roam_sock)
-		return;
+	/* Retain the callback admission and accounting-generation protections. */
+	deleted = entry_delete_by_mac(roam->mac);
+	if (deleted > 0)
+		atomic64_add(deleted, &hnat_roam_deleted);
+	atomic64_inc(&hnat_roam_completed);
+	atomic_dec(&hnat_roam_pending);
+	kfree(roam);
+}
 
-	iov.iov_base = rcv_buf;
-	iov.iov_len = sizeof(rcv_buf);
-	memset(&msg, 0, sizeof(msg));
-	msg.msg_namelen = sizeof(struct sockaddr_nl);
+/* The bridge notifies the old port before changing a learned FDB entry. */
+static int hnat_roam_switchdev_event(struct notifier_block *nb,
+				     unsigned long event, void *ptr)
+{
+	struct switchdev_notifier_fdb_info *fdb_info = ptr;
+	struct hnat_roam_work *roam;
+	struct net_device *dev;
 
-	len = kernel_recvmsg(_hnat_roam_sock, &msg, &iov, 1, iov.iov_len, MSG_DONTWAIT);
-	if (len <= 0)
-		goto out;
+	if (event != SWITCHDEV_FDB_DEL_TO_DEVICE || !fdb_info || !fdb_info->addr)
+		return NOTIFY_DONE;
 
-	nlh = (struct nlmsghdr*)rcv_buf;
-	if (!NLMSG_OK(nlh, len) || nlh->nlmsg_type != RTM_NEWNEIGH)
-		goto out;
+	dev = switchdev_notifier_info_to_dev(ptr);
+	if (!dev || !net_eq(dev_net(dev), &init_net) ||
+	    netif_is_bridge_master(dev) || fdb_info->is_local ||
+	    !is_valid_ether_addr(fdb_info->addr))
+		return NOTIFY_DONE;
 
-	len = nlh->nlmsg_len - NLMSG_HDRLEN;
-	ndm = (struct ndmsg *)NLMSG_DATA(nlh);
-	if (ndm->ndm_family != PF_BRIDGE)
-		goto out;
+	atomic64_inc(&hnat_roam_events);
+	if (debug_level >= 2)
+		pr_info("hnat: FDB delete mac=%pM port=%s\n", fdb_info->addr, dev->name);
 
-	nla = (struct nlattr *)((u8 *)ndm + sizeof(struct ndmsg));
-	len -= NLMSG_LENGTH(sizeof(struct ndmsg));
-	while (nla_ok(nla, len)) {
-		if (nla_type(nla) == NDA_LLADDR) {
-			entry_delete_by_mac(nla_data(nla));
-		}
-		nla = nla_next(nla, &len);
+	/* The notifier is atomic; own the MAC instead of retaining FDB/dev pointers. */
+	roam = kmalloc(sizeof(*roam), GFP_ATOMIC);
+	if (!roam) {
+		atomic64_inc(&hnat_roam_alloc_failed);
+		pr_warn_ratelimited("hnat: FDB roaming event dropped: allocation failed\n");
+		return NOTIFY_DONE;
 	}
 
-out:
-	if (!READ_ONCE(_hnat_roam_stopping))
-		schedule_delayed_work(&_hnat_roam_work,
-				      len > 0 ? 0 : msecs_to_jiffies(100));
+	ether_addr_copy(roam->mac, fdb_info->addr);
+	INIT_WORK(&roam->work, hnat_roam_work_handler);
+	atomic_inc(&hnat_roam_pending);
+	atomic64_inc(&hnat_roam_queued);
+	if (!queue_work(hnat_roam_wq, &roam->work)) {
+		atomic64_dec(&hnat_roam_queued);
+		atomic_dec(&hnat_roam_pending);
+		atomic64_inc(&hnat_roam_queue_failed);
+		kfree(roam);
+		pr_warn_ratelimited("hnat: FDB roaming event could not be queued\n");
+	}
+
+	return NOTIFY_DONE;
 }
+
+static struct notifier_block hnat_roam_switchdev_nb = {
+	.notifier_call = hnat_roam_switchdev_event,
+};
 
 static int hnat_roaming_enable(void)
 {
-	struct socket *sock = NULL;
-	struct sockaddr_nl addr;
 	int ret;
 
-	INIT_DELAYED_WORK(&_hnat_roam_work, hnat_roam_handler);
-	WRITE_ONCE(_hnat_roam_stopping, false);
+	if (hnat_roam_wq)
+		return -EBUSY;
 
-	ret = sock_create_kern(&init_net, AF_NETLINK, SOCK_RAW, NETLINK_ROUTE, &sock);
-	if (ret < 0)
-		goto out;
+	WRITE_ONCE(hnat_roam_enabled, false);
+	if (!IS_ENABLED(CONFIG_NET_SWITCHDEV)) {
+		ret = -EOPNOTSUPP;
+		goto fail;
+	}
 
-	_hnat_roam_sock = sock;
+	/* Different work items still serialize their FOE table walks. */
+	hnat_roam_wq = alloc_ordered_workqueue("hnat_roam", 0);
+	if (!hnat_roam_wq) {
+		ret = -ENOMEM;
+		goto fail;
+	}
 
-	addr.nl_family = AF_NETLINK;
-	addr.nl_pad = 0;
-	addr.nl_pid = 65534;
-	addr.nl_groups = 1 << (RTNLGRP_NEIGH - 1);
-	ret = kernel_bind(sock, (struct sockaddr *)&addr, sizeof(addr));
-	if (ret < 0)
-		goto out;
+	ret = register_switchdev_notifier(&hnat_roam_switchdev_nb);
+	if (ret) {
+		destroy_workqueue(hnat_roam_wq);
+		hnat_roam_wq = NULL;
+		goto fail;
+	}
 
-	if (!READ_ONCE(_hnat_roam_stopping))
-		schedule_delayed_work(&_hnat_roam_work, msecs_to_jiffies(100));
-	pr_info("hnat roaming work enable\n");
+	WRITE_ONCE(hnat_roam_error, 0);
+	WRITE_ONCE(hnat_roam_enabled, true);
+	pr_info("hnat roaming work enable (switchdev FDB)\n");
 
 	return 0;
-out:
-	WRITE_ONCE(_hnat_roam_stopping, true);
-	_hnat_roam_sock = NULL;
-	if (sock)
-		sock_release(sock);
-
+fail:
+	WRITE_ONCE(hnat_roam_error, ret);
 	return ret;
 }
 
 static void hnat_roaming_disable(void)
 {
-	WRITE_ONCE(_hnat_roam_stopping, true);
-	cancel_delayed_work_sync(&_hnat_roam_work);
-	if (_hnat_roam_sock)
-		sock_release(_hnat_roam_sock);
-	_hnat_roam_sock = NULL;
+	if (!hnat_roam_wq)
+		return;
+
+	WRITE_ONCE(hnat_roam_enabled, false);
+	/* Unregister waits for notifier callbacks before the queue is drained. */
+	unregister_switchdev_notifier(&hnat_roam_switchdev_nb);
+	destroy_workqueue(hnat_roam_wq);
+	hnat_roam_wq = NULL;
 	pr_info("hnat roaming work disable\n");
+}
+
+void hnat_roaming_stats(struct seq_file *s)
+{
+	seq_printf(s, "enabled %u\n", READ_ONCE(hnat_roam_enabled));
+	seq_printf(s, "last_error %d\n", READ_ONCE(hnat_roam_error));
+	seq_printf(s, "fdb_events %lld\n", atomic64_read(&hnat_roam_events));
+	seq_printf(s, "queued %lld\n", atomic64_read(&hnat_roam_queued));
+	seq_printf(s, "completed %lld\n", atomic64_read(&hnat_roam_completed));
+	seq_printf(s, "pending %d\n", atomic_read(&hnat_roam_pending));
+	seq_printf(s, "allocation_failures %lld\n", atomic64_read(&hnat_roam_alloc_failed));
+	seq_printf(s, "queue_failures %lld\n", atomic64_read(&hnat_roam_queue_failed));
+	seq_printf(s, "entries_deleted %lld\n", atomic64_read(&hnat_roam_deleted));
 }
 
 static int hnat_hw_init(u32 ppe_id)
@@ -1291,7 +1337,7 @@ static int hnat_probe(struct platform_device *pdev)
 
 	err = hnat_roaming_enable();
 	if (err)
-		pr_info("hnat roaming work fail\n");
+		pr_warn("hnat FDB roaming unavailable: %d\n", err);
 
 	INIT_LIST_HEAD(&hnat_priv->xlat.map_list);
 	platform_set_drvdata(pdev, hnat_priv);

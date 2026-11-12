@@ -3216,6 +3216,13 @@ static int hnat_tunnel_show(struct seq_file *s, void *private)
 }
 DEFINE_SHOW_ATTRIBUTE(hnat_tunnel);
 
+static int hnat_roaming_show(struct seq_file *s, void *private)
+{
+	hnat_roaming_stats(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hnat_roaming);
+
 int hnat_init_debugfs(struct mtk_hnat *h)
 {
 	int ret = 0;
@@ -3255,6 +3262,7 @@ int hnat_init_debugfs(struct mtk_hnat *h)
 	debugfs_create_file("all_entry", 0444, root, h, &hnat_debug_fops);
 	debugfs_create_file("accounting", 0444, root, h, &hnat_account_fops);
 	debugfs_create_file("tunnel_events", 0444, root, h, &hnat_tunnel_fops);
+	debugfs_create_file("roaming", 0444, root, h, &hnat_roaming_fops);
 	debugfs_create_file("fallback_stats", 0444, root, h, &hnat_fallback_fops);
 	debugfs_create_file("external_interface", 0444, root, h,
 			    &hnat_ext_fops);
