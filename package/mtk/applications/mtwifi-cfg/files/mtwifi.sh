@@ -6,13 +6,14 @@
 append DRIVERS "mtwifi"
 
 detect_mtwifi() {
-	local idx ifname
+	local dev dev_list idx ifname
 	local band htmode htbsscoex ssid dbdc_main
 	if [ -d "/sys/module/mt_wifi" ]; then
 		dev_list="$(l1util list)"
 		for dev in $dev_list; do
-			config_get type ${dev} type
-			[ "$type" = "mtwifi" ] || {
+			# Newer wifi-scripts do not preload the UCI shell cache.
+			# Only initialize missing devices; retain every existing section.
+			uci -q get "wireless.${dev}" >/dev/null || {
 				ifname="$(l1util get ${dev} main_ifname)"
 
 				idx="$(l1util get ${dev} subidx)"
