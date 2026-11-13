@@ -1,0 +1,47 @@
+Subject: [PATCH] cmd: pstore: match Linux pmsg and ftrace region order
+
+Linux ramoops places console, pmsg and ftrace after the crash records.
+Read these same offsets when displaying or saving auxiliary records;
+keep the crash-record scan and boot recovery decision unchanged.
+
+--- a/cmd/pstore.c
++++ b/cmd/pstore.c
+@@ -378,8 +378,7 @@
+ 	}
+ 
+ 	if (type == PSTORE_TYPE_FTRACE || type == PSTORE_TYPE_ALL) {
+-		ptr = pstore_addr + pstore_length - pstore_pmsg_size
+-		- pstore_ftrace_size;
++		ptr = pstore_addr + pstore_length - pstore_ftrace_size;
+ 		/* The FTrace record(s) uses LINUX_VERSION_CODE ^ 'DBGC'
+ 		 * signature, pass 0 to pstore_get_buffer to prevent
+ 		 * checking it
+@@ -390,7 +389,8 @@
+ 	}
+ 
+ 	if (type == PSTORE_TYPE_PMSG || type == PSTORE_TYPE_ALL) {
+-		ptr = pstore_addr + pstore_length - pstore_pmsg_size;
++		ptr = pstore_addr + pstore_length - pstore_ftrace_size
++			- pstore_pmsg_size;
+ 		size = pstore_get_buffer(PERSISTENT_RAM_SIG, ptr,
+ 					 pstore_pmsg_size, buffer);
+ 		if (size != 0)
+@@ -488,7 +488,7 @@
+ 		sprintf(path, "%s/console-ramoops-0", argv[3]);
+ 		do_save(cmdtp, flag, 6, save_argv, FS_TYPE_ANY);
+ 	}
+-	ptr += pstore_console_size;
++	ptr = pstore_addr + pstore_length - pstore_ftrace_size;
+ 
+ 	/* Save FTrace record(s)
+ 	 * The FTrace record(s) uses LINUX_VERSION_CODE ^ 'DBGC' signature,
+@@ -500,7 +500,8 @@
+ 		sprintf(path, "%s/ftrace-ramoops-0", argv[3]);
+ 		do_save(cmdtp, flag, 6, save_argv, FS_TYPE_ANY);
+ 	}
+-	ptr += pstore_ftrace_size;
++	ptr = pstore_addr + pstore_length - pstore_ftrace_size
++		- pstore_pmsg_size;
+ 
+ 	/* Save Console record */
+ 	size = pstore_get_buffer(PERSISTENT_RAM_SIG, ptr, pstore_pmsg_size,

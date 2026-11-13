@@ -1,0 +1,51 @@
+Subject: [PATCH] cmd: pstore: validate retained ring buffers before reading
+
+Warm boots can encounter stale or damaged ramoops headers. Reject payloads
+that exceed the data area and ring offsets beyond the saved data before
+subtracting or copying. Terminate the unwrapped buffer for header parsing,
+and release the mapping on every exit path.
+
+--- a/cmd/pstore.c
++++ b/cmd/pstore.c
+@@ -90,20 +90,25 @@ static u32 pstore_get_buffer(u32 sig, phys_addr_t buffer, u32 size, char *dest)
+ {
+-	struct persistent_ram_buffer *prb =
+-		(struct persistent_ram_buffer *)map_sysmem(buffer, size);
++	struct persistent_ram_buffer *prb;
+-	u32 dest_size;
++	u32 dest_size = 0;
++
++	if (!dest || size <= sizeof(*prb))
++		return 0;
++
++	prb = (struct persistent_ram_buffer *)map_sysmem(buffer, size);
+ 
+ 	if (sig == 0 || prb->sig == sig) {
+ 		if (prb->size == 0) {
+ 			log_debug("found existing empty buffer\n");
+-			return 0;
++			goto out;
+ 		}
+ 
+-		if (prb->size > size) {
++		if (prb->size > size - sizeof(*prb) ||
++		    prb->start > prb->size) {
+ 			log_debug("found existing invalid buffer, size %u, start %u\n",
+ 			          prb->size, prb->start);
+-			return 0;
++			goto out;
+ 		}
+ 	} else {
+ 		log_debug("no valid data in buffer (sig = 0x%08x)\n", prb->sig);
+-		return 0;
++		goto out;
+ 	}
+@@ -115,6 +120,8 @@ static u32 pstore_get_buffer(u32 sig, phys_addr_t buffer, u32 size, char *dest)
+ 	memcpy(dest + prb->size - prb->start, &prb->data[0], prb->start);
+ 
+ 	dest_size = prb->size;
++	dest[dest_size] = '\0';
++out:
+ 	unmap_sysmem(prb);
+ 
+ 	return dest_size;
