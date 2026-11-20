@@ -103,13 +103,21 @@ local function station_table(stations, hosts, ap)
             if row.signal and row.noise then row.rssi = row.signal - row.noise end
             for _, dir in ipairs({"rx", "tx"}) do
                 local stats = sta[dir] or {}
-                for _, key in ipairs({"rate", "bytes", "packets"}) do
-                    row[dir .. "_" .. key] = stats[key]
-                end
+                row[dir .. "_bytes"] = stats.bytes
+                row[dir .. "_packets"] = stats.packets
                 if stats.mcs then row[dir .. "_mcs"] = stats.mcs end
                 if stats.nss and stats.nss > 0 then row[dir .. "_nss"] = stats.nss end
+                local modern = false
                 for phy, flag in pairs({ht="is_11n", vht="is_11ac", he="is_11ax", eht="is_11be"}) do
-                    if stats[phy] == true or stats[phy] == 1 then row[flag] = true end
+                    if stats[phy] == true or stats[phy] == 1 then
+                        row[flag], modern = true, true
+                    end
+                end
+                -- rpcd emits zero without a PHY sample. Older WEXT tables
+                -- can also decode an empty rate word as legacy CCK 1 Mbit/s.
+                local rate = stats.rate
+                if type(rate) == "number" and rate > 0 and (ap.radio == "ng" or modern or rate ~= 1000) then
+                    row[dir .. "_rate"] = rate
                 end
             end
             rows[#rows+1] = row

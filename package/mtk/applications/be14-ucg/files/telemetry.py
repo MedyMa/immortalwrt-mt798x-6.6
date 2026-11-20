@@ -171,6 +171,11 @@ def wireless_report(snapshot, learned):
             for station in ap["sta_table"] or []:  # lua-cjson represents an empty array as {}.
                 station = station.copy()
                 station.pop("model_source", None)
+                # Network retains each direction separately. Only update its
+                # balance inputs together, from the same association sample.
+                if not (station.get("rx_rate") and station.get("tx_rate")):
+                    station.pop("rx_rate", None)
+                    station.pop("tx_rate", None)
                 model = station.get("device_name")
                 if model:
                     # Network indexes the AP station's hostname for its client list.

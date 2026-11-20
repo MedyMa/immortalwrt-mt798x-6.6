@@ -73,7 +73,22 @@ def lease_event(event):
         gateway = str(ipaddress.IPv4Address(gateways[0])) if gateways else None
         if gateway:
             subprocess.run(prefix + ["route", "replace", gateway + "/32", "dev", IFACE], check=True)
+        if previous.get("gateway") and previous["gateway"] != gateway:
+            subprocess.run(prefix + ["route", "del", previous["gateway"] + "/32", "dev", IFACE],
+                           stderr=subprocess.DEVNULL)
         write(path, {"ip": str(addr.ip), "cidr": str(addr), "gateway": gateway})
+    elif event == "leasefail" and not path.exists():
+        write(path, {"state": "retrying"})
+    else:
+        return
+    # The lease file is authoritative. Wake the single status writer after the
+    # address and route have been installed, even between regular probes.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as wake:
+        wake.setblocking(False)
+        try:
+            wake.sendto(b"L", str(path.with_suffix(".sock")))
+        except (BlockingIOError, FileNotFoundError, ConnectionRefusedError):
+            pass
 
 
 def guest(directory, parent, mac):
@@ -85,30 +100,42 @@ def guest(directory, parent, mac):
     subprocess.run(["ip", "link", "set", IFACE, "up"], check=True)
     lease = Path(directory) / "lease.json"
     env = dict(os.environ, BE14_HOST_LEASE=str(lease))
-    dhcp = subprocess.Popen(["udhcpc", "-f", "-R", "-i", IFACE, "-x", "hostname:BPI-R4", "-s", __file__],
-                            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    try:
-        for _ in sys.stdin:
-            if dhcp.poll() is not None:
-                break
-            try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as events:
+        events.bind(str(lease.with_suffix(".sock")))
+        dhcp = subprocess.Popen(["udhcpc", "-f", "-R", "-i", IFACE, "-x", "hostname:BPI-R4", "-s", __file__],
+                                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        last_target = None
+        try:
+            while dhcp.poll() is None:
                 socket.if_nametoindex(IFACE)
-            except OSError:
-                break
-            try:
-                record = json.loads(lease.read_text())
-            except FileNotFoundError:
-                record = {}
-            gateway = record.get("gateway")
-            if gateway:
-                result = subprocess.run(["ping", "-4", "-c", "1", "-W", "2", gateway], stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL, timeout=5)
-                record["gateway_reachable"] = result.returncode == 0
-            record.pop("cidr", None)
-            write(STATUS, dict(record, state="leased" if record else "dhcp", parent=parent, mac=mac, updated=time.time()))
-    finally:
-        dhcp.terminate()
-        dhcp.wait(timeout=8)
+                try:
+                    record = json.loads(lease.read_text())
+                except FileNotFoundError:
+                    record = {}
+                record.pop("cidr", None)
+                record.update(parent=parent, mac=mac, updated=time.time())
+                record.setdefault("state", "leased" if record.get("ip") else "dhcp")
+                gateway = record.get("gateway")
+                target = (record.get("ip"), gateway)
+                if gateway:
+                    if target != last_target:
+                        write(STATUS, record)
+                    try:
+                        result = subprocess.run(["ping", "-4", "-c", "1", "-W", "2", gateway],
+                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                        record["gateway_reachable"] = result.returncode == 0
+                    except (OSError, subprocess.TimeoutExpired):
+                        record["probe_error"] = True
+                last_target = target
+                write(STATUS, record)
+                ready, _, _ = select.select([sys.stdin, events], [], [], INTERVAL)
+                if sys.stdin in ready:
+                    break  # The supervisor closed the control pipe.
+                if events in ready:
+                    events.recv(1)
+        finally:
+            dhcp.terminate()
+            dhcp.wait(timeout=8)
 
 
 def serve(network, url, port):
@@ -124,14 +151,16 @@ def serve(network, url, port):
             subprocess.run(["ip", "link", "add", "link", parent, "name", IFACE, "netns", str(child.pid),
                             "address", mac, "type", "macvlan", "mode", "private"], check=True, timeout=5)
             child.stdin.write("start\n")
-            while child.poll() is None:
-                child.stdin.write("tick\n")
-                child.stdin.flush()
-                time.sleep(INTERVAL)
+            child.stdin.flush()
+            while True:
+                try:
+                    child.wait(timeout=INTERVAL)
+                except subprocess.TimeoutExpired:
+                    pass
+                else:
+                    raise RuntimeError("DHCP interface stopped")
                 if parent_port(network, url) != port:
                     break
-            else:
-                raise RuntimeError("DHCP interface stopped")
         finally:
             try:
                 child.stdin.close()
