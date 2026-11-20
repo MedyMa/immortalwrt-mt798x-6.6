@@ -179,6 +179,16 @@ def active(bindings, expected):
     return True
 
 
+def confirm_revision(state, version, snapshot, expected):
+    confirmed = dict(cfgversion=version, applied_binding=binding_signature(snapshot),
+                     inactive_bands=sorted(b for b, target in expected.items() if target.get("inactive")),
+                     restricted_bands=sorted(b for b, target in expected.items() if target.get("restricted")))
+    if "pending" in state or any(state.get(key) != value for key, value in confirmed.items()):
+        state.update(confirmed)
+        state.pop("pending", None)
+        save(state)
+
+
 def finish_pending(state, read=None, reload=None, wait=time.sleep):
     read = read or local
     reload = reload or reload_wifi
@@ -211,18 +221,22 @@ def finish_pending(state, read=None, reload=None, wait=time.sleep):
     bindings = snap["bindings"]
 
     def rollback():
-        if changes:
+        # A failed update on another band must not re-enable a withdrawn or restricted SSID.
+        reversible = {c: ch for c, ch in changes.items() if not pending["expected"][c].get("inactive")}
+        if reversible:
             fresh = read("snapshot")
             if not still_bound(fresh):
                 return
             current = fresh["bindings"]
-            if all(matches(current.get(c, {}), ch, "after") for c, ch in changes.items()):
+            if all(matches(current.get(c, {}), ch, "after") for c, ch in reversible.items()):
                 reverse = {c: dict(section=ch["section"], device=ch["device"], before=ch["after"],
-                                   after=ch["before"], remove=bool(ch.get("create"))) for c, ch in changes.items()}
+                                   after=ch["before"], remove=bool(ch.get("create"))) for c, ch in reversible.items()}
                 replace(reverse, rollback=True)
-            elif not all(matches(current.get(c, {}), ch, "before") for c, ch in changes.items()):
+            elif not all(matches(current.get(c, {}), ch, "before") for c, ch in reversible.items()):
                 raise ValueError("local edit prevents automatic rollback")
             reload()
+        if len(reversible) != len(changes):
+            state.pop("applied_binding", None)
         del state["pending"]
         save(state)
 
@@ -245,11 +259,7 @@ def finish_pending(state, read=None, reload=None, wait=time.sleep):
             if not still_bound(fresh):
                 return
             if active(fresh["bindings"], pending["expected"]):
-                state["cfgversion"] = pending["version"]
-                state["applied_binding"] = binding_signature(fresh)
-                state["inactive_bands"] = sorted(b for b, v in pending["expected"].items() if v.get("inactive"))
-                del state["pending"]
-                save(state)
+                confirm_revision(state, pending["version"], fresh, pending["expected"])
                 return
             if attempt < 20:
                 wait(1)
@@ -318,12 +328,10 @@ def handle(msg, state, snap, authenticated=False):
         changes, expected = {}, {}
     if not changes:
         if expected and not active(snap["bindings"], expected):
+            if any(t.get("inactive") and snap["bindings"][b].get("observed") for b, t in expected.items()):
+                reload_wifi()
             raise ValueError("WLAN live settings differ, revision withheld")
-        signature = binding_signature(snap)
-        inactive = sorted(b for b, v in expected.items() if v.get("inactive"))
-        if state["cfgversion"] != version or state.get("applied_binding") != signature or state.get("inactive_bands") != inactive:
-            state.update(cfgversion=version, applied_binding=signature, inactive_bands=inactive)
-            save(state)
+        confirm_revision(state, version, snap, expected)
         return 5
     state["pending"] = dict(changes=changes, expected=expected, version=version, wlan_id=wlan_id,
                             automatic=bool(snap.get("automatic")), network=snap.get("management_network"))

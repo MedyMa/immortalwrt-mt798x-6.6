@@ -156,9 +156,10 @@ def wireless_report(snapshot, learned):
                                     "channel", "up", "tx_power") if k in ap}
         entry["usage"] = "user"
         bound = snapshot["bindings"].get(band, {})
-        if bound.get("section") == ap["section"] and snapshot["wlan_id"]:
+        if not snapshot.get("automatic") and bound.get("section") == ap["section"] and snapshot["wlan_id"]:
             entry["id"] = snapshot["wlan_id"]
         elif names[band, ssid] == 1:
+            # The radio can still be broadcasting the old WLAN while a new binding is pending.
             ident = learned.get(band, {}).get(ssid)
             if ident:
                 entry["id"] = ident

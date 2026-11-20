@@ -82,19 +82,29 @@ def automatic_choices(msg, mapping):
     for choice in wlan_choices(mapping):
         ident = choice["id"]
         try:
-            rows = sys_vaps(msg["system_cfg"], ident) if "system_cfg" in msg else msg["vap_table"]
-            # Use the same policy checks for the picker and for the eventual push.
-            offered = {b: dict(eligible=True, section=None, device=None) for b in choice["bands"]}
-            plan(rows, dict(bindings=offered, automatic=True, management_network=None), ident)
+            rows = sys_vaps(msg["system_cfg"], ident, automatic=True) if "system_cfg" in msg else msg["vap_table"]
         except ValueError:
             continue
-        result.append(choice)
+        eligible = []
+        for band in choice["bands"]:
+            # The controller can assign different access policies to individual BSSes.
+            offered = {band: dict(eligible=True, section=None, device=None)}
+            try:
+                plan(rows, dict(bindings=offered, automatic=True, management_network=None), ident)
+            except ValueError:
+                continue
+            eligible.append(band)
+        if eligible:
+            result.append(dict(choice, bands=eligible))
     return result
 
 
 def sys_vaps(text, wlan_id, automatic=False):
     values = flat(text)
     auths = groups(values, "aaa")
+    filtered = {a.get("devname") for a in groups(values, "macacl").values()
+                if a.get("devname") and a.get("status") not in FALSE and a.get("acl.status") not in FALSE
+                and values.get("macacl.status") not in FALSE}
     rows = []
     for i, vif in groups(values, "wireless").items():
         if vif.get("id") != wlan_id:
@@ -107,12 +117,19 @@ def sys_vaps(text, wlan_id, automatic=False):
         auth = matches[0] if len(matches) == 1 else auths.get(i, {})
         if len(matches) > 1 or (dev and auth.get("devname", dev) != dev) or auth.get("ssid", vif.get("ssid")) != vif.get("ssid"):
             raise ValueError("ambiguous WLAN authenticator")
-        if (vif.get("usage", "user") != "user" or vif.get("status") == "disabled" or
+        row = dict(id=wlan_id, radio=BANDS.get(vif.get("parent")), essid=vif.get("ssid"))
+        if (vif.get("usage", "user") != "user" or vif.get("status") == "disabled" or dev in filtered or
                 vif.get("is_guest") in TRUE or auth.get("is_guest") in TRUE or
+                vif.get("schedule_enabled") in TRUE or auth.get("radius.macacl.status") in TRUE or
+                (vif.get("mac_acl.status") in TRUE and (vif.get("mac_acl.policy") == "allow" or
+                 any(re.fullmatch(r"mac_acl\.\d+\.mac", k) for k in vif))) or
                 auth.get("wpa.psk_file.status") in TRUE or vif.get("vlan", "0") not in ("", "0") or
                 any(v.get("devname") == dev and v.get("id", "0") != "0" for v in groups(values, "vlan").values()) or
                 (auth.get("br.devname", "br0") != "br0")):
-            raise ValueError("test WLAN requires an enabled untagged personal network")
+            if not automatic:
+                raise ValueError("unsupported WLAN network policy")
+            rows.append(dict(row, restricted=True))
+            continue
         mgmt = {token for k, v in auth.items() if re.fullmatch(r"wpa\.key\.\d+\.mgmt", k) for token in v.split()}
         if mgmt == {"OWE"}:
             security = "owe"
@@ -120,10 +137,12 @@ def sys_vaps(text, wlan_id, automatic=False):
             security = "sae-mixed" if auth.get("wpa3.transition") in TRUE or "WPA-PSK" in mgmt else "sae"
         elif mgmt == {"WPA-PSK"} and auth.get("wpa") == "2":
             security = "psk2"
-        else:
+        elif not automatic or not auth:
             raise ValueError("unsupported WLAN authentication")
-        rows.append(dict(id=wlan_id, radio=BANDS.get(vif.get("parent")), essid=vif.get("ssid"),
-                         security=security, x_passphrase=auth.get("wpa.psk"),
+        else:
+            rows.append(dict(row, restricted=True))
+            continue
+        rows.append(dict(row, security=security, x_passphrase=auth.get("wpa.psk"),
                          hide_ssid=vif.get("hide_ssid"), isolate=vif.get("l2_isolation"),
                          pmf=auth.get("pmf.mode")))
     return rows
@@ -132,7 +151,7 @@ def sys_vaps(text, wlan_id, automatic=False):
 def plan(rows, snapshot, wlan_id, allow_withdraw=False):
     if not isinstance(rows, list):
         raise ValueError("invalid VAP table")
-    changes, expected = {}, {}
+    changes, expected, restricted = {}, {}, set()
     for row in rows:
         if not isinstance(row, dict):
             raise ValueError("invalid VAP entry")
@@ -146,15 +165,23 @@ def plan(rows, snapshot, wlan_id, allow_withdraw=False):
         binding = snapshot["bindings"].get(code)
         if not binding:
             continue
-        if code in expected:
+        if code in expected or code in restricted:
             raise ValueError("duplicate WLAN for band")
         ssid = row.get("essid")
         if not isinstance(ssid, str) or not 1 <= len(ssid.encode()) <= 32 or re.search(r"[\x00-\x1f\x7f]", ssid):
             raise ValueError("invalid WLAN SSID")
-        if (row.get("usage", "user") != "user" or row.get("status") == "disabled"
-                or any(flag(row.get(k, False)) == "1" for k in ("guest_policy", "is_guest", "vlan_enabled", "dynamic_vlan"))
+        mode = {"wpapsk": "psk2", "wpa2-psk": "psk2", "wpa3-sae": "sae",
+                "wpa2-wpa3": "sae-mixed"}.get(row.get("security"), row.get("security"))
+        if (row.get("restricted") is True or row.get("usage", "user") != "user" or row.get("status") == "disabled"
+                or any(flag(row.get(k, False)) == "1" for k in ("guest_policy", "is_guest", "vlan_enabled", "dynamic_vlan",
+                                                                 "mac_filter_enabled", "schedule_enabled", "radius_mac_auth_enabled"))
                 or any(row.get(k) not in (None, 0, "0", "") for k in ("vlan", "vlan_id"))
+                or (mode is not None and (mode not in ("psk2", "sae", "sae-mixed", "owe")
+                                          or (code == "6e" and mode not in ("sae", "owe"))))
                 or flag(row.get("enabled", True)) == "0"):
+            if allow_withdraw and binding.get("managed_secondary") and binding.get("be14_ucg_managed") == "1":
+                restricted.add(code)
+                continue
             raise ValueError("unsupported WLAN network policy")
         automatic = snapshot.get("automatic", False)
         if automatic and (not binding.get("eligible") or ssid in snapshot.get("other_ssids", {})
@@ -167,11 +194,7 @@ def plan(rows, snapshot, wlan_id, allow_withdraw=False):
             after.pop("disabled", None)
             after["be14_ucg_managed"] = "1"
             after["network"] = snapshot["management_network"]
-        if row.get("security") is not None:
-            mode = {"wpapsk": "psk2", "wpa2-psk": "psk2", "wpa3-sae": "sae",
-                    "wpa2-wpa3": "sae-mixed"}.get(row["security"], row["security"])
-            if mode not in ("psk2", "sae", "sae-mixed", "owe") or (code == "6e" and mode not in ("sae", "owe")):
-                raise ValueError("unsupported WLAN encryption for band")
+        if mode is not None:
             after["encryption"] = mode
             if mode == "owe":
                 after.pop("key", None)
@@ -201,6 +224,8 @@ def plan(rows, snapshot, wlan_id, allow_withdraw=False):
             if not (b.get("missing") or b.get("disabled") == "1" or b.get("managed_secondary")):
                 raise ValueError("cannot withdraw a locally owned AP")
             expected[code] = dict(section=b["section"], device=b["device"], inactive=True)
+            if code in restricted:
+                expected[code]["restricted"] = True
             if b.get("be14_ucg_managed") == "1" and b.get("disabled") != "1":
                 before = {k: b[k] for k in FIELDS + ("disabled", "be14_ucg_managed", "network") if k in b}
                 changes[code] = dict(section=b["section"], device=b["device"], before=before, after=dict(before, disabled="1"))

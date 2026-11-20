@@ -27,7 +27,13 @@ config agent 'main'
 
 要在 UCG 查看每台终端使用的应用，可以把一个测试 SSID 在 R4 上桥接到独立 VLAN，在上联网口放行该标签，并由 UCG 提供 DHCP 和默认网关。R4 对这个 VLAN 保留终端源地址，UCG 的「流量识别」即可分析经过网关的连接。在 UCG 按测试手机的 IP 核对应用和流量。R4 上的代理隧道若把流量封装到外部节点，UCG 在这条路径上看到的是隧道端点。[UniFi 流量识别说明](https://help.ui.com/hc/en-us/articles/12570783535383-UniFi-Gateway-Traffic-and-Device-Identification)
 
-## 绑定测试 WLAN
+## 在 LuCI 自动下发 WLAN
+
+在 UCG「设置 → WiFi」创建使用原生网络的独立 SSID，广播 AP 选已采用的 E7。在 R4「MTK → UniFi → 设置 → WLAN 配置下发」选择「自动下发 · 独立 AP」，选中该 WLAN 和频段。每个频段可以新建独立 AP，也可以选择已停用的备用 AP。保存后，测试终端通过 R4 的上联网桥向 UCG 获取 DHCP 地址。
+
+自动模式按实际广播的 SSID 和频段上报客户端。UCG 撤下 WLAN 或启用 BE14 无法执行的接入策略（例如 MAC 白名单、定时开放或带标签的 VLAN）时，代理会停用对应的托管 AP。恢复支持的策略后会重新启用。原有主 SSID 继续使用本地配置。
+
+## 手动绑定测试 WLAN
 
 在 UCG 创建一个普通、无 VLAN 标签的个人 WLAN，使用控制器实际下发的 WLAN ID。控制器可能使用数字编号或 24 位十六进制 ObjectId。在 R4 上选择已运行的独立测试 AP。其 UCI 节名须以 `be14_ucg_` 开头，`mode` 为 `ap`，`mldgroup` 显式为 `0`，并接到预定的测试网络。可用 `l1util list` 查看真实无线设备的 UCI 名称。例如 `be14_ucg_five` 可以绑定在已改名的 5 GHz 设备上。
 
