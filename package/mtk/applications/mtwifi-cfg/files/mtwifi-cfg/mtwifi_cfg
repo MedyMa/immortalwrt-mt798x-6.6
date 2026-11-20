@@ -16,8 +16,8 @@
 ]]
 
 local cjson = require "cjson"
-local inspect = require "inspect"
 local nixio = require "nixio"
+local fs = require "nixio.fs"
 local l1parser = require "l1dat_parser"
 local datconf = require "datconf"
 local utils = require "mtwifi_utils"
@@ -26,6 +26,11 @@ local bandwidth = require "mtwifi_bandwidth"
 local uci = require "uci"
 
 local l1dat = l1parser.load_l1_profile(l1parser.L1_DAT_PATH)
+
+local function command_ok(command)
+    local result = os.execute(command)
+    return result == 0 or result == true
+end
 
 function string:split(sep)
     local sep, fields = sep or ":", {}
@@ -50,6 +55,10 @@ function save_profile(cfgs, path)
         return false
     end
 
+    if not fs.chmod(path, "600") then
+        nixio.syslog("err", "mtwifi-cfg: cannot set profile permissions on " .. path)
+        return false
+    end
     local datobj = datconf.openfile(path)
     if not datobj then return false end
     datobj:merge(cfgs)
@@ -87,35 +96,69 @@ local function whnat_value(group)
     nixio.syslog("err", "mtwifi-cfg: invalid WHNAT value for " .. group.master)
 end
 
-local function whnat_save(group, value, current_path, current_dats)
-    local profiles = {}
-    -- Resolve the raw L1 entry, including band aliases whose mainidx differs.
-    for path in pairs(group.profiles) do
-        profiles[path] = path == current_path and current_dats or load_profile(path)
-        if not profiles[path] then
-            nixio.syslog("err", "mtwifi-cfg: cannot read WHNAT profile " .. path)
-            return false
-        end
+-- The netifd wrapper and boot service serialize all writers with mtwifi.lock.
+-- Stage every DAT edit before the first write. datconf can truncate on failure,
+-- so keep the exact original bytes, including comments, for every touched file.
+local function stage_profile(changes, path, fields)
+    local entry = changes[path]
+    if not entry then
+        local file = io.open(path, "rb")
+        if not file then return false end
+        local original = file:read("*a")
+        file:close()
+        if not original then return false end
+        entry = { original = original, fields = {} }
+        changes[path] = entry
     end
-    profiles[group.path] = load_profile(group.path)
-    if not profiles[group.path] then
-        nixio.syslog("err", "mtwifi-cfg: cannot read WHNAT init profile " .. group.path)
-        return false
-    end
+    for k, v in pairs(fields) do entry.fields[k] = v end
+    return true
+end
 
-    for path, dats in pairs(profiles) do
-        if path == current_path then
-            dats.WHNAT = value
-        elseif tostring(dats.WHNAT) ~= value then
-            if not save_profile({WHNAT = value}, path) then return false end
-            local saved = load_profile(path)
-            if not saved or saved.WHNAT ~= value then
-                nixio.syslog("err", "mtwifi-cfg: cannot save WHNAT profile " .. path)
-                return false
+local function restore_profiles(changes)
+    local restored = true
+    for path, entry in pairs(changes) do
+        if entry.written then
+            local temporary = path .. ".mtwifi-restore"
+            local file = io.open(temporary, "wb")
+            local ok = file and fs.chmod(temporary, "600") and file:write(entry.original)
+            if file and not file:close() then ok = false end
+            if ok and os.rename(temporary, path) then
+                entry.written = false
+            else
+                os.remove(temporary)
+                nixio.syslog("err", "mtwifi-cfg: cannot restore " .. path)
+                restored = false
             end
         end
     end
+    return restored
+end
+
+local function commit_profiles(changes)
+    for path, entry in pairs(changes) do
+        entry.written = true
+        if not save_profile(entry.fields, path) then
+            restore_profiles(changes)
+            return false
+        end
+    end
     return true
+end
+
+local function whnat_stage(changes, group, value, current_path, current_dats)
+    local function stage(path)
+        if path == current_path then
+            current_dats.WHNAT = value
+            return true
+        end
+        local dats = load_profile(path)
+        return dats and (tostring(dats.WHNAT) == value or
+            stage_profile(changes, path, { WHNAT = value }))
+    end
+    for path in pairs(group.profiles) do
+        if not stage(path) then return false end
+    end
+    return stage(group.path)
 end
 
 local function whnat_apply(group, value)
@@ -138,14 +181,25 @@ local function whnat_apply(group, value)
 end
 
 function mtwifi_cfg_whnat()
-    local ok = true
-    for _, group in ipairs(whnat_groups()) do
-        local value = whnat_value(group)
-        if not value or not whnat_save(group, value) or not whnat_apply(group, value) then
-            ok = false
+    local changes, groups = {}, whnat_groups()
+    for _, group in ipairs(groups) do
+        group.value = whnat_value(group)
+        local before = load_profile(group.path)
+        if not before or not group.value or not whnat_stage(changes, group, group.value) then return false end
+        group.previous = before.WHNAT
+    end
+    if not commit_profiles(changes) then return false end
+    for i, group in ipairs(groups) do
+        if not whnat_apply(group, group.value) then
+            restore_profiles(changes)
+            for j = 1, i do
+                local previous = groups[j].previous
+                if previous == "0" or previous == "1" then whnat_apply(groups[j], previous) end
+            end
+            return false
         end
     end
-    return ok
+    return true
 end
 
 function diff_cfg(cfg1, cfg2)
@@ -183,17 +237,17 @@ function is_dbdc_inited(ifname)
 end
 
 function ifup(ifname)
-    if ifname and #ifname > 0 then
-        os.execute("ifconfig "..ifname.." up")
-        nixio.syslog("info", "mtwifi-cfg: ifconfig up "..ifname)
-    end
+    if not ifname or not ifname:match("^[%w_%-]+$") then return false end
+    if command_ok("ifconfig " .. ifname .. " up") then return true end
+    nixio.syslog("err", "mtwifi-cfg: could not start " .. ifname)
+    return false
 end
 
 function ifdown(ifname)
-    if ifname and #ifname > 0 then
-        os.execute("ifconfig "..ifname.." down")
-        nixio.syslog("info", "mtwifi-cfg: ifconfig down "..ifname)
-    end
+    if not ifname or not ifname:match("^[%w_%-]+$") then return false end
+    if command_ok("ifconfig " .. ifname .. " down") then return true end
+    nixio.syslog("err", "mtwifi-cfg: could not stop " .. ifname)
+    return false
 end
 
 function cfg2dat(cfg)
@@ -237,10 +291,10 @@ end
 
 function vif_in_dev(vif, dev)
     if (vif == dev.main_ifname
-        or string.match(vif, utils.esc(dev.ext_ifname).."[0-9]+")
-        or string.match(vif, utils.esc(dev.apcli_ifname).."[0-9]+")
-        or string.match(vif, utils.esc(dev.wds_ifname).."[0-9]+")
-        or string.match(vif, utils.esc(dev.mesh_ifname).."[0-9]+")) then
+        or string.match(vif, "^"..utils.esc(dev.ext_ifname).."[0-9]+$")
+        or string.match(vif, "^"..utils.esc(dev.apcli_ifname).."[0-9]+$")
+        or string.match(vif, "^"..utils.esc(dev.wds_ifname).."[0-9]+$")
+        or string.match(vif, "^"..utils.esc(dev.mesh_ifname).."[0-9]+$")) then
         return true
     else
         return false
@@ -248,7 +302,7 @@ function vif_in_dev(vif, dev)
 end
 
 function vif_is_apcli(vif, dev)
-    if (string.match(vif, utils.esc(dev.apcli_ifname).."[0-9]+")) then
+    if (string.match(vif, "^"..utils.esc(dev.apcli_ifname).."[0-9]+$")) then
         return true
     else
         return false
@@ -292,15 +346,35 @@ function vif_count(cfg)
     return vif_num, ap_num, apcli_num
 end
 
-function mtwifi_cfg_foreach_vif(cfg, mode, func)
-    if cfg == nil or func == nil then return end
-
-    local vif_num,_,_ = vif_count(cfg)
-    for idx=0,vif_num-1 do
-        local v = cfg.interfaces[string.format("%d", idx)]
-        if v.config.mode and v.config.mode == mode then
-            func(v)
+local function ordered_vifs(cfg)
+    local interfaces = cfg.interfaces or {}
+    local keys = {}
+    for key in pairs(interfaces) do
+        keys[#keys + 1] = key
+    end
+    -- netifd uses zero-based keys in 24.10 and padded, one-based keys in 25.12.
+    table.sort(keys, function(a, b)
+        local na, nb = tonumber(a), tonumber(b)
+        if na and nb then
+            if na ~= nb then return na < nb end
+        elseif na then
+            return true
+        elseif nb then
+            return false
         end
+        return tostring(a) < tostring(b)
+    end)
+
+    local vifs = {}
+    for _, key in ipairs(keys) do
+        vifs[#vifs + 1] = interfaces[key]
+    end
+    return vifs
+end
+
+local function mtwifi_cfg_foreach_vif(cfg, mode, func)
+    for _, vif in ipairs(ordered_vifs(cfg)) do
+        if vif.config.mode == mode and not defs.disabled(vif.config.disabled) then func(vif) end
     end
 end
 
@@ -312,17 +386,18 @@ end
 function mtwifi_up(devname, cfg, restore_vifs, is_dbdc)
     nixio.syslog("info", "mtwifi-cfg: start "..devname)
     local dev = l1dat.devname_ridx[devname]
-    if not dev then return end
+    if not dev then return false end
 
     if is_dbdc then
-        local dbdc_main_dev = dev.INDEX .. "_1_1"
-        local dbdc_main_ifname = l1dat.devname_ridx[dbdc_main_dev].main_ifname
+        local dbdc_main_dev = l1dat.devname_ridx[dev.INDEX .. "_1_1"]
+        if not dbdc_main_dev then return false end
+        local dbdc_main_ifname = dbdc_main_dev.main_ifname
 
         if not is_dbdc_inited(dbdc_main_ifname) then
             nixio.syslog("info", "mtwifi-cfg: dbdc card init...")
-            ifup(dbdc_main_ifname)
+            if not ifup(dbdc_main_ifname) then return false end
             utils.sleep(1)
-            ifdown(dbdc_main_ifname)
+            if not ifdown(dbdc_main_ifname) then return false end
         end
 
         if restore_vifs and devname ~= cfg.device then
@@ -330,31 +405,51 @@ function mtwifi_up(devname, cfg, restore_vifs, is_dbdc)
             for _,vif in ipairs(restore_vifs) do
                 if vif_in_dev(vif, dev) and (not vif_is_apcli(vif, dev)) then
                     nixio.syslog("info", "mtwifi-cfg: restore ap vif: "..vif)
-                    ifup(vif)
+                    if not ifup(vif) then return false end
                 end
             end
             -- restart apcli vif
             for _,vif in ipairs(restore_vifs) do
                 if vif_is_apcli(vif, dev) then
                     nixio.syslog("info", "mtwifi-cfg: restore apcli vif: "..vif)
-                    ifup(vif)
+                    if not ifup(vif) then return false end
                     __apcli_auto_connect(vif)
                 end
             end
-            return
+            return true
         end
     end
 
-    local start_vif = function(v)
-        if (not v.config.disabled) and v.mtwifi_ifname then
-            local vif = v.mtwifi_ifname
-            nixio.syslog("info", "mtwifi-cfg: up vif: "..vif)
-            ifup(vif)
+    for _, mode in ipairs({"ap", "sta"}) do
+        for _, v in ipairs(ordered_vifs(cfg)) do
+            if v.config.mode == mode and not defs.disabled(v.config.disabled) and not ifup(v.mtwifi_ifname) then
+                return false
+            end
         end
     end
+    return true
+end
 
-    mtwifi_cfg_foreach_vif(cfg, "ap", start_vif)
-    mtwifi_cfg_foreach_vif(cfg, "sta", start_vif)
+local function stop_dot1x(dev)
+    local path = "/var/run/8021xd_" .. dev.main_ifname .. ".pid"
+    local file = io.open(path)
+    if not file then return true end
+    local pid = tonumber(file:read("*l"))
+    file:close()
+    local function running()
+        return pid and pid > 1 and fs.readlink("/proc/" .. pid .. "/exe") == "/usr/bin/8021xd" and
+            (fs.readfile("/proc/" .. pid .. "/cmdline") or ""):find("-i%z" .. utils.esc(dev.main_ifname) .. "%z")
+    end
+    if running() then
+        nixio.kill(pid, 15)
+        for i = 1, 20 do
+            if not running() then break end
+            nixio.nanosleep(0, 100000000)
+        end
+        if running() then return false end
+    end
+    os.remove(path)
+    return true
 end
 
 function mtwifi_down(devname, cfg)
@@ -362,42 +457,90 @@ function mtwifi_down(devname, cfg)
     local dev = l1dat.devname_ridx[devname]
     local reset_vifs = {}
 
-    if not dev then return end
+    if not dev then return reset_vifs, false end
 
+    local ok = stop_dot1x(dev)
     for _,vif in ipairs(string.split(utils.read_pipe("ls /sys/class/net"), "\n")) do
         if (vif_status(vif) == "up" and vif_in_dev(vif, dev)) then
             nixio.syslog("info", "mtwifi-cfg: down vif: "..vif)
-            ifdown(vif)
+            if not ifdown(vif) then ok = false end
             if cfg and devname ~= cfg.device then
                 reset_vifs[#reset_vifs+1] = vif
             end
         end
     end
-    return reset_vifs
+    return reset_vifs, ok
 end
 
-function mtwifi_reinstall()
-    nixio.syslog("info", "mtwifi-cfg: unload mtwifi module...")
+local function vendor_module_order()
+    local allowed = { mt_wifi = true, mtk_hwifi = true, connac_if = true,
+        mtk_pci = true, mtk_wed = true, mt7990 = true, mt7991 = true,
+        mt7992 = true, mt7993 = true, mtk_warp = true, mtk_warp_proxy = true,
+        debugger_wifi = true }
+    local order, visited = {}, {}
+    local function visit(name)
+        if not allowed[name] then error("wireless module has an unrelated consumer") end
+        if visited[name] then return end
+        visited[name] = true
+        local entries = fs.dir("/sys/module/" .. name .. "/holders")
+        if entries then
+            for holder in entries do
+                if holder ~= "." and holder ~= ".." then visit(holder) end
+            end
+        end
+        order[#order + 1] = name
+    end
+    visit("mt_wifi")
+    return order
+end
 
-    --os.execute("rmmod mt_whnat")
-    --os.execute("rmmod mtfwd")
-    os.execute("rmmod mtk_warp_proxy")
-    os.execute("rmmod mtk_warp")
-    --os.execute("rmmod mt7915_mt_wifi")
-    os.execute("rmmod mt_wifi")
+function mtwifi_reinstall(restore, order)
+    local root_changed = false
+    local function failed()
+        if restore and not restore() then
+            nixio.syslog("err", "mtwifi-cfg: profile recovery failed")
+        end
+        if root_changed then
+            for _, name in ipairs(order) do
+                if utils.exists("/sys/module/" .. name) and not command_ok("rmmod " .. name) then break end
+            end
+        end
+        for index = #order, 1, -1 do
+            if not command_ok("modprobe " .. order[index]) then
+                nixio.syslog("err", "mtwifi-cfg: driver recovery failed")
+                break
+            end
+        end
+        return false
+    end
+    for _, name in ipairs(order) do
+        if utils.exists("/sys/module/" .. name) then
+            if not command_ok("rmmod " .. name) then return failed() end
+            if name == "mt_wifi" then root_changed = true end
+        end
+    end
+    for index = #order, 1, -1 do
+        if not command_ok("modprobe " .. order[index]) then return failed() end
+    end
+    return true
+end
 
-    utils.sleep(2)
-
-    nixio.syslog("info", "mtwifi-cfg: reload mtwifi module...")
-
-    os.execute("modprobe mt_wifi")
-    --os.execute("modprobe mt7915_mt_wifi")
-    os.execute("modprobe mtk_warp")
-    os.execute("modprobe mtk_warp_proxy")
-    --os.execute("modprobe mtfwd")
-    --os.execute("modprobe mt_whnat")
-
-    utils.sleep(1)
+local function restart_other_radios(current)
+    local cursor = uci.cursor()
+    cursor:foreach("wireless", "wifi-device", function(section)
+        local name = section[".name"]
+        if name ~= current and section.type == "mtwifi" and l1dat.devname_ridx[name] and
+            tostring(section.disabled) ~= "1" and name:match("^[%w_]+$") then
+            local request = cjson.encode({ device = name })
+            local quoted = "'" .. request:gsub("'", "'\\''") .. "'"
+            local command = "(ubus call network.wireless down " .. quoted ..
+                "; ubus call network.wireless up " .. quoted .. ") </dev/null >/dev/null 2>&1 &"
+            if not command_ok(command) then
+                nixio.syslog("err", "mtwifi-cfg: could not restart sibling radio")
+            end
+        end
+    end)
+    cursor:close()
 end
 
 function __exec_iwpriv_cmd(ifname, key, val)
@@ -417,53 +560,36 @@ function mtwifi_cfg_iwpriv_hook(cfg)
     end
 
     local apcli_hook = function(v)
-        if (not v.config.disabled) and v.mtwifi_ifname then
-            local vif = v.mtwifi_ifname
-            __apcli_auto_connect(vif)
-        end
+        __apcli_auto_connect(v.mtwifi_ifname)
     end
 
     mtwifi_cfg_foreach_vif(cfg, "ap", ap_hook)
     mtwifi_cfg_foreach_vif(cfg, "sta", apcli_hook)
 end
 
-function set_chip_cfg(cfg, dats, init_whnat)
-    local dev_dats
-    local uci
-    local dat_key
-
-    if not cfg.config.dbdc_main then return end
-
-    for k,v in pairs(defs.chip_cfgs) do
-        uci = k
-        dat_key = v[1]
-
-        if not (init_whnat and dat_key == "WHNAT") then
-            -- reset chip cfgs to default
-            dats[dat_key] = v[2]
-
-            -- setup current dev cfg
-            set_dev_dat(dats, dat_key, cfg.config[uci])
+local function set_chip_cfg(cfg, dats, init_whnat, changes)
+    if not defs.disabled(cfg.config.dbdc_main) then return true end
+    local shared = {}
+    for option, field in pairs(defs.chip_cfgs) do
+        local key = field[1]
+        if key ~= "WHNAT" or not init_whnat then
+            dats[key] = field[2]
+            set_dev_dat(dats, key, cfg.config[option])
+            shared[key] = dats[key]
         end
     end
-
-    -- setup other dev cfg
-    for k,v in pairs(l1dat.devname_ridx) do
-        if k ~= cfg.device and 
-        v.INDEX == l1dat.devname_ridx[cfg.device].INDEX and 
-        v.mainidx == l1dat.devname_ridx[cfg.device].mainidx then        
-            dev_dats = load_profile(v.profile_path)
-            if dev_dats then
-                for _,j in pairs(defs.chip_cfgs) do
-                    dat_key = j[1]
-                    if not (init_whnat and dat_key == "WHNAT") then
-                        set_dev_dat(dev_dats, dat_key, dats[dat_key])
-                    end
-                end
-                save_profile(dev_dats, v.profile_path)
+    local dev = l1dat.devname_ridx[cfg.device]
+    for _, radio in pairs(l1dat.devname_ridx) do
+        if radio.profile_path ~= dev.profile_path and radio.INDEX == dev.INDEX and radio.mainidx == dev.mainidx then
+            local current = load_profile(radio.profile_path)
+            if not current then return false end
+            for key, value in pairs(shared) do
+                if tostring(current[key]) ~= tostring(value) and
+                    not stage_profile(changes, radio.profile_path, { [key] = value }) then return false end
             end
         end
     end
+    return true
 end
 
 local function mld_group(config)
@@ -522,33 +648,17 @@ end
 local function mld_eht_mode(value)
     local modes = {
         EHT20 = true, EHT40 = true, EHT80 = true, EHT80_80 = true,
-        EHT160 = true, EHT320 = true
+        EHT160 = true, EHT320 = true, ["EHT320-1"] = true, ["EHT320-2"] = true
     }
     return type(value) == "string" and modes[value] == true
 end
 
 local function mld_writer_signature(iface)
-    local enc = defs.enc2dat[iface.encryption or "none"]
-    if not enc then
-        return nil
-    end
-
-    local authmode, cipher = enc[1], enc[2]
-    local pmf_mfpc = tostring(defs.vif_cfgs.PMFMFPC or "0")
-    local pmf_mfpr = tostring(defs.vif_cfgs.PMFMFPR or "0")
-    local pmf_sha256 = tostring(defs.vif_cfgs.PMFSHA256 or "0")
-    if authmode == "OWE" or authmode == "WPA3PSK" then
-        pmf_mfpc, pmf_mfpr, pmf_sha256 = "1", "1", "0"
-    elseif authmode == "WPA2PSKWPA3PSK" then
-        pmf_mfpc, pmf_mfpr, pmf_sha256 = "1", "0", "0"
-    end
-
-    -- Match the AP writer: omitted key becomes empty, and 802.1X/RADIUS
-    -- fields retain the reset defaults because this writer does not map them.
-    return {
-        tostring(iface.ssid or ""), authmode, cipher, tostring(iface.key or ""),
-        pmf_mfpc, pmf_mfpr, pmf_sha256, mld_bool(defs.vif_cfgs.IEEE8021X)
-    }
+    local security = defs.security(iface)
+    if not security then return nil end
+    local signature = defs.security_signature(security)
+    signature[#signature + 1] = tostring(iface.ssid or "")
+    return signature
 end
 
 local function add_mld_member(groups, group, signature, legacy_boolean)
@@ -573,8 +683,6 @@ local function validate_mld_groups(cfg)
     local current_dev = l1dat.devname_ridx[current_device]
     local current_profile = current_dev and load_profile(current_dev.profile_path) or {}
     local interfaces = cfg.interfaces or {}
-    local vif_num = 0
-    for _ in pairs(interfaces) do vif_num = vif_num + 1 end
     local config = cfg.config or {}
     local htmode = config.htmode or cursor:get("wireless", current_device, "htmode")
     local disabled_value = config.disabled
@@ -586,8 +694,7 @@ local function validate_mld_groups(cfg)
 
     -- The writer walks netifd's numeric interface keys and increments the DAT
     -- slot only for APs. Resolve an omitted option from that exact profile slot.
-    for index = 0, vif_num - 1 do
-        local item = interfaces[tostring(index)] or interfaces[index]
+    for _, item in ipairs(ordered_vifs(cfg)) do
         local iface = item and (item.config or item)
         if iface and iface.mode == "ap" then
             apidx = apidx + 1
@@ -671,13 +778,127 @@ local function valid_eht_restricted_twt(value)
     return value == nil or value == "" or value == 0 or value == "0" or value == 1 or value == "1"
 end
 
+local function valid_mac(value)
+    return type(value) == "string" and value:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
+end
+
+local function acl(config)
+    local list, seen = {}, {}
+    local function add(mac)
+        if not valid_mac(mac) then return false end
+        mac = mac:lower()
+        if seen[mac] then return true end
+        if #list >= defs.max_acl_entry then return false end
+        list[#list + 1], seen[mac] = mac, true
+        return true
+    end
+    if config.macfilter ~= "allow" and config.macfilter ~= "deny" then return "" end
+    if config.maclist ~= nil and type(config.maclist) ~= "table" then return nil end
+    for _, mac in ipairs(config.maclist or {}) do
+        if not add(mac) then return nil end
+    end
+    if config.macfile and config.macfile ~= "" then
+        if type(config.macfile) ~= "string" or config.macfile:sub(1, 1) ~= "/" or
+            fs.stat(config.macfile, "type") ~= "reg" then return nil end
+        local file = io.open(config.macfile, "r")
+        if not file then return nil end
+        local contents = file:read(16385)
+        file:close()
+        if contents and #contents > 16384 then return nil end
+        for line in ((contents or "") .. "\n"):gmatch("([^\n]*)\n") do
+            local mac = utils.trim(line:gsub("#.*$", ""))
+            if mac ~= "" and not add(mac) then return nil end
+        end
+    end
+    return table.concat(list, ";")
+end
+
+local function validate_vifs(cfg, dev)
+    local settings = {}
+    for _, v in ipairs(ordered_vifs(cfg)) do
+        if type(v) ~= "table" or type(v.config) ~= "table" then return nil, "INVALID_INTERFACE" end
+        local config = v.config
+        local mode = config.mode
+        local disabled = defs.disabled(config.disabled)
+        local ifname = v.mtwifi_ifname
+        local prefix = mode == "ap" and dev.ext_ifname or dev.apcli_ifname
+        if mode ~= "ap" and mode ~= "sta" then return nil, "UNSUPPORTED_INTERFACE_MODE" end
+        if not disabled and (type(ifname) ~= "string" or #ifname > 15 or not prefix or
+            not ifname:match("^" .. utils.esc(prefix) .. "%d+$")) then
+            return nil, "INVALID_INTERFACE_NAME"
+        end
+
+        local security, err = defs.security(config)
+        local ssid = config.ssid
+        if type(ssid) ~= "string" or #ssid == 0 or #ssid > 32 or ssid:find("%c") then
+            ssid, err = "", "INVALID_SSID"
+        end
+        if security and cfg.config.band == "6g" and security.auth ~= "WPA3PSK" and security.auth ~= "OWE" then
+            err = "SIX_GHZ_REQUIRES_SAE_OR_OWE"
+        end
+        for _, field in ipairs({"macaddr", "bssid"}) do
+            if config[field] and config[field] ~= "" and not valid_mac(config[field]) then
+                if not disabled then return nil, "INVALID_MAC_ADDRESS" end
+                config[field] = nil
+            end
+        end
+        local maclist = ""
+        if mode == "ap" and not disabled then
+            for field in pairs(defs.iwpriv_ap_cfgs) do
+                local value = config[field]
+                if value ~= nil and value ~= "" then
+                    local threshold = tonumber(value)
+                    if not threshold or threshold % 1 ~= 0 or threshold < -100 or threshold > 0 then
+                        return nil, "INVALID_RSSI_THRESHOLD"
+                    end
+                    config[field] = threshold
+                else
+                    config[field] = nil
+                end
+            end
+            maclist = acl(config)
+            if not maclist then return nil, "INVALID_ACL" end
+        end
+        if err and not disabled then return nil, err end
+        settings[v] = { security = err and defs.security({}) or security, ssid = ssid, maclist = maclist }
+    end
+    return settings
+end
+
 function mtwifi_cfg_setup(argv)
-    local cfg = cjson.decode(argv)
+    local decoded, cfg = pcall(cjson.decode, argv)
+    if not decoded or type(cfg) ~= "table" or type(cfg.config) ~= "table" or
+        type(cfg.interfaces) ~= "table" or not l1dat then return false end
 
     local devname = cfg.device
     local dev = l1dat.devname_ridx[devname]
 
-    if not dev then return end
+    if not dev then return false end
+
+    local device_band = l1parser.device_band(dev)
+    local radio = cfg.config
+    if radio.band == nil or radio.band == "" or radio.band == "auto" then radio.band = device_band end
+    if radio.band == "2.4g" then radio.band = "2g" end
+    if device_band and radio.band ~= device_band then
+        nixio.syslog("err", "mtwifi-cfg: RADIO_BAND_MISMATCH")
+        return false
+    end
+    if radio.channel == nil or radio.channel == "" or tostring(radio.channel) == "0" then radio.channel = "auto" end
+    local country = radio.country
+    local region
+    if type(country) == "string" and country ~= "" then
+        country = country:upper()
+        region = defs.country_region(country, radio.band)
+        if region == nil then
+            nixio.syslog("err", "mtwifi-cfg: INVALID_COUNTRY")
+            return false
+        end
+    end
+    local vifs, vif_error = validate_vifs(cfg, dev)
+    if not vifs then
+        nixio.syslog("err", "mtwifi-cfg: " .. vif_error)
+        return false
+    end
 
     local whnat = whnat_group(dev)
 
@@ -700,6 +921,9 @@ function mtwifi_cfg_setup(argv)
         return false
     end
     local dats_orig = load_profile(profile)
+    if not dats_orig then return false end
+    local changes = {}
+    local function restore_profile() return restore_profiles(changes) end
     set_optional_dev_dat(dats, "Vht1024QamSupport", cfg.config.vht_1024)
     set_optional_dev_dat(dats, "TxBurst", cfg.config.tx_burst)
     local is_5g = cfg.config.band == "5g"
@@ -710,18 +934,21 @@ function mtwifi_cfg_setup(argv)
     local vif_num, bssid_num, apcli_num = vif_count(cfg)
 
     if vif_num == 0 then
-        nixio.syslog("err", "mtwifi-cfg: not valid vif found!")
-        return
+        local _, stopped = mtwifi_down(devname)
+        return stopped
     end
     if bssid_num > defs.max_mbssid then
         nixio.syslog("err", "mtwifi-cfg: too many vifs!")
-        return
+        return false
     end
     if apcli_num > 1 then
         nixio.syslog("err", "mtwifi-cfg: only support one apcli vif!")
+        return false
     end
 
-    dats.BssidNum = 4
+    -- Changing BssidNum reloads the shared driver. Keep the vendor allocation
+    -- (two on BE14 6 GHz) unless the requested APs need more slots.
+    dats.BssidNum = math.max(1, bssid_num, tonumber(dats_orig.BssidNum) or 4)
 
     -- HeLdpc is parsed as one semicolon-delimited value per BSSID. Only
     -- replace the profile when the radio option is explicitly configured.
@@ -733,48 +960,47 @@ function mtwifi_cfg_setup(argv)
         end
         dats.HeLdpc = table.concat(he_ldpc, ";")
     end
-    
+
 
     -- setup wireless mode
     if type(cfg.config.htmode) ~= type("") then
         nixio.syslog("err", "mtwifi-cfg: invalid htmode!")
-        return
+        return false
     end
 
-    local WirelessMode
-
-    if cfg.config.band == "2g" then
-        WirelessMode = 9  -- PHY_11BGN_MIXED
-        if is_ax_mode(cfg) then
-            WirelessMode = 16  -- PHY_11AX_24G
-        elseif is_be_mode(cfg) then
-            WirelessMode = 22 -- PHY_11BE_24G
-        end
-    elseif cfg.config.band == "5g" then
-        WirelessMode = 15 -- PHY_11VHT_N_MIXED
-        if is_ax_mode(cfg) then
-            WirelessMode = 17 -- PHY_11AX_5G
-        elseif is_be_mode(cfg) then
-            WirelessMode = 23 -- PHY_11BE_5G
-        end
-    elseif cfg.config.band == "6g" then
-        if is_ax_mode(cfg) then
-            WirelessMode = 18 -- PHY_11AX_6G
-        elseif is_be_mode(cfg) then
-            WirelessMode = 24 -- PHY_11BE_6G
-        end
+    if region ~= nil then
+        dats.CountryCode = country
+        dats[radio.band == "2g" and "CountryRegion" or "CountryRegionABand"] = region
     end
-
-
-    if not WirelessMode then
-        nixio.syslog("err", "mtwifi-cfg: invalid wireless mode!")
-        return
-    end
-
-    local bandwidth_ok, bandwidth_err = bandwidth.apply(cfg.config, dats)
+    local bandwidth_ok, bandwidth_err, WirelessMode = bandwidth.apply(cfg.config, dats)
     if not bandwidth_ok then
         nixio.syslog("err", "mtwifi-cfg: " .. bandwidth_err .. "!")
-        return
+        return false
+    end
+    local channel_ok, channel_error = bandwidth.set_channel(cfg.config, dats)
+    if not channel_ok then
+        nixio.syslog("err", "mtwifi-cfg: " .. channel_error)
+        return false
+    end
+
+    if is_ax_mode(cfg) or is_be_mode(cfg) then
+        if radio.bss_color ~= nil and radio.bss_color ~= "" then
+            local color = tonumber(radio.bss_color)
+            if not color or color ~= math.floor(color) or (color ~= 255 and (color < 1 or color > 63)) then
+                nixio.syslog("err", "mtwifi-cfg: invalid BSS color")
+                return false
+            end
+            dats.BSSColorValue = color
+        end
+        local sr = cfg2dat(radio.sre_enable)
+        if sr ~= nil and sr ~= "" then
+            sr = tonumber(sr)
+            if sr ~= 0 and sr ~= 1 then
+                nixio.syslog("err", "mtwifi-cfg: invalid spatial reuse value")
+                return false
+            end
+            dats.SREnable = sr
+        end
     end
 
     -- setup apcli
@@ -789,25 +1015,23 @@ function mtwifi_cfg_setup(argv)
     dats.ApCliPMFMFPC = 0
     dats.ApCliPMFMFPR = 0
     dats.ApCliPMFSHA256 = 0
+    dats.ApCliPweMethod = 0
 
-    for _,v in pairs(cfg.interfaces) do
+    for _, v in ipairs(ordered_vifs(cfg)) do
         if v.config.mode == "sta" then
-            if not v.config.disabled then
-                dats.ApCliEnable = 1
-            end
-            dats.ApCliSsid = v.config.ssid or ""
+            local security = vifs[v].security
+            local enabled = not defs.disabled(v.config.disabled)
+            dats.ApCliEnable = enabled and 1 or 0
+            dats.ApCliSsid = vifs[v].ssid
             dats.ApCliBssid = v.config.bssid or ""
-            dats.MACRepeaterEn = (v.config.bssid and v.config.bssid ~= "") and 1 or 0
+            dats.MACRepeaterEn = enabled and defs.disabled(v.config.mac_repeater) and 1 or 0
             dats.ApcliMacAddress = v.config.macaddr or (dats.MacAddress_Default or "")
-            dats.ApCliAuthMode = defs.enc2dat[v.config.encryption][1]
-            dats.ApCliEncrypType = defs.enc2dat[v.config.encryption][2]
-            dats.ApCliWPAPSK = v.config.key or ""
-
-            if dats.ApCliAuthMode == "OWE" or dats.ApCliAuthMode == "WPA3PSK" then
-                dats.ApCliPMFMFPC = 1
-                dats.ApCliPMFMFPR = 1
-                dats.ApCliPMFSHA256 = 0
-            end
+            dats.ApCliAuthMode = security.auth
+            dats.ApCliEncrypType = security.cipher
+            dats.ApCliWPAPSK = security.key
+            dats.ApCliPMFMFPC = security.pmf > 0 and 1 or 0
+            dats.ApCliPMFMFPR = security.pmf == 2 and 1 or 0
+            dats.ApCliPweMethod = cfg.config.band == "6g" and 2 or 0
             break
         end
     end
@@ -839,26 +1063,9 @@ function mtwifi_cfg_setup(argv)
     end
 
     -- setup chip cfgs
-    set_chip_cfg(cfg, dats, whnat ~= nil)
+    if not set_chip_cfg(cfg, dats, whnat ~= nil, changes) then return false end
 
     -- setup other dev cfgs
-    if type(cfg.config.country) == type("") and #cfg.config.country == 2 then
-        dats.CountryCode = cfg.config.country
-        if cfg.config.band == "2g" then
-            dats.CountryRegion = defs.countryRegions[cfg.config.country][1]
-        elseif cfg.config.band == "5g" or cfg.config.band == "6g" then
-            dats.CountryRegionABand = defs.countryRegions[cfg.config.country][2]
-        end
-    end
-
-    if cfg.config.channel == "auto" then
-        dats.AutoChannelSelect = 3
-        dats.Channel = 0
-    else
-        dats.AutoChannelSelect = 0
-        dats.Channel = cfg.config.channel
-    end
-
     if cfg.config.txpower and cfg.config.txpower < 100 then
         dats.PERCENTAGEenable = 1
         dats.TxPower = cfg.config.txpower
@@ -932,13 +1139,30 @@ function mtwifi_cfg_setup(argv)
     end
 
     -- setup vif cfgs
+    local eap_bridges, ownip = {}, nil
     local apidx = 1
-    for idx = 0,vif_num-1 do
-        v = cfg.interfaces[string.format("%d", idx)]
+    for _, v in ipairs(ordered_vifs(cfg)) do
         if v.config.mode == "ap" then
-            set_idx_dat(dats, apidx, "SSID", v.config.ssid)
-            set_idx_dat(dats, apidx, "WPAPSK", v.config.key or "")
-            set_dat(dats, apidx, "NoForwarding", 0)
+            local settings = vifs[v]
+            local security = settings.security
+            if security.server and not defs.disabled(v.config.disabled) then
+                local bridge = v.bridge or v.mtwifi_ifname
+                if not bridge or #bridge > 15 or not bridge:match("^[%w_.-]+$") then return false end
+                local ip = v.config.ownip or utils.read_pipe("ip -4 route get " .. security.server):match(" src ([%d.]+)")
+                if not ip or (ownip and ip ~= ownip) then
+                    nixio.syslog("err", "mtwifi-cfg: RADIUS source address unavailable or inconsistent")
+                    return false
+                end
+                ownip = ip
+                eap_bridges[bridge] = true
+                set_dat(dats, apidx, "RADIUS_Server", security.server)
+                set_dat(dats, apidx, "RADIUS_Port", security.port)
+                set_idx_dat(dats, apidx, "RADIUS_Key", security.secret)
+                -- WPA2 selects the external authenticator. IEEE8021X enables dynamic WEP in WEXT.
+            end
+            set_idx_dat(dats, apidx, "SSID", settings.ssid)
+            set_idx_dat(dats, apidx, "WPAPSK", security.key)
+            set_dat(dats, apidx, "NoForwarding", defs.disabled(v.config.isolate) and 1 or 0)
             set_dat(dats, apidx, "HideSSID", v.config.hidden)
             -- The legacy parser consumes one boolean token per AP BSSID.
             -- Keep the vendor profile untouched when this EHT-only control is unset.
@@ -957,10 +1181,10 @@ function mtwifi_cfg_setup(argv)
                 effective_group = tonumber(utils.token_get(dats.MldGroup, apidx, "0"))
             end
             if effective_group == 0 then
-                if idx == 0 then
+                if apidx == 1 then
                     dats.MacAddress = v.config.macaddr or (dats.MacAddress_Default or "")
                 else
-                    set_idx_dat(dats, apidx, "MacAddress", v.config.macaddr or (dats.MacAddress_Default or ""))
+                    set_idx_dat(dats, apidx - 1, "MacAddress", v.config.macaddr or (dats.MacAddress_Default or ""))
                 end
             end
             set_dat(dats, apidx, "WmmCapable", v.config.wmm)
@@ -991,48 +1215,19 @@ function mtwifi_cfg_setup(argv)
                 set_dat(dats, apidx, "HT_BAWinSize", 64)
             end
 
-            if v.config.macfilter then
-                if v.config.macfilter == "allow" then
-                    set_idx_dat(dats, apidx-1, "AccessPolicy", 1)
-                elseif v.config.macfilter == "deny" then
-                    set_idx_dat(dats, apidx-1, "AccessPolicy", 2)
-                end
-            end
+            local policy = ({ allow = 1, deny = 2 })[v.config.macfilter] or 0
+            dats["AccessPolicy" .. (apidx - 1)] = policy
+            dats["AccessControlList" .. (apidx - 1)] = settings.maclist
 
-            if v.config.maclist then
-                local maclist = ""
-                for i, v in ipairs(v.config.maclist) do
-                    if i > defs.max_acl_entry then 
-                        break
-                    end
-                    if #maclist > 0 then
-                        maclist = maclist .. ";" .. v
-                    else
-                        maclist = v
-                    end
-                end
-                set_idx_dat(dats, apidx-1, "AccessControlList", maclist)
-            end
-
-            local authmode = defs.enc2dat[v.config.encryption][1]
+            local authmode = security.auth
             set_dat(dats, apidx, "AuthMode", authmode)
-            set_dat(dats, apidx, "EncrypType", defs.enc2dat[v.config.encryption][2])
-
-            if authmode == "OWE" or authmode == "WPA3PSK" then
-                set_dat(dats, apidx, "PMFMFPC", 1)
-                set_dat(dats, apidx, "PMFMFPR", 1)
-                set_dat(dats, apidx, "PMFSHA256", 0)
-            elseif authmode == "WPA2PSKWPA3PSK" then
-                set_dat(dats, apidx, "PMFMFPC", 1)
-                set_dat(dats, apidx, "PMFMFPR", 0)
-                set_dat(dats, apidx, "PMFSHA256", 0)
-            end
+            set_dat(dats, apidx, "EncrypType", security.cipher)
+            set_dat(dats, apidx, "PMFMFPC", security.pmf > 0 and 1 or 0)
+            set_dat(dats, apidx, "PMFMFPR", security.pmf == 2 and 1 or 0)
 
             if cfg.config.band == "6g" then
                 -- SAE hash-to-element and PMF are required on 6 GHz.
                 set_dat(dats, apidx, "PweMethod", 2)
-                set_dat(dats, apidx, "PMFMFPC", 1)
-                set_dat(dats, apidx, "PMFMFPR", 1)
             end
 
             if not (authmode == "OPEN" or authmode == "OWE") then
@@ -1043,17 +1238,23 @@ function mtwifi_cfg_setup(argv)
         end
     end
 
+    if ownip then
+        local names = {}
+        for name in pairs(eap_bridges) do names[#names + 1] = name end
+        table.sort(names)
+        dats.own_ip_addr = ownip
+        dats.EAPifname = table.concat(names, ";")
+        dats.PreAuthifname = dats.EAPifname
+    end
     local reinstall_wifidrv = false
     local whnat_enabled
     if whnat then
         whnat_enabled = whnat_value(whnat)
-        if not whnat_enabled or not whnat_save(whnat, whnat_enabled, profile, dats) then
+        if not whnat_enabled or not whnat_stage(changes, whnat, whnat_enabled, profile, dats) then
             return false
         end
     end
     local cfg_diff = diff_cfg(dats_orig, dats)
-
-    if not save_profile(dats, profile) then return false end
 
     for _,v in pairs(defs.reinstall_cfgs) do
         local changed = cfg_diff[v] ~= nil
@@ -1066,81 +1267,109 @@ function mtwifi_cfg_setup(argv)
         -- WiFi7 reads WHNAT from init_path at probe and supports a native
         -- runtime setter; unloading the legacy module stack cannot apply it.
         if changed and not (whnat and v == "WHNAT") then
-            if utils.exists("/sys/module/mt_wifi") == false then
+            if utils.exists("/sys/module/mt_wifi/refcnt") == false then
                 nixio.syslog("err", "mtwifi-cfg: mtwifi module is build-in, please reboot the device!")
-                return
+                return false
             end
             reinstall_wifidrv = true
         end
     end
 
-    if string.find(profile, "dbdc") then
-        if reinstall_wifidrv then
-            for k, _ in pairs(l1dat.devname_ridx) do
-                mtwifi_down(k)
-            end
-
-            mtwifi_reinstall()
-
-            for k, _ in pairs(l1dat.devname_ridx) do
-                if k == devname then
-                    mtwifi_up(k, cfg, nil, true)
-                else
-                    os.execute("/sbin/wifi up " .. k) -- TODO: may cause deadlock
-                end
-            end
-        else
-            local restore_vifs = {}
-            local restart_other_dbdc_dev = false
-            if next(cfg_diff) ~= nil then
-                restart_other_dbdc_dev = true
-            end
-
-            if restart_other_dbdc_dev then
-                for k, j in pairs(l1dat.devname_ridx) do
-                    if j.INDEX == dev.INDEX and j.mainidx == dev.mainidx then
-                        local ret = mtwifi_down(k, cfg)
-                        for _, v in ipairs(ret) do
-                            table.insert(restore_vifs, v)
-                        end
-                    end
-                end
-                if #restore_vifs > 0 then
-                    nixio.syslog("info", "mtwifi-cfg: dbdc restore_vifs: "..inspect.inspect(restore_vifs))
-                end
-
-                for k, j in pairs(l1dat.devname_ridx) do
-                    if j.INDEX == dev.INDEX and j.mainidx == dev.mainidx then
-                        mtwifi_up(k, cfg, restore_vifs, true)
-                    end
-                end
-            else
-                mtwifi_down(devname)
-                mtwifi_up(devname, cfg, nil, true)
-            end
+    local module_order
+    if reinstall_wifidrv then
+        local ok
+        ok, module_order = pcall(vendor_module_order)
+        if not ok then
+            nixio.syslog("err", "mtwifi-cfg: wireless driver has an unrelated consumer")
+            return false
         end
-    else
-        mtwifi_down(devname)
-
-        if reinstall_wifidrv then
-            mtwifi_reinstall()
-        end
-
-        mtwifi_up(devname, cfg)
+    end
+    if not stage_profile(changes, profile, dats) or not commit_profiles(changes) then return false end
+    local is_dbdc = string.find(profile, "dbdc") ~= nil
+    local function recover()
+        local _, stopped = mtwifi_down(devname)
+        if not restore_profile() then nixio.syslog("err", "mtwifi-cfg: profile recovery failed") end
+        if not stopped then nixio.syslog("err", "mtwifi-cfg: wireless cleanup failed") end
+        return false
     end
 
+    if reinstall_wifidrv then
+        for name in pairs(l1dat.devname_ridx) do
+            local _, stopped = mtwifi_down(name)
+            if not stopped then
+                recover()
+                restart_other_radios(devname)
+                return false
+            end
+        end
+        if not mtwifi_reinstall(restore_profile, module_order) then
+            restart_other_radios(devname)
+            return false
+        end
+        local started = mtwifi_up(devname, cfg, nil, is_dbdc)
+        if not started then recover() end
+        restart_other_radios(devname)
+        if not started then return false end
+    elseif is_dbdc and next(cfg_diff) ~= nil then
+        local restore_vifs = {}
+        local siblings = {}
+        for name, radio in pairs(l1dat.devname_ridx) do
+            if radio.INDEX == dev.INDEX and radio.mainidx == dev.mainidx then
+                siblings[#siblings + 1] = name
+            end
+        end
+        table.sort(siblings)
+        local stopped = true
+        for _, name in ipairs(siblings) do
+            local vifs, ok = mtwifi_down(name, cfg)
+            for _, vif in ipairs(vifs) do restore_vifs[#restore_vifs + 1] = vif end
+            if not ok then
+                stopped = false
+                break
+            end
+        end
+        local started = stopped and mtwifi_up(devname, cfg, nil, true)
+        if not started then recover() end
+        for _, name in ipairs(siblings) do
+            if name ~= devname and not mtwifi_up(name, cfg, restore_vifs, true) then
+                nixio.syslog("err", "mtwifi-cfg: could not restore " .. name)
+            end
+        end
+        if not started then return false end
+    else
+        local _, stopped = mtwifi_down(devname)
+        if not stopped or not mtwifi_up(devname, cfg, nil, is_dbdc) then return recover() end
+    end
+
+    if ownip then
+        if not dev.main_ifname:match("^[%w_]+$") or not dev.ext_ifname:match("^[%w_]+$") or
+            not command_ok("/usr/bin/8021xd -i " .. dev.main_ifname .. " -p " .. dev.ext_ifname) then
+            nixio.syslog("err", "mtwifi-cfg: RADIUS authenticator failed to start")
+            return recover()
+        end
+    end
     mtwifi_cfg_iwpriv_hook(cfg)
-    if whnat and not whnat_apply(whnat, whnat_enabled) then return false end
+    if whnat and not whnat_apply(whnat, whnat_enabled) then
+        recover()
+        local before = load_profile(whnat.path)
+        if before and (before.WHNAT == "0" or before.WHNAT == "1") then whnat_apply(whnat, before.WHNAT) end
+        return false
+    end
+    return true
 end
 
 function mtwifi_cfg_down(devname)
+    if not l1dat then return false end
     if devname then
-        mtwifi_down(devname)
-    else
-        for k, _ in pairs(l1dat.devname_ridx) do
-            mtwifi_down(k)
-        end
+        local _, stopped = mtwifi_down(devname)
+        return stopped
     end
+    local ok = true
+    for name in pairs(l1dat.devname_ridx) do
+        local _, stopped = mtwifi_down(name)
+        if not stopped then ok = false end
+    end
+    return ok
 end
 
 local action = {
@@ -1148,16 +1377,12 @@ local action = {
         if not mtwifi_cfg_whnat() then os.exit(1) end
     end,
     ["down"] = function(devname)
-        mtwifi_cfg_down(devname)
+        if not mtwifi_cfg_down(devname) then os.exit(1) end
     end,
 
     ["setup"] = function()
         local argv = io.read()
-        if #argv > 0 then
-            if mtwifi_cfg_setup(argv) == false then
-                os.exit(1)
-            end
-        end
+        if not argv or not mtwifi_cfg_setup(argv) then os.exit(1) end
     end
 }
 

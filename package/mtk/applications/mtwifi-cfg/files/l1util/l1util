@@ -22,7 +22,7 @@ if not l1dat then
 end
 
 function show_usage()
-    print("Usage: l1util list | whnat | get <dev> <prop> | idx2if <idx> | if2zone <ifname> | if2dat <ifname> | zone2if <zone> | if2dbdcidx <ifname>")
+    print("Usage: l1util list | whnat | radio <dev> | get <dev> <prop> | idx2if <idx> | if2zone <ifname> | if2dat <ifname> | zone2if <zone> | if2dbdcidx <ifname>")
 end
 
 function show_devs()
@@ -57,6 +57,30 @@ function get_dev_prop(dev, prop)
 end
 
 local action = {
+    ["radio"] = function(name)
+        local dev = l1dat.devname_ridx[name]
+        if not dev then os.exit(1) end
+        local defs = require("mtwifi_defs")
+        local bandwidth = require("mtwifi_bandwidth")
+        local band = l1parser.device_band(dev)
+        local countries = {}
+        for country in pairs(defs.countryRegions) do
+            countries[country] = band and defs.country_region(country, band) or true
+        end
+        countries["00"] = band and defs.country_region("00", band) or true
+        local profile = require("datconf").openfile(dev.profile_path)
+        local settings = profile and profile:getall() or {}
+        if profile then profile:close() end
+        local region = tonumber(settings[band == "2g" and "CountryRegion" or "CountryRegionABand"])
+        if band == "5g" and settings.CountryCode == "US" then region = defs.country_region("US", band) end
+        print(require("cjson").encode({
+            band = band, ifname = dev.main_ifname, countries = countries,
+            channels = band and bandwidth.region_channels[band] or nil,
+            region = region,
+            country = settings.CountryCode
+        }))
+    end,
+
     ["whnat"] = function()
         print(require("cjson").encode(l1parser.whnat_owners(l1dat)))
     end,

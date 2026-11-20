@@ -2538,10 +2538,24 @@ UCHAR eht_cent_ch_freq(struct wifi_dev *wdev, UCHAR prim_ch, UCHAR eht_bw, UCHAR
 			idx++;
 		}
 	} else if (eht_bw == EHT_BW_320) {
+		UCHAR layout = 0;
+
+#ifdef CONFIG_AP_SUPPORT
+		RTMP_ADAPTER *ad = wdev->sys_handle;
+
+		if (ad && wdev->wdev_type == WDEV_TYPE_AP)
+			layout = ad->ApCfg.Eht320Layout;
+#endif
 		while (ch_320M && idx < ch_layout_size[3] &&
 				ch_320M[idx].ch_up_bnd != 0) {
 			if (prim_ch >= ch_320M[idx].ch_low_bnd &&
 				prim_ch <= ch_320M[idx].ch_up_bnd) {
+				if (layout) {
+					if ((idx % 2) + 1 == layout)
+						return ch_320M[idx].cent_freq_idx;
+					idx++;
+					continue;
+				}
 				/* if ext_ch == below:
 				 * central ch < primary channel
 				 * if ext_ch == above:
@@ -2571,11 +2585,20 @@ BOOLEAN eht320_channel_group(RTMP_ADAPTER *pAd, UCHAR channel, struct wifi_dev *
 	CHANNEL_CTRL *pChCtrl = hc_get_channel_ctrl(pAd->hdev_ctrl);
 	UCHAR groupch = 0;
 	BOOLEAN is_valid = FALSE;
+	UCHAR layout = 0;
 
+#ifdef CONFIG_AP_SUPPORT
+	if (wdev->wdev_type == WDEV_TYPE_AP)
+		layout = pAd->ApCfg.Eht320Layout;
+#endif
 	/* build BW320 new_ch_layout with support_ch(pChCtrl) */
 	while (old_idx < ch_layout_size && old_ch_layout[old_idx].ch_up_bnd != 0) {
-		if (new_idx + 15 >= pChCtrl->ChListNum)
+		if (cur_ch + 15 >= pChCtrl->ChListNum)
 			break;
+		if (layout && (old_idx % 2) + 1 != layout) {
+			old_idx++;
+			continue;
+		}
 
 		if (pChCtrl->ChList[cur_ch].Channel == old_ch_layout[old_idx].ch_low_bnd) {
 			if (pChCtrl->ChList[cur_ch+15].Channel == old_ch_layout[old_idx].ch_up_bnd) {

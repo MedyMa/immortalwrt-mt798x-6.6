@@ -20696,60 +20696,64 @@ done:
 }
 
 #ifdef LED_CONTROL_SUPPORT
-INT	Set_Led_Proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg)
+INT Set_Led_Proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg)
 {
-	PCHAR thisChar;
-	long led_param[8];
-	INT i = 0, j = 0;
-	struct wifi_dev *wdev = NULL;
+	PCHAR token;
+	UCHAR led_param[6];
+	UINT i, value;
+	struct wifi_dev *wdev;
 	POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;
-	UINT apidx = pObj->ioctl_if;
 	UCHAR BandIdx = hc_get_hw_band_idx(pAd);
 	PLED_INIT_TABLE pled_table = pAd->LedCntl.Led_Init_Ops;
-	UCHAR led_idx = LED_IDX_0;
 
-	wdev = &pAd->ApCfg.MBSSID[apidx].wdev;
+	if (!arg || !pObj || BandIdx == INVALID_WIFI_RAM_BAND_NUM ||
+		!pled_table || pled_table->band_idx != BandIdx)
+		return FALSE;
 
-	if (wdev->if_up_down_state == FALSE) {
-		MTWF_PRINT("bss[%d] is not ready!!!\n", apidx);
-		return -1;
-	}
+	wdev = get_wdev_by_ioctl_idx_and_iftype(pAd, pObj->ioctl_if, pObj->ioctl_if_type);
+	if (!wdev || !wdev->if_up_down_state)
+		return FALSE;
 
-	if (BandIdx == INVALID_WIFI_RAM_BAND_NUM) {
-		MTWF_PRINT("hc_get_hw_band_idx(pAd) is wrong!\n");
-		return -1;
-	}
-
-	MTWF_PRINT("\n %s ==> arg = %s\n", __func__, arg);
-	memset(led_param, 0, sizeof(long) * 8);
-
-	while ((thisChar = strsep((char **)&arg, "-")) != NULL) {
-		led_param[i] = os_str_tol(thisChar, 0, 10);
-		i++;
-
-		if (i >= 8)
-			break;
-	}
-
-	MTWF_PRINT("\n%s\n", __func__);
-
-	for (j = 0; j < i; j++)
-		MTWF_PRINT("%02x\n", (UINT)led_param[j]);
-
-	if (pled_table) {
-		for (i = 0; i < LED_MAX_NUM; i++) {
-			if (((pled_table[i].band_idx != LED_BAND_NONE) &&
-				 (BandIdx == pled_table[i].band_idx))) {
-				led_idx = pled_table[i].led_idx;
-				break;
-			}
+	for (i = 0; i < ARRAY_SIZE(led_param); i++) {
+		token = strsep(&arg, "-");
+		if (!token || !*token)
+			return FALSE;
+		value = 0;
+		for (; *token; token++) {
+			if (*token < '0' || *token > '9')
+				return FALSE;
+			value = value * 10 + (*token - '0');
+			if (value > 255)
+				return FALSE;
 		}
+		led_param[i] = value;
+	}
+	if (arg || led_param[0] > 1 || led_param[1] > 1 || led_param[2] > LED_TX_DATA_ONLY)
+		return FALSE;
+
+	switch (led_param[5]) {
+	case LED_SOLID_ON:
+	case LED_SOLID_OFF:
+	case LED_TX_BLINKING:
+	case LED_BLINKING_500MS_ON_500MS_OFF:
+	case LED_BLINKING_250MS_ON_250MS_OFF:
+	case LED_BLINKING_170MS_ON_170MS_OFF:
+	case LED_BLINKING_500MS_ON_100MS_OFF:
+	case LED_BLINKING_500MS_ON_700MS_OFF:
+	case LED_BLINKING_1000MS_ON_1000MS_OFF:
+	case LED_BLINKING_2000MS_ON_2000MS_OFF:
+	case LED_WPS_3_BLINKING_PER_SECOND_FOR_4_SECONDS:
+	case LED_WPS_5S_ON_3S_OFF_THEN_BLINKING:
+	case LED_WPS_5S_ON:
+	case LED_GENERAL_FIX_BLINKING_FORMAT:
+	case LED_TWO_LED_INTERATIVE_BLINKING:
+		break;
+	default:
+		return FALSE;
 	}
 
-	rtmp_control_led_cmd(pAd, led_idx, led_param[0], led_param[1], BandIdx,
-		led_param[2], led_param[3], led_param[4], led_param[5]);
-
-	return TRUE;
+	return rtmp_control_led_cmd(pAd, pled_table->led_idx, led_param[0], led_param[1], BandIdx,
+		led_param[2], led_param[3], led_param[4], led_param[5]) == NDIS_STATUS_SUCCESS;
 }
 #endif
 

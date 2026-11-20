@@ -76,7 +76,7 @@ hc_get_mac_dev(struct _RTMP_ADAPTER *ad)
 {
 	struct hdev_ctrl *ctrl = NULL;
 
-	if (!ad)
+	if (!ad || !ad->hdev_ctrl)
 		return NULL;
 
 	ctrl = (struct hdev_ctrl *)ad->hdev_ctrl;

@@ -7,7 +7,8 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=mtwifi-cfg
 PKG_LICENSE:=GPL-2.0+
 PKG_VERSION:=1
-PKG_RELEASE:=5
+PKG_RELEASE:=26
+PKG_CONFIG_DEPENDS:=CONFIG_MTK_WIFI7_CFG80211_SUPPORT CONFIG_WIFI_SCRIPTS_UCODE
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -16,10 +17,12 @@ define Package/mtwifi-cfg
   CATEGORY:=MTK Properties
   SUBMENU:=Applications
   TITLE:=mtwifi configure scripts for mt798x
-  DEPENDS:=+wireless-tools +iwinfo +wifi-dats +wifi-scripts +lua-cjson +libuci-lua +luci-lib-nixio +datconf-lua @!PACKAGE_wifi-profile
+  DEPENDS:=+mtwifi-dot1x +wireless-tools +iwinfo +wifi-dats +wifi-scripts +lua-cjson +libuci-lua +luci-lib-nixio +datconf-lua @!PACKAGE_wifi-profile @!MTK_WIFI7_CFG80211_SUPPORT
 endef
 
 define Build/Compile
+	$(if $(CONFIG_MTK_WIFI7_CFG80211_SUPPORT),$(error mtwifi-cfg requires the WEXT driver interface))
+	$(if $(CONFIG_WIFI_SCRIPTS_UCODE),$(error mtwifi-cfg requires the legacy wifi-scripts layout))
 endef
 
 define Package/mtwifi-cfg/install

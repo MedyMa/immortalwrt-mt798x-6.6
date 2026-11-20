@@ -31711,6 +31711,8 @@ INT32 UniCmdLedCtrl(
 	case LED_BLINKING_170MS_ON_170MS_OFF:
 	case LED_BLINKING_500MS_ON_100MS_OFF:
 	case LED_BLINKING_500MS_ON_700MS_OFF:
+	case LED_BLINKING_1000MS_ON_1000MS_OFF:
+	case LED_BLINKING_2000MS_ON_2000MS_OFF:
 		if (tx_over_blink) {
 			u4CmdNeedMaxBufSize = u4ComCmdSize + sizeof(led_ctrl.led_tx_blink);
 			os_zero_mem(&led_ctrl.led_tx_blink, sizeof(led_ctrl.led_tx_blink));
@@ -31721,7 +31723,8 @@ INT32 UniCmdLedCtrl(
 		}
 		break;
 	default:
-		break;
+		ret = NDIS_STATUS_FAILURE;
+		goto error;
 	}
 
 	/* Step 2: Allocate memory space */

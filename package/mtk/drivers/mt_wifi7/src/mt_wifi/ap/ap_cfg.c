@@ -8796,6 +8796,25 @@ INT RTMPAPQueryInformation(
 			Status = -EFAULT;
 	}
 		break;
+#ifdef TR181_SUPPORT
+	case OID_802_11_BW: {
+		UCHAR bw;
+
+		if (!wdev) {
+			Status = -ENODEV;
+			break;
+		}
+		if (wrq->u.data.length < sizeof(bw)) {
+			Status = -EINVAL;
+			break;
+		}
+		bw = wlan_operate_get_bw(wdev);
+		wrq->u.data.length = sizeof(bw);
+		if (copy_to_user(wrq->u.data.pointer, &bw, sizeof(bw)))
+			Status = -EFAULT;
+		break;
+	}
+#endif
 #if defined(VENDOR_FEATURE6_SUPPORT) || defined(TR181_SUPPORT)
 
 	case RT_OID_802_11_PHY_MODE: {
@@ -11336,20 +11355,6 @@ INT RTMPAPQueryInformation(
 				"max_bss_num = %d\n", max_bss_num);
 		} else
 			MTWF_DBG(pAd, DBG_CAT_CFG, CATCFG_DBGLOG, DBG_LVL_ERROR,
-				"Invalid wdev for cmd %d\n", cmd);
-		break;
-	}
-	case OID_802_11_BW:
-	{
-		UCHAR bw;
-
-		if (wdev) {
-			bw = wlan_operate_get_bw(wdev);
-			wrq->u.data.length = sizeof(bw);
-			Status = copy_to_user(wrq->u.data.pointer, &bw, wrq->u.data.length);
-			MTWF_DBG(pAd, DBG_CAT_CHN, CATCHN_CHN, DBG_LVL_INFO, "bw = %d\n", bw);
-		} else
-			MTWF_DBG(pAd, DBG_CAT_CHN, CATCHN_CHN, DBG_LVL_ERROR,
 				"Invalid wdev for cmd %d\n", cmd);
 		break;
 	}

@@ -412,6 +412,13 @@ UCHAR ApAutoChannelAtBootUp(RTMP_ADAPTER *pAd, struct wifi_dev *wdev)
 			MTWF_DBG(pAd, DBG_CAT_CHN, CATCHN_ACS, DBG_LVL_NOTICE, "ACS is already DONE, Channel = %d\n", NewChannel);
 		}
 
+		if (pAd->ApCfg.AcsPrimaryConfigured && (!NewChannel ||
+		    !(pAd->ApCfg.AcsPrimaryChannels[NewChannel / 8] & BIT(NewChannel % 8)))) {
+			pAd->MsMibBucket.Enabled = TRUE;
+			pAd->OneSecMibBucket.Enabled = TRUE;
+			return FALSE;
+		}
+
 		/* Update channel of wdev as new channel */
 		AutoChSelUpdateChannel(pAd, NewChannel, IsAband, wdev);
 
@@ -436,11 +443,6 @@ UCHAR ApAutoChannelAtBootUp(RTMP_ADAPTER *pAd, struct wifi_dev *wdev)
 
 #endif /* MT_DFS_SUPPORT && BACKGROUND_SCAN_SUPPORT */
 
-
-#ifdef RT_CFG80211_SUPPORT
-	/* send acs complete event*/
-	nl80211_send_acs_complete_event(pAd, wdev);
-#endif
 
 	/* sync to other device */
 	wdev_sync_prim_ch(pAd, wdev);
@@ -504,13 +506,15 @@ static BOOLEAN ApCheckLongPreambleSTA(RTMP_ADAPTER *pAd)
 		used for wireless client bridging.
 	==========================================================================
  */
-static VOID ap_run_at_boot(struct _RTMP_ADAPTER *pAd, struct wifi_dev *wdev)
+static BOOLEAN ap_run_at_boot(struct _RTMP_ADAPTER *pAd, struct wifi_dev *wdev)
 {
-	if (ApAutoChannelAtBootUp(pAd, wdev) != TRUE) {
+	BOOLEAN selected = ApAutoChannelAtBootUp(pAd, wdev);
+
+	if (!selected) {
 		MTWF_DBG(pAd, DBG_CAT_CHN, CATCHN_ACS, DBG_LVL_ERROR,
 				"\x1b[41m ACS is disable !!\x1b[m\n");
 	}
-
+	return selected;
 }
 
 NDIS_STATUS APOneShotSettingInitialize(RTMP_ADAPTER *pAd)
@@ -9490,7 +9494,18 @@ INT ap_inf_open(struct wifi_dev *wdev)
 #ifdef BACKGROUND_SCAN_SUPPORT
 	BackgroundScanInit(pAd, wdev);
 #endif /* BACKGROUND_SCAN_SUPPORT */
-	ap_run_at_boot(pAd, wdev);
+	if (!ap_run_at_boot(pAd, wdev) && pAd->ApCfg.AcsPrimaryConfigured) {
+		wdev->bAllowBeaconing = FALSE;
+#ifdef CONFIG_6G_SUPPORT
+		if (WMODE_CAP_6G(wdev->PhyMode))
+			ap_6g_cfg_deinit(pAd, wdev);
+#endif
+		if (wifi_sys_close(wdev) != TRUE)
+			MTWF_DBG(pAd, DBG_CAT_INTF, CATINTF_UP, DBG_LVL_ERROR,
+				 "close wdev after ACS failure failed\n");
+		wdev->state = 0;
+		return FALSE;
+	}
 
 	APStartUpForMbss(pAd, &pAd->ApCfg.MBSSID[wdev->func_idx]);
 #ifdef CFG_SUPPORT_FALCON_PP

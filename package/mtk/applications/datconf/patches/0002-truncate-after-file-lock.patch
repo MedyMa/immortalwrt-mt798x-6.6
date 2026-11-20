@@ -1,0 +1,21 @@
+--- a/kvcutil/libkvcutil.c
++++ b/kvcutil/libkvcutil.c
+@@ -300,8 +300,6 @@ struct kvc_context *kvc_load_opt(const char *file, int flags,
+ 	oflags = O_RDWR;
+ 	if (flags & LF_CREATE_NEW)
+ 		oflags |= O_CREAT;
+-	if (flags & LF_TRUNC)
+-		oflags |= O_TRUNC;
+ 
+ 	fd = open(file, oflags, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+ 	if (fd < 0)
+@@ -317,6 +315,9 @@ struct kvc_context *kvc_load_opt(const char *file, int flags,
+ 			goto cleanup;
+ 	}
+ 
++	if ((flags & LF_TRUNC) && ftruncate(fd, 0))
++		goto cleanup;
++
+ 	/* get file size through the fd */
+ 	ret = fstat(fd, &st);
+ 	if (ret)

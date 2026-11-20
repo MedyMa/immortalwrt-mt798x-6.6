@@ -2609,6 +2609,51 @@ void CheckPhyModeIsABand(RTMP_ADAPTER *pAd)
 }
 
 
+/* Retain secondary channels in the scan when limiting eligible primaries. */
+static UCHAR select_configured_acs_channel(RTMP_ADAPTER *ad, AUTO_CH_CTRL *ctrl,
+					 ChannelSel_Alg alg)
+{
+	PCHANNELINFO info = ctrl->pChannelInfo;
+	AUTOCH_SEL_CTRL *acs = &ctrl->AutoChSelCtrl;
+	UINT32 best_score = 0;
+	UCHAR best_priority = 0, best_channel = 0;
+	UINT i;
+
+	if (!info)
+		return 0;
+	for (i = 0; i < acs->ChListNum && i < MAX_NUM_OF_CHANNELS; i++) {
+		AUTOCH_SEL_CH_LIST *entry = &acs->AutoChSelChList[i];
+		UCHAR ch = entry->Channel;
+		UINT32 score;
+
+		if (!ch || !entry->BwCap || entry->SkipChannel ||
+		    !(ad->ApCfg.AcsPrimaryChannels[ch / 8] & BIT(ch % 8)))
+			continue;
+#ifdef DOT11_EHT_BE
+		if (ad->ApCfg.Eht320Layout && entry->Bw != BW_320)
+			continue;
+#endif
+		if (alg == ChannelAlgApCnt)
+			score = info->ApCnt[i];
+		else if (alg == ChannelAlgCCA)
+			score = info->cca_nav_tx_time[i];
+#ifdef CONFIG_6G_SUPPORT
+		else if (acs->PSC_ACS)
+			score = info->full_cca_time[i];
+#endif
+		else
+			score = info->chanbusytime[i];
+
+		if (!best_channel || entry->Priority > best_priority ||
+		    (entry->Priority == best_priority && score < best_score)) {
+			best_channel = ch;
+			best_priority = entry->Priority;
+			best_score = score;
+		}
+	}
+	return best_channel;
+}
+
 UCHAR SelectBestChannel(RTMP_ADAPTER *pAd, ChannelSel_Alg Alg, struct wifi_dev *pwdev)
 {
 	UCHAR ch = 0;
@@ -2630,6 +2675,12 @@ UCHAR SelectBestChannel(RTMP_ADAPTER *pAd, ChannelSel_Alg Alg, struct wifi_dev *
 
 #endif /* MICROWAVE_OVEN_SUPPORT */
 
+	if (pAd->ApCfg.AcsPrimaryConfigured) {
+		ch = select_configured_acs_channel(pAd, pAutoChCtrl, Alg);
+		if (!ch)
+			return 0;
+		goto selected;
+	}
 	switch (Alg) {
 	case ChannelAlgRandom:
 	case ChannelAlgApCnt:
@@ -2679,6 +2730,7 @@ UCHAR SelectBestChannel(RTMP_ADAPTER *pAd, ChannelSel_Alg Alg, struct wifi_dev *
 		break;
 	}
 
+selected:
 	RTMPSendWirelessEvent(pAd, IW_CHANNEL_CHANGE_EVENT_FLAG, 0, 0, ch);
 	pAutoChCtrl->AutoChSelCtrl.ACSChStat = ACS_CH_STATE_SELECTED;
 	pAutoChCtrl->AutoChSelCtrl.SelCh = ch;
@@ -3207,6 +3259,9 @@ VOID build_acs_scan_ch_list_by_bw(
 #endif
 		) {
 			for (idx = 0; idx < ch_layout_size[2]; idx++) {
+				if (pAd->ApCfg.Eht320Layout &&
+				    (idx % 2) + 1 != pAd->ApCfg.Eht320Layout)
+					continue;
 				if ((ChIdx + 15) < ChListNum56G
 					&& pACSChList[ChIdx].Channel == eht_ch_320M[idx].ch_low_bnd
 					&& pACSChList[ChIdx+15].Channel == eht_ch_320M[idx].ch_up_bnd) {

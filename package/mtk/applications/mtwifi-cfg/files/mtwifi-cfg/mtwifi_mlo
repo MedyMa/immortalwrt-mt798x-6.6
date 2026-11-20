@@ -15,6 +15,7 @@ local MAX_MANAGED_GROUP = 1
 local lock_fd
 local MAX_REQUEST = 4096
 local OPERATION_TIMEOUT = 180
+local CFG80211_OPERATION_TIMEOUT = 720
 local RELOAD_RETRY_INTERVAL = 8
 local MAX_RELOAD_ATTEMPTS = 5
 local RELOAD_TIMEOUT = 8
@@ -58,13 +59,17 @@ local function cursor()
 	return uci.cursor()
 end
 
+local function eht_mode(htmode)
+	local modes = { EHT20 = true, EHT40 = true, EHT80 = true,
+		EHT80_80 = true, EHT160 = true, EHT320 = true, ["EHT320-1"] = true, ["EHT320-2"] = true }
+	return modes[htmode] == true
+end
+
 local function device_info(c, section)
 	local device = c:get("wireless", section, "device")
 	if not device or c:get("wireless", device, "type") ~= "mtwifi" then return nil end
 	local htmode = c:get("wireless", device, "htmode") or ""
-	local eht_modes = { EHT20 = true, EHT40 = true, EHT80 = true,
-		EHT80_80 = true, EHT160 = true, EHT320 = true }
-	if not eht_modes[htmode] then return nil end
+	if not eht_mode(htmode) then return nil end
 	return device, htmode
 end
 
@@ -72,7 +77,7 @@ local function band_name(c, device, htmode)
 	local band = c:get("wireless", device, "band")
 	if band == "2g" or band == "2.4g" then return "2.4G" end
 	if band == "5g" then return "5G" end
-	if band == "6g" or htmode == "EHT320" then return "6G" end
+	if band == "6g" or htmode:match("^EHT320") then return "6G" end
 	local hwmode = c:get("wireless", device, "hwmode")
 	if hwmode == "a" then return "5G" end
 	return "未知频段"
@@ -146,19 +151,19 @@ end
 
 local function save_state(state)
 	if not fs.stat(STATE_DIR) then
-		if not fs.mkdir(STATE_DIR, 448) then return false end -- 0700
+		if not fs.mkdir(STATE_DIR, "700") then return false end
 	end
-	if fs.chmod and not fs.chmod(STATE_DIR, 448) then return false end -- 0700
+	if fs.chmod and not fs.chmod(STATE_DIR, "700") then return false end
 	local tmp = STATE_FILE .. ".tmp." .. tostring(nixio.getpid())
 	local flags = nixio.open_flags("wronly", "creat", "excl", "sync")
-	local file = nixio.open(tmp, flags, 384) -- 0600
+	local file = nixio.open(tmp, flags, "600")
 	if not file then return false end
 	local data = cjson.encode(state) .. "\n"
 	local written = file:write(data)
 	local synced = written == #data and file:sync()
 	file:close()
 	if not synced then os.remove(tmp); return false end
-	if fs.chmod and not fs.chmod(tmp, 384) then os.remove(tmp); return false end -- 0600
+	if fs.chmod and not fs.chmod(tmp, "600") then os.remove(tmp); return false end
 	if not os.rename(tmp, STATE_FILE) then os.remove(tmp); return false end
 	local dir = nixio.open(STATE_DIR, "r")
 	if not dir then return false end
@@ -169,7 +174,7 @@ local function save_state(state)
 end
 
 local function acquire_lock()
-	local fd = nixio.open(LOCK_FILE, nixio.open_flags("rdwr", "creat"), 384) -- 0600
+	local fd = nixio.open(LOCK_FILE, nixio.open_flags("rdwr", "creat"), "600")
 	if not fd then return false end
 	if not fd:lock("tlock") then fd:close(); return false end
 	lock_fd = fd
@@ -352,6 +357,8 @@ local function runtime_field_matches(config, expected, name)
 end
 
 local function wireless_runtime_matches(status, members, expected)
+	local cfg80211 = fs.stat("/usr/share/ucode/mtwifi/cfg.uc")
+	local links, mld_addr = {}, nil
 	for _, member in ipairs(members or {}) do
 		local device = status[member.device]
 		if type(device) ~= "table" or device.up ~= true or device.pending ~= false or
@@ -363,6 +370,23 @@ local function wireless_runtime_matches(status, members, expected)
 				local matches = true
 				for _, name in ipairs(MANAGED) do
 					if not runtime_field_matches(iface.config, fields, name) then matches = false; break end
+				end
+				if matches and cfg80211 then
+					local name = iface.ifname
+					if type(name) ~= "string" or #name > 15 or not name:match("^[%w_%-]+$") then return false end
+					local ok, text = bounded_exec({ "/bin/ubus", "call", "hostapd." .. name, "get_status" },
+						STATUS_TIMEOUT, true)
+					local decoded, ap = pcall(cjson.decode, text or "")
+					if not ok or not decoded or type(ap) ~= "table" or ap.status ~= "ENABLED" or
+						(ap.beacon_ready ~= true and ap.beacon_ready ~= 1) or (tonumber(ap.freq) or 0) <= 0 then return false end
+					local active_group = tonumber(scalar(iface.config.mldgroup) or "0") or 0
+					if active_group > 0 or scalar(iface.config.mlo) == "1" then
+						if type(ap.mld_addr) ~= "string" or ap.mld_addr == "00:00:00:00:00:00" or
+							type(ap.link_id) ~= "number" or ap.link_id < 0 or ap.link_id > 15 or
+							(mld_addr and ap.mld_addr ~= mld_addr) or links[ap.link_id] then return false end
+						mld_addr = ap.mld_addr
+						links[ap.link_id] = true
+					end
 				end
 				if matches then found = true; break end
 			end
@@ -394,27 +418,30 @@ local function current_groups(state, c)
 end
 
 local function security_signature(iface)
-	local enc = defs.enc2dat[iface.encryption or "none"]
-	if not enc then return nil end
-	local authmode, cipher = enc[1], enc[2]
-	local allowed_auth = authmode == "WPA3PSK" or authmode == "OWE"
-	local allowed_cipher = { AES = true, CCMP128 = true, CCMP256 = true, GCMP128 = true, GCMP256 = true }
-	if not allowed_auth or not allowed_cipher[cipher] then return nil end
-	local pmf_mfpc = tostring(defs.vif_cfgs.PMFMFPC or "0")
-	local pmf_mfpr = tostring(defs.vif_cfgs.PMFMFPR or "0")
-	local pmf_sha256 = tostring(defs.vif_cfgs.PMFSHA256 or "0")
-	if authmode == "OWE" or authmode == "WPA3PSK" then
-		pmf_mfpc, pmf_mfpr, pmf_sha256 = "1", "1", "0"
-	elseif authmode == "WPA2PSKWPA3PSK" then
-		pmf_mfpc, pmf_mfpr, pmf_sha256 = "1", "0", "0"
+	if fs.stat("/usr/share/ucode/mtwifi/cfg.uc") then
+		-- The cfg80211 writer also supports explicit CCMP/GCMP variants.
+		local auth, cipher = (iface.encryption or "none"):match("^([^+]+)%+?(.*)$")
+		local ciphers = { [""] = "ccmp", ccmp = "ccmp", gcmp = "gcmp",
+			ccmp256 = "ccmp256", gcmp256 = "gcmp256" }
+		if (auth ~= "sae" and auth ~= "owe") or not ciphers[cipher] or
+			(iface.ieee80211w ~= nil and scalar(iface.ieee80211w) ~= "2") then return nil end
+		local pairwise = ciphers[cipher]
+		if auth == "sae" and cipher == "" and (iface.gcmp256 == nil or disabled(iface.gcmp256)) then
+			pairwise = "ccmp+gcmp256"
+		end
+		local values = { auth, pairwise, tostring(iface.key or ""), "2",
+			scalar(iface.sae_pwe) or "2", scalar(iface.mobility_domain) or "" }
+		for _, key in ipairs({ "sae_ext_key", "ieee80211r" }) do
+			local value = iface[key]
+			if value == nil and key ~= "ieee80211r" and auth == "sae" then value = "1" end
+			values[#values + 1] = disabled(value) and "1" or "0"
+		end
+		values[#values + 1] = disabled(iface.ft_over_ds) and "1" or "0"
+		return table.concat(values, "\0")
 	end
-	-- This branch's AP writer uses shared profile defaults for 802.1X and
-	-- maps only auth mode, cipher, PSK and the PMF values above.
-	local values = {
-		authmode, cipher, tostring(iface.key or ""), pmf_mfpc, pmf_mfpr,
-		pmf_sha256, scalar(defs.vif_cfgs.IEEE8021X) or "0"
-	}
-	return table.concat(values, "\0")
+	local security = defs.security(iface)
+	if not security or (security.auth ~= "WPA3PSK" and security.auth ~= "OWE") then return nil end
+	return table.concat(defs.security_signature(security), "\0")
 end
 
 local function selected_aps(c, selected, allow_owned, state)
@@ -430,7 +457,8 @@ local function selected_aps(c, selected, allow_owned, state)
 		if type(section) ~= "string" or not section:match("^[%w_]+$") or unique[section] then return nil, "invalid_member" end
 		unique[section] = true
 		local iface = c:get_all("wireless", section)
-		if not iface or iface[".type"] ~= "wifi-iface" or iface.mode ~= "ap" or disabled(iface.disabled) or disabled(iface.wds) then
+		if not iface or iface[".type"] ~= "wifi-iface" or iface.mode ~= "ap" or
+			disabled(iface.disabled) or disabled(iface.wds) or disabled(iface.mwds) then
 			return nil, "invalid_member"
 		end
 		local identity = interface_identity(c, section)
@@ -439,8 +467,7 @@ local function selected_aps(c, selected, allow_owned, state)
 		common_network = identity.network
 		local device, htmode = identity.device, identity.htmode
 		if disabled(c:get("wireless", device, "disabled")) then return nil, "unsupported_member" end
-		local eht_modes = { EHT20 = true, EHT40 = true, EHT80 = true, EHT80_80 = true, EHT160 = true, EHT320 = true }
-		if not eht_modes[htmode] then return nil, "unsupported_member" end
+		if not eht_mode(htmode) then return nil, "unsupported_member" end
 		if devices[device] then return nil, "duplicate_radio" end
 		devices[device] = true
 		local group, valid = group_value(iface.mldgroup, iface.mlo)
@@ -482,7 +509,9 @@ local function build_status()
 			(phase == "applied" and "saved" or phase))
 		groups[#groups + 1] = {
 			id = record.id, state = state_name,
-			runtime = phase == "applied" and (record.runtime_confirmed and "config_applied" or "unverified") or "not_ready",
+			runtime = phase == "applied" and
+				(record.links_confirmed and "links_confirmed" or
+				 (record.runtime_confirmed and "config_applied" or "unverified")) or "not_ready",
 			members = members
 		}
 	end
@@ -503,7 +532,7 @@ local function build_status()
 			band = band_name(c, device, htmode), ssid = scalar(iface.ssid) or "",
 			grouped = not valid or (group or 0) > 0,
 			managed = rec ~= nil,
-			eligible = supported and not disabled(iface.wds),
+			eligible = supported and not disabled(iface.wds) and not disabled(iface.mwds),
 			legacy = legacy,
 			disabled = disabled(iface.disabled) or disabled(c:get("wireless", device, "disabled"))
 		}
@@ -656,14 +685,17 @@ local function finish_operation(state, record, index, was_restore)
 		record.phase, record.action, record.operation = "applied", nil, nil
 		record.precondition, record.previous, record.restore_expected = nil, nil, nil
 		record.runtime_confirmed = true
+		record.links_confirmed = fs.stat("/usr/share/ucode/mtwifi/cfg.uc") and true or nil
 		if not save_state(state) then return { ok = false, code = "state_write_failed", message = "state_write_failed" } end
-		return { ok = true, state = "saved", pending = false, id = record.id, runtime = "config_applied" }
+		return { ok = true, state = "saved", pending = false, id = record.id,
+			runtime = record.links_confirmed and "links_confirmed" or "config_applied" }
 	end
 	if operation == "edit" or record.previous then
 		local target = record.restore_expected or record.previous
 		record.expected, record.phase, record.action, record.operation = target, "applied", nil, nil
 		record.previous, record.restore_expected, record.precondition = nil, nil, nil
 		record.runtime_confirmed = true
+		record.links_confirmed = fs.stat("/usr/share/ucode/mtwifi/cfg.uc") and true or nil
 		record.ssid = target[record.members[1].section].ssid.value
 		if not save_state(state) then return { ok = false, code = "state_write_failed", message = "state_write_failed" } end
 		return { ok = true, state = operation == "close" and "restored" or "rolled_back", pending = false, id = record.id }
@@ -692,8 +724,12 @@ local function poll_operation(state, id)
 		record.phase = "recovery_conflict"; save_state(state)
 		return { ok = false, code = "conflict", message = "external_change_detected", pending = true, id = id }
 	end
-	if target and runtime_matches(record.members, target) then return finish_operation(state, record, entry.index, restoring) end
-	if not restoring and now - (tonumber(record.started_at) or now) >= OPERATION_TIMEOUT then
+	local runtime = wireless_runtime_status()
+	if runtime and target and wireless_runtime_matches(runtime, record.members, target) then
+		return finish_operation(state, record, entry.index, restoring)
+	end
+	local deadline = fs.stat("/usr/share/ucode/mtwifi/cfg.uc") and CFG80211_OPERATION_TIMEOUT or OPERATION_TIMEOUT
+	if not restoring and now - (tonumber(record.started_at) or now) >= deadline then
 		local rollback = record.operation == "edit" and record.previous or record.original
 		local allowed = { record.original or {}, record.expected or {}, rollback or {} }
 		local ok, err = restore_snapshots(state, record, rollback, allowed, true)
@@ -705,7 +741,11 @@ local function poll_operation(state, id)
 	end
 	local last = tonumber(record.last_reload_at) or 0
 	local attempts = tonumber(record.reload_attempts) or 0
-	local retry_reload = record.reload_failed == true or (restoring and now - last >= 60)
+	local waiting = false
+	for _, member in ipairs(record.members or {}) do
+		if runtime and runtime[member.device] and runtime[member.device].pending then waiting = true; break end
+	end
+	local retry_reload = not waiting and (record.reload_failed == true or (restoring and now - last >= 60))
 	if attempts < MAX_RELOAD_ATTEMPTS and retry_reload and now - last >= RELOAD_RETRY_INTERVAL then
 		record.last_reload_at, record.reload_attempts = now, attempts + 1
 		record.reload_failed = true

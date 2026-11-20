@@ -1,0 +1,8 @@
+config agent 'main'
+	option enabled '0'
+	option inform_url ''
+	option management_network 'lan'
+	option wired_host '0'
+	# Provisioning WLAN ID from the controller. Optional for client reporting.
+	option wlan_id ''
+	# list section 'be14_ucg_test5'

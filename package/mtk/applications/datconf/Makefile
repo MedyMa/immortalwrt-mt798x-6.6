@@ -8,9 +8,11 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=datconf
-PKG_REVISION:=757f9679
+PKG_REVISION:=19d67f
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_REVISION).tar.bz2
-PKG_RELEASE:=1
+PKG_SOURCE_URL:=https://raw.githubusercontent.com/MedyMa/immortalwrt-mt798x-25.12/main/dl
+PKG_HASH:=9578a7020222551b2c7abe6b9705ed4c86fb05d84a743c43f0b2b6647196fbba
+PKG_RELEASE:=4
 PKG_USE_NINJA:=0
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)

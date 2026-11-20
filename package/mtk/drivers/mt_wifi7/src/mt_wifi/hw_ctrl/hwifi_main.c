@@ -339,7 +339,6 @@ static void hwifi_init_radio(struct _RTMP_ADAPTER *ad)
 	struct mtk_mac_dev *mac_dev = pad_to_mac_dev(ad);
 	struct mtk_mac_phy *mac_phy = &mac_dev->mac_phy;
 
-	OS_NdisAllocateSpinLock(&mac_phy->lock);
 	OS_SEM_LOCK(&mac_phy->lock);
 	mac_phy->chan = 0;
 	mac_phy->chan2 = 0;
@@ -2132,6 +2131,7 @@ mtk_mac_alloc_hw(size_t size, struct mtk_mac_hw_ops *hw_ops)
 	}
 	os_zero_mem(handle, priv_sz);
 	handle->mac_dev = (struct mtk_mac_dev *) ((char *) handle + ALIGN(sizeof(*handle), 4));
+	OS_NdisAllocateSpinLock(&handle->mac_dev->mac_phy.lock);
 
 	ret = RTMPAllocAdapterBlock(handle, (void **)&ad, RTMP_DEV_INF_HWIFI);
 

@@ -54,6 +54,48 @@ RTMP_STRING *RTMPFindSection(RTMP_STRING *buffer)
 		return NULL;
 }
 
+/* Match complete keys at a line boundary and copy directly from the profile. */
+static INT read_profile_key(const char *key, char *dest, int destsize,
+			    char *buffer, UINT *end_offset, BOOLEAN trim_space)
+{
+	const char *line, *value, *end;
+	size_t keylen, len;
+
+	if (!key || !dest || destsize <= 0 || !buffer)
+		return FALSE;
+
+	if (end_offset && *end_offset) {
+		if (*end_offset >= strlen(buffer))
+			return FALSE;
+		line = buffer + *end_offset;
+	} else {
+		line = RTMPFindSection(buffer);
+	}
+	if (!line)
+		return FALSE;
+
+	keylen = strlen(key);
+	while ((line = strchr(line, '\n')) != NULL) {
+		line++;
+		if (!strncmp(line, key, keylen) && line[keylen] == '=')
+			break;
+	}
+	if (!line)
+		return FALSE;
+
+	value = line + keylen + 1;
+	end = strchrnul(value, '\n');
+	if (end_offset)
+		*end_offset = end - buffer;
+	while (value < end && (*value == '\t' || (trim_space && *value == ' ')))
+		value++;
+
+	len = min_t(size_t, end - value, destsize - 1);
+	memset(dest, 0, destsize);
+	memcpy(dest, value, len);
+	return TRUE;
+}
+
 /*
     ========================================================================
 
@@ -83,75 +125,7 @@ INT RTMPGetKeyParameter(
 	IN RTMP_STRING *buffer,
 	IN BOOLEAN bTrimSpace)
 {
-	RTMP_STRING *pMemBuf, *temp_buf1 = NULL, *temp_buf2 = NULL;
-	RTMP_STRING *start_ptr, *end_ptr;
-	RTMP_STRING *ptr;
-	RTMP_STRING *offset = NULL;
-	INT  len, keyLen;
-
-	keyLen = strlen(key);
-	os_alloc_mem(NULL, (PUCHAR *)&pMemBuf, MAX_PARAM_BUFFER_SIZE  * 2);
-
-	if (pMemBuf == NULL)
-		return FALSE;
-
-	memset(pMemBuf, 0, MAX_PARAM_BUFFER_SIZE * 2);
-	temp_buf1 = pMemBuf;
-	temp_buf2 = (RTMP_STRING *)(pMemBuf + MAX_PARAM_BUFFER_SIZE);
-	/*find section*/
-	offset = RTMPFindSection(buffer);
-
-	if (offset == NULL) {
-		os_free_mem((PUCHAR)pMemBuf);
-		return FALSE;
-	}
-
-	strlcpy(temp_buf1, "\n", strlen("\n") + 1);
-	strncat(temp_buf1, key, strlen(key));
-	strncat(temp_buf1, "=", strlen("="));
-	/*search key*/
-	start_ptr = rtstrstr(offset, temp_buf1);
-
-	if (start_ptr == NULL) {
-		os_free_mem((PUCHAR)pMemBuf);
-		return FALSE;
-	}
-
-	start_ptr += strlen("\n");
-	end_ptr = rtstrstr(start_ptr, "\n");
-
-	if (end_ptr == NULL)
-		end_ptr = start_ptr + strlen(start_ptr);
-
-	if (end_ptr < start_ptr) {
-		os_free_mem((PUCHAR)pMemBuf);
-		return FALSE;
-	}
-
-	NdisMoveMemory(temp_buf2, start_ptr, end_ptr - start_ptr);
-	temp_buf2[end_ptr - start_ptr] = '\0';
-	start_ptr = rtstrstr(temp_buf2, "=");
-
-	if (start_ptr == NULL) {
-		os_free_mem((PUCHAR)pMemBuf);
-		return FALSE;
-	}
-
-	ptr = (start_ptr + 1);
-
-	/*trim special characters, i.e.,  TAB or space*/
-	while (*start_ptr != 0x00) {
-		if (((*ptr == ' ') && bTrimSpace) || (*ptr == '\t'))
-			ptr++;
-		else
-			break;
-	}
-
-	len = strlen(start_ptr);
-	memset(dest, 0x00, destsize);
-	strlcpy(dest, ptr, destsize);
-	os_free_mem((PUCHAR)pMemBuf);
-	return TRUE;
+	return read_profile_key(key, dest, destsize, buffer, NULL, bTrimSpace);
 }
 
 #ifndef CONFIG_PROFILE_OFF
@@ -581,91 +555,7 @@ INT RTMPGetKeyParameterWithOffset(
 	IN  RTMP_STRING *buffer,
 	IN	BOOLEAN	bTrimSpace)
 {
-	RTMP_STRING *temp_buf1 = NULL;
-	RTMP_STRING *temp_buf2 = NULL;
-	RTMP_STRING *start_ptr;
-	RTMP_STRING *end_ptr;
-	RTMP_STRING *ptr;
-	RTMP_STRING *offset = 0;
-	INT  len;
-
-	os_alloc_mem(NULL, (PUCHAR *)&temp_buf1, MAX_PARAM_BUFFER_SIZE);
-
-	if (temp_buf1 == NULL)
-		return FALSE;
-
-	os_alloc_mem(NULL, (PUCHAR *)&temp_buf2, MAX_PARAM_BUFFER_SIZE);
-
-	if (temp_buf2 == NULL) {
-		os_free_mem((PUCHAR)temp_buf1);
-		return FALSE;
-	}
-
-	/*find section		*/
-	if (*end_offset == 0) {
-		offset = RTMPFindSection(buffer);
-
-		if (offset == NULL) {
-			os_free_mem((PUCHAR)temp_buf1);
-			os_free_mem((PUCHAR)temp_buf2);
-			return FALSE;
-		}
-	} else
-		offset = buffer + (*end_offset);
-
-	strlcpy(temp_buf1, "\n", strlen("\n") + 1);
-	strncat(temp_buf1, key, strlen(key));
-	strncat(temp_buf1, "=", strlen("="));
-	/*search key*/
-	start_ptr = rtstrstr(offset, temp_buf1);
-
-	if (start_ptr == NULL) {
-		os_free_mem((PUCHAR)temp_buf1);
-		os_free_mem((PUCHAR)temp_buf2);
-		return FALSE;
-	}
-
-	start_ptr += strlen("\n");
-	end_ptr = rtstrstr(start_ptr, "\n");
-
-	if (end_ptr == NULL)
-		end_ptr = start_ptr + strlen(start_ptr);
-
-	if (end_ptr < start_ptr) {
-		os_free_mem((PUCHAR)temp_buf1);
-		os_free_mem((PUCHAR)temp_buf2);
-		return FALSE;
-	}
-
-	*end_offset = end_ptr - buffer;
-	NdisMoveMemory(temp_buf2, start_ptr, end_ptr - start_ptr);
-	temp_buf2[end_ptr - start_ptr] = '\0';
-	strlcpy(temp_buf1, temp_buf2, strlen(temp_buf2) + 1);
-	start_ptr = rtstrstr(temp_buf1, "=");
-
-	if (start_ptr == NULL) {
-		os_free_mem((PUCHAR)temp_buf1);
-		os_free_mem((PUCHAR)temp_buf2);
-		return FALSE;
-	}
-
-	strlcpy(temp_buf2, start_ptr + 1, strlen(start_ptr + 1) + 1);
-	ptr = temp_buf2;
-
-	/*trim space or tab*/
-	while (*ptr != 0x00) {
-		if ((bTrimSpace && (*ptr == ' ')) || (*ptr == '\t'))
-			ptr++;
-		else
-			break;
-	}
-
-	len = strlen(ptr);
-	memset(dest, 0x00, destsize);
-	strlcpy(dest, ptr, len >= destsize ?  destsize : len);
-	os_free_mem((PUCHAR)temp_buf1);
-	os_free_mem((PUCHAR)temp_buf2);
-	return TRUE;
+	return read_profile_key(key, dest, destsize, buffer, end_offset, bTrimSpace);
 }
 
 #ifdef CONFIG_AP_SUPPORT
@@ -5063,7 +4953,8 @@ NDIS_STATUS	RTMPSetProfileParameters(
 	INT ret = 0;
 #endif /* CONFIG_AP_SUPPORT */
 
-	os_alloc_mem(NULL, (UCHAR **)&tmpbuf, MAX_PARAM_BUFFER_SIZE);
+	os_alloc_mem(NULL, (UCHAR **)&tmpbuf,
+		     max_t(size_t, MAX_PARAM_BUFFER_SIZE, ACL_PROFILE_VALUE_SIZE));
 	if (tmpbuf == NULL)
 		return NDIS_STATUS_FAILURE;
 
@@ -6246,24 +6137,40 @@ NDIS_STATUS	RTMPSetProfileParameters(
 				}
 			}
 
-			/*AutoChannelSkipList*/
-			if (RTMPGetKeyParameter("AutoChannelSkipList", tmpbuf, 128, pBuffer, FALSE)) {
-				pAd->ApCfg.AutoChannelSkipListNum = delimitcnt(tmpbuf, ";") + 1;
-				if (delimitcnt(tmpbuf, ";"))
-					pAd->ApCfg.AutoChannelSkipListNum =
-						delimitcnt(tmpbuf, ";") + 1;
-				else
-					pAd->ApCfg.AutoChannelSkipListNum = 0;
+			pAd->ApCfg.AcsPrimaryConfigured = RTMPGetKeyParameter(
+				"AcsPrimaryChannels", tmpbuf, MAX_PARAM_BUFFER_SIZE, pBuffer, FALSE) &&
+				*strim(tmpbuf);
+			memset(pAd->ApCfg.AcsPrimaryChannels, 0, sizeof(pAd->ApCfg.AcsPrimaryChannels));
+			if (pAd->ApCfg.AcsPrimaryConfigured) {
+				for (macptr = rstrtok(tmpbuf, ";"); macptr;
+				     macptr = rstrtok(NULL, ";")) {
+					UCHAR channel;
 
-				for (i = 0, macptr = rstrtok(tmpbuf, ";"); macptr; macptr = rstrtok(NULL, ";"), i++) {
-					if (i < pAd->ApCfg.AutoChannelSkipListNum) {
-						pAd->ApCfg.AutoChannelSkipList[i] = os_str_tol(macptr, 0, 10);
-						MTWF_DBG(NULL,
-							DBG_CAT_CFG, CATCFG_PROFILE, DBG_LVL_INFO,
-							" AutoChannelSkipList[%d]= %d\n", i,
-							pAd->ApCfg.AutoChannelSkipList[i]);
-					} else
+					if (!kstrtou8(strim(macptr), 10, &channel) && channel)
+						pAd->ApCfg.AcsPrimaryChannels[channel / 8] |= BIT(channel % 8);
+				}
+			}
+#ifdef DOT11_EHT_BE
+			pAd->ApCfg.Eht320Layout = 0;
+			if (RTMPGetKeyParameter("Eht320Layout", tmpbuf, 8, pBuffer, TRUE) &&
+			    (tmpbuf[0] == '1' || tmpbuf[0] == '2') && !tmpbuf[1])
+				pAd->ApCfg.Eht320Layout = tmpbuf[0] - '0';
+#endif
+			pAd->ApCfg.AutoChannelSkipListNum = 0;
+			if (RTMPGetKeyParameter("AutoChannelSkipList", tmpbuf,
+						MAX_PARAM_BUFFER_SIZE, pBuffer, FALSE)) {
+				for (macptr = rstrtok(tmpbuf, ";"); macptr;
+				     macptr = rstrtok(NULL, ";")) {
+					UCHAR channel;
+
+					if (pAd->ApCfg.AutoChannelSkipListNum >=
+					    ARRAY_SIZE(pAd->ApCfg.AutoChannelSkipList))
 						break;
+					if (kstrtou8(strim(macptr), 10, &channel) || !channel)
+						continue;
+
+					pAd->ApCfg.AutoChannelSkipList[
+						pAd->ApCfg.AutoChannelSkipListNum++] = channel;
 				}
 #ifdef CONFIG_6G_AFC_SUPPORT
 				afc_save_autochannel_skip_init(pAd);

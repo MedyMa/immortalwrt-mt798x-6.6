@@ -4586,6 +4586,11 @@ typedef struct _AP_ADMIN_CONFIG {
 	ULONG ApCnt;		/* max RSSI during Auto Channel Selection period */
 	UCHAR AutoChannel_Channel;	/* channel number during Auto Channel Selection */
 	UCHAR current_channel_index;	/* current index of channel list */
+	BOOLEAN AcsPrimaryConfigured;
+	UCHAR AcsPrimaryChannels[32];
+#ifdef DOT11_EHT_BE
+	UCHAR Eht320Layout;
+#endif
 	UCHAR AutoChannelSkipListNum;	/* number of rejected channel list */
 	UCHAR AutoChannelSkipListNum6G;	/* number of rejected channel list for 6G */
 #ifdef DFS_VENDOR10_CUSTOM_FEATURE

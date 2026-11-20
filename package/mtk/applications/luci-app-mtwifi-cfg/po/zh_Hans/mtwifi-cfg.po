@@ -118,32 +118,8 @@ msgstr "VHT 1024-QAM（5 GHz）"
 msgid "Vendor VHT extension; this is not HE or EHT 1024-QAM. Leave unset to preserve the profile setting."
 msgstr "厂商 VHT 扩展；这不是 HE 或 EHT 1024-QAM。留空可保留配置文件中的设置。"
 
-msgid "MLO Group"
-msgstr "MLO 分组"
-
 msgid "0 disables MLO; interfaces in the same group must use identical SSID and security settings. Leave unset to preserve the profile setting."
 msgstr "0 表示禁用 MLO；同组接口必须使用相同的 SSID 和安全设置。留空可保留配置文件中的设置。"
-
-msgid "Use profile setting"
-msgstr "使用配置文件设置"
-
-msgid "HE LDPC (all AP BSSIDs)"
-msgstr "HE LDPC（所有 AP BSSID）"
-
-msgid "Applies one HeLdpc value to the radio’s AP BSSIDs. Leave unset to preserve the profile tokens."
-msgstr "将同一 HeLdpc 值应用于此射频的所有 AP BSSID。留空可保留配置文件中的各项设置。"
-
-msgid "MLO group must be between 0 and 16"
-msgstr "MLO 分组必须介于 0 和 16 之间"
-
-msgid "MLO group %s requires matching SSID and security settings"
-msgstr "MLO 分组 %s 中的接口必须使用相同的 SSID 和安全设置"
-
-msgid "VHT 1024-QAM (5 GHz)"
-msgstr "VHT 1024-QAM（5 GHz）"
-
-msgid "Vendor VHT extension; this is not HE or EHT 1024-QAM. Leave unset to preserve the profile setting."
-msgstr "厂商 VHT 扩展；这不是 HE 或 EHT 1024-QAM。留空可保留配置文件中的设置。"
 
 msgid "MAC Address"
 msgstr "MAC 地址"
@@ -447,3 +423,111 @@ msgstr "无线配置已变化，请刷新页面后再清理旧版 MLO 配置。"
 
 msgid "Only legacy MLO flags are cleared. Wireless names, passwords and network bindings are preserved."
 msgstr "此操作仅关闭旧版 MLO 标志，保留现有无线名称、密码和网络绑定。"
+
+msgid "Wireless band or channel information is unavailable. Refresh before saving."
+msgstr "无线频段或信道信息不可用，请刷新后再保存。"
+
+msgid "Invalid wireless band, mode or bandwidth."
+msgstr "无线频段、模式或频宽无效。"
+
+msgid "Secondary 80 MHz channel"
+msgstr "第二段 80 MHz 信道"
+
+msgid "Select secondary channel"
+msgstr "请选择第二段信道"
+
+msgid "Select two permitted, non-adjacent 80 MHz channel segments."
+msgstr "请选择两个合法且互不相邻的 80 MHz 信道段。"
+
+msgid "This country code is unavailable in the driver."
+msgstr "驱动不支持此国家或地区代码。"
+
+msgid "The selected band does not match this radio."
+msgstr "所选频段与此射频设备不匹配。"
+
+msgid "Invalid primary channel for the selected bandwidth."
+msgstr "所选主信道不支持此频宽。"
+
+msgid "The selected channel is unavailable for this country or region."
+msgstr "所选信道在此国家或地区不可用。"
+
+msgid "320 MHz (320-1)"
+msgstr "320 MHz（320-1）"
+
+msgid "320 MHz (320-2)"
+msgstr "320 MHz（320-2）"
+
+msgid "Allowed primary channels"
+msgstr "允许的主信道"
+
+msgid "Automatic selection uses these channels or ranges such as 36-48. Leave empty to use the radio channel list."
+msgstr "自动选频仅使用此处列出的信道或范围（如 36-48）。留空则使用射频设备的信道列表。"
+
+msgid "Excluded channels"
+msgstr "排除的信道"
+
+msgid "Exclude DFS channels from automatic selection"
+msgstr "自动选频时跳过 DFS 信道"
+
+msgid "MAC repeater"
+msgstr "MAC 中继"
+
+msgid "Additional MAC address list file"
+msgstr "附加 MAC 地址列表文件"
+
+msgid "Path on the router. Use one MAC address per line."
+msgstr "路由器上的路径。每行填写一个 MAC 地址。"
+
+msgid "Enter an absolute file path."
+msgstr "请输入绝对文件路径。"
+
+msgid "Generate random key"
+msgstr "生成随机密钥"
+
+msgid "Wireless key"
+msgstr "无线密钥"
+
+msgid "Show Wi-Fi QR code"
+msgstr "显示 Wi-Fi 二维码"
+
+msgid "Enter a valid network name."
+msgstr "请输入有效的网络名称。"
+
+msgid "Enter a valid wireless key."
+msgstr "请输入有效的无线密钥。"
+
+msgid "This encryption cannot be shared by QR code."
+msgstr "此加密方式无法通过二维码分享。"
+
+msgid "The selected cipher is unavailable for this encryption."
+msgstr "此加密方式不支持所选密码套件。"
+
+msgid "Force GCMP-128 (AES)"
+msgstr "强制使用 GCMP-128（AES）"
+
+msgid "Force CCMP-256 (AES)"
+msgstr "强制使用 CCMP-256（AES）"
+
+msgid "Use a passphrase of 8–63 bytes. WPA-PSK also accepts a 64-digit hexadecimal key."
+msgstr "请输入 8–63 字节的口令。WPA-PSK 也支持 64 位十六进制密钥。"
+
+msgid "WPA3 and OWE require management frame protection."
+msgstr "WPA3 和 OWE 必须启用管理帧保护。"
+
+msgid "WPA3 transition mode requires at least optional management frame protection."
+msgstr "WPA3 过渡模式至少需要将管理帧保护设为可选。"
+
+msgid "Management frame protection requires an AES cipher."
+msgstr "管理帧保护需要使用 AES 密码套件。"
+
+msgid "This network uses an encryption or mode the MTK driver cannot join."
+msgstr "MTK 驱动不支持连接此网络所用的加密方式或模式。"
+
+msgid "BSS color"
+msgstr "BSS 着色"
+
+msgid "Set a BSS color from 1 to 63, or enter 255 to let the driver pick a color. Leave empty to use the profile setting."
+msgstr "请输入 1 至 63 的 BSS 颜色编号，或输入 255 让驱动自动选色。留空时沿用当前无线配置文件的设置。"
+
+msgid "Spatial reuse"
+msgstr "空间复用"

@@ -18,6 +18,9 @@
 #ifndef __MT_PROFILE_H__
 #define __MT_PROFILE_H__
 
+/* 17 characters per MAC address plus a separator or terminating NUL. */
+#define ACL_PROFILE_VALUE_SIZE (18 * MAX_NUM_OF_ACL_LIST)
+
 UCHAR *get_dev_l2profile(RTMP_ADAPTER *pAd);
 UCHAR *get_dev_profile_path(void *ph_dev_obj);
 INT get_dev_config_idx(RTMP_ADAPTER *pAd);

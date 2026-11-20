@@ -76,7 +76,7 @@ void rtmp_read_acl_parms_from_file(
 			return;
 		}
 
-		if (RTMPGetKeyParameter(tok_str, tmpbuf, MAX_PARAM_BUFFER_SIZE, buffer, TRUE)) {
+		if (RTMPGetKeyParameter(tok_str, tmpbuf, ACL_PROFILE_VALUE_SIZE, buffer, TRUE)) {
 			for (i = 0, macptr = rstrtok(tmpbuf, ";"); macptr
 				&& (mbss->AccessControlList.Num <= MAX_NUM_OF_ACL_LIST);
 				macptr = rstrtok(NULL, ";"), i++) {

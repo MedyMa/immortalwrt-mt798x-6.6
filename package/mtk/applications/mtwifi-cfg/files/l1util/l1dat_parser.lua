@@ -121,6 +121,15 @@ function l1dat_parser.add_default_value(l1cfg)
     return l1cfg
 end
 
+function l1dat_parser.device_band(dev)
+    if dev.band == "2.4g" then return "2g" end
+    if dev.band == "2g" or dev.band == "5g" or dev.band == "6g" then return dev.band end
+    if dev.INDEX ~= "MT7990" then return nil end
+    if dev.main_ifname == "ra0" then return "2g" end
+    if dev.main_ifname == "rai0" then return "5g" end
+    if dev.main_ifname == "rax0" then return "6g" end
+end
+
 function l1dat_parser.get_value_by_idx(devidx, mainidx, subidx, key)
     --print("Enter l1dat_parser.get_value_by_idx("..devidx..","..mainidx..", "..subidx..", "..key..")<br>")
     if not devidx or not mainidx or not key then return end
@@ -243,9 +252,9 @@ function l1dat_parser.load_l1_profile(path)
     -- print("Before setup ridx", util.serialize_data(devs, seen2))
 
     -- Force to setup reverse indice for quick search.
-    -- Benifit: 
+    -- Benifit:
     --   1. O(1) search with ifname, devname
-    --   2. Seperate DBDC name=k1;k2 format in the L1 profile into each 
+    --   2. Seperate DBDC name=k1;k2 format in the L1 profile into each
     --      ifname, devname.
     local dbdc_if = {}
     local ridx = l1dat_parser.IF_RINDEX
@@ -261,10 +270,10 @@ function l1dat_parser.load_l1_profile(path)
             for i = 1, band_num - 1 do
                 dbdc_if[i] = l1dat_parser.token_get(dev.main_ifname, i, nil)
             end
-            for i = 1, band_num do 
+            for i = 1, band_num do
                 devs[ridx][dbdc_if[i]] = {}
                 devs[ridx][dbdc_if[i]]["subidx"] = i
-                
+
                 for k, v in pairs(dev) do
                     if  k == "INDEX" or k == "EEPROM_offset" or k == "EEPROM_size"
                        or k == "mainidx" then
@@ -336,6 +345,46 @@ function l1dat_parser.load_l1_profile(path)
         end
     end
 
+    -- Preserve UCI radio names when returning from the new manager to WEXT.
+    local ok, uci = pcall(require, "uci")
+    if ok then
+        local cursor = uci.cursor()
+        local physical = devs[dridx]
+        local names, canonical, ambiguous, blocked, mapped = {}, {}, {}, {}, {}
+        cursor:foreach("wireless", "wifi-device", function(section)
+            if section.type ~= "mtwifi" then return end
+            local by_name = physical[section[".name"]]
+            local by_dev = physical[section.devname]
+            local by_phy = devs[ridx][section.phy]
+            if by_phy and by_phy.main_ifname ~= section.phy then by_phy = nil end
+            local dev = by_dev or by_name or by_phy
+            if (section.devname and not by_dev) or
+                (by_name and by_name ~= dev) or (by_phy and by_phy ~= dev) then
+                -- Neither side of a contradictory binding is a missing radio.
+                if by_name then blocked[by_name] = true end
+                if by_phy then blocked[by_phy] = true end
+                if by_dev then blocked[by_dev] = true end
+                return
+            end
+            if dev then
+                if names[dev] and names[dev] ~= section[".name"] then ambiguous[dev] = true end
+                names[dev] = section[".name"]
+                if physical[section[".name"]] == dev then canonical[dev] = section[".name"] end
+            end
+        end)
+        cursor:close()
+        local aliases = {}
+        for name, dev in pairs(physical) do
+            local owner = canonical[dev] or (not ambiguous[dev] and (names[dev] or name))
+            -- Conflicting aliases without a canonical owner must not create
+            -- a new default AP beside the saved configuration.
+            if owner and not blocked[dev] then
+                mapped[owner] = dev
+                aliases[name] = dev
+            end
+        end
+        devs[dridx] = setmetatable(mapped, { __index = aliases })
+    end
     fd:close()
     return devs
 end

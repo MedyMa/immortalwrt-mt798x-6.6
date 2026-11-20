@@ -1,0 +1,45 @@
+#!/usr/bin/python3 -B
+"""Show local BE14 associations and the WLAN assignments used in inform."""
+import json
+import sys
+
+sys.path.insert(0, "/usr/lib/be14-ucg")
+from agent import FACTORY_KEY, MODEL, local, state_for
+from telemetry import wireless_report
+
+
+def main():
+    snapshot = local("snapshot")
+    state = state_for(snapshot["url"])
+    learned = state.get("report_wlans", {})
+    report = wireless_report(snapshot, learned)
+    paired = state["key"] != FACTORY_KEY
+    received = state.get("wlan_model") == MODEL
+    print(f"Model {MODEL} | pairing saved: {paired} | authenticated {MODEL} WLAN settings received: {received}")
+    for radio in report["radio_table_stats"]:
+        band = radio["radio"]
+        row = snapshot["radios"][band]
+        profiles = learned.get(band, {})
+        print(f"{row['ifname']} | {'up' if row['up'] else 'down'} | channel {radio.get('channel', '?')} | "
+              f"netifd {row.get('applied_htmode') or '?'} | operating MHz {radio.get('bw', '?')} | "
+              f"eligible UCG SSIDs {len(profiles)}")
+        for ap in report["vap_table"]:
+            if ap["radio"] != band:
+                continue
+            ssid = ap["essid"]
+            if not paired:
+                match = "awaiting adoption"
+            elif "id" in ap:
+                match = "matched"
+            elif not received:
+                match = "awaiting controller WLAN settings"
+            elif ssid in profiles:
+                match = "ambiguous SSID on this band"
+            else:
+                match = "no matching assignment"
+            print(f"  {ap['name']} {json.dumps(ssid)} | local clients {ap.get('num_sta', '?')} | "
+                  f"UCG WLAN {match} | RX/TX bytes {ap.get('rx_bytes', '?')} {ap.get('tx_bytes', '?')}")
+
+
+if __name__ == "__main__":
+    main()

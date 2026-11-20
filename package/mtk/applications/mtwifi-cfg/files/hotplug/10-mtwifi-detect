@@ -1,9 +1,15 @@
 #!/bin/sh
 
-[ "${ACTION}" = "add" ] && [ "${INTERFACE%%[0-9]}" = "ra" ] &&  {
-	if [ ! -f /etc/config/wireless ]; then
-		need_up=1
-	fi
-	/sbin/wifi config
-	[ "$need_up" = "1" ] && /sbin/wifi up
-}
+[ "$ACTION" = add ] || return 0
+case "$INTERFACE" in
+	ra0|rai0|rax0) ;;
+	*) return 0 ;;
+esac
+
+lock /tmp/mtwifi-detect.lock || return 1
+before="$(uci -q show wireless)"
+if /sbin/wifi config && [ "$before" != "$(uci -q show wireless)" ]; then
+	# If netifd is still starting, it will read the new config itself.
+	ubus -t 2 call network reload >/dev/null 2>&1
+fi
+lock -u /tmp/mtwifi-detect.lock
