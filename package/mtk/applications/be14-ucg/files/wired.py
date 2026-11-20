@@ -30,6 +30,21 @@ def interface(name):
     return isinstance(name, str) and re.fullmatch(r"[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,14}", name)
 
 
+def controller_bridge(snapshot):
+    dev = snapshot.get("management_device")
+    if not interface(dev) or not snapshot.get("upstream_bridge"):
+        return False
+    host = urlsplit(snapshot.get("url") or "").hostname
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        return False
+    route = net_json("ip", "-j", "-4", "route", "get", host)
+    defaults = net_json("ip", "-j", "-4", "route", "show", "default", "dev", dev)
+    return (len(route) == 1 and route[0].get("dev") == dev and not route[0].get("gateway")
+            and any(r.get("gateway") == host for r in defaults))
+
+
 def unicast(mac):
     return (isinstance(mac, str) and re.fullmatch(r"(?:[\da-f]{2}:){5}[\da-f]{2}", mac, re.ASCII)
             and mac != "00:00:00:00:00:00" and not int(mac[:2], 16) & 1)

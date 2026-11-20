@@ -18,8 +18,8 @@ from urllib.parse import urlsplit
 from cryptography.exceptions import InvalidTag
 from inform import FACTORY_KEY, HEADER, LIMIT, packet, unpack
 from telemetry import wireless_report
-from wired import uplink_report
-from wlan import flat, plan, report_wlans, sys_vaps, valid_wlan_id
+from wired import controller_bridge, uplink_report
+from wlan import automatic_choices, flat, plan, report_wlans, sys_vaps, valid_wlan_id
 
 STATE = Path("/etc/be14-ucg/state.json")
 LOCK = "/var/run/be14-ucg.lock"
@@ -113,6 +113,13 @@ def post(url, data):
         client.close()
 
 
+def binding_signature(snapshot):
+    if not snapshot.get("bindings"):
+        return []
+    selected = sorted([band, b["device"], b["section"]] for band, b in snapshot["bindings"].items())
+    return [snapshot["wlan_id"], bool(snapshot.get("automatic")), snapshot.get("management_network"), selected]
+
+
 def report(snapshot, state):
     mac = snapshot["mac"].lower()
     if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
@@ -132,7 +139,12 @@ def report(snapshot, state):
         msg.update(uplink_report(snapshot))
         # An adopted U7 record may have acknowledged a WLAN configuration
         # that omitted 6 GHz. Request a fresh one with the E7 capabilities.
-        if state.get("wlan_model") != MODEL and (state["gcm"] or state["url"].startswith("https://")):
+        requested = snapshot.get("wlan_id") and binding_signature(snapshot) != state.get("applied_binding")
+        if snapshot.get("automatic") and any(b.get("be14_ucg_managed") != "1" for band, b in snapshot["bindings"].items()
+                                             if band not in state.get("inactive_bands", [])):
+            requested = True
+        if (requested or "automatic_wlans" not in state or state.get("wlan_model") != MODEL) and (
+                state["gcm"] or state["url"].startswith("https://")):
             msg["cfgversion"] = "0"
     return msg
 
@@ -152,10 +164,17 @@ def active(bindings, expected):
         return False
     for band, target in expected.items():
         live = bindings[band]
+        if live.get("section") != target["section"] or live.get("device") != target["device"]:
+            return False
+        if target.get("inactive"):
+            if live.get("observed") or not (live.get("missing") or live.get("disabled") == "1"):
+                return False
+            continue
         settings = target["settings"]
-        if (live.get("section") != target["section"] or live.get("device") != target["device"] or
-                live.get("observed") != settings["ssid"] or
-                any(live.get(k) != v or live.get("applied", {}).get(k) != v for k, v in settings.items())):
+        if (live.get("observed") != settings["ssid"] or
+                (settings.get("be14_ucg_managed") == "1" and not live.get("bridge_attached")) or
+                any(live.get(k) != v or (k not in ("be14_ucg_managed", "network") and live.get("applied", {}).get(k) != v)
+                    for k, v in settings.items())):
             return False
     return True
 
@@ -165,19 +184,42 @@ def finish_pending(state, read=None, reload=None, wait=time.sleep):
     reload = reload or reload_wifi
     pending = state["pending"]
     changes = pending["changes"]
+
+    def still_bound(snap):
+        expected, current = pending["expected"], snap["bindings"]
+        if (snap["wlan_id"] == pending["wlan_id"] and bool(snap.get("automatic")) == bool(pending.get("automatic"))
+                and (not pending.get("automatic") or snap.get("management_network") == pending.get("network"))
+                and set(current) == set(expected) and
+                all(current[band].get(field) == target[field] for band, target in expected.items()
+                    for field in ("section", "device"))):
+            return True
+        # The owner changed the binding. Its old transaction can neither apply nor roll back.
+        del state["pending"]
+        save(state)
+        return False
+
     def matches(binding, change, which):
         return (binding.get("section") == change["section"] and binding.get("device") == change["device"]
+                and (not change.get("create") or bool(binding.get("missing")) == (which == "before"))
                 and all(binding.get(k) == change[which].get(k) for k in change["before"].keys() | change["after"].keys()))
+    def replace(updates, rollback=False):
+        read("replace", wlan_id=pending["wlan_id"], changes=updates, automatic=bool(pending.get("automatic")),
+             network=pending.get("network"), rollback=rollback)
     snap = read("snapshot")
+    if not still_bound(snap):
+        return
     bindings = snap["bindings"]
-    if set(bindings) != set(pending["expected"]) or snap["wlan_id"] != pending["wlan_id"]:
-        raise ValueError("WLAN binding changed while provisioning")
+
     def rollback():
         if changes:
-            current = read("snapshot")["bindings"]
+            fresh = read("snapshot")
+            if not still_bound(fresh):
+                return
+            current = fresh["bindings"]
             if all(matches(current.get(c, {}), ch, "after") for c, ch in changes.items()):
-                reverse = {c: dict(ch, before=ch["after"], after=ch["before"]) for c, ch in changes.items()}
-                read("replace", changes=reverse)
+                reverse = {c: dict(section=ch["section"], device=ch["device"], before=ch["after"],
+                                   after=ch["before"], remove=bool(ch.get("create"))) for c, ch in changes.items()}
+                replace(reverse, rollback=True)
             elif not all(matches(current.get(c, {}), ch, "before") for c, ch in changes.items()):
                 raise ValueError("local edit prevents automatic rollback")
             reload()
@@ -190,7 +232,9 @@ def finish_pending(state, read=None, reload=None, wait=time.sleep):
 
     # Resume safely on either side of UCI's atomic file replacement.
     if changes and all(matches(bindings[c], ch, "before") for c, ch in changes.items()):
-        read("replace", changes=changes)
+        if pending.get("automatic") and (snap.get("missing_selection") or not controller_bridge(snap)):
+            raise ValueError("controller uplink unavailable")
+        replace(changes)
     elif not all(matches(bindings[c], ch, "after") for c, ch in changes.items()):
         raise ValueError("concurrent local WLAN edit, pending revision withheld")
     try:
@@ -198,8 +242,12 @@ def finish_pending(state, read=None, reload=None, wait=time.sleep):
             reload()
         for attempt in range(21):
             fresh = read("snapshot")
-            if fresh["wlan_id"] == pending["wlan_id"] and active(fresh["bindings"], pending["expected"]):
+            if not still_bound(fresh):
+                return
+            if active(fresh["bindings"], pending["expected"]):
                 state["cfgversion"] = pending["version"]
+                state["applied_binding"] = binding_signature(fresh)
+                state["inactive_bands"] = sorted(b for b, v in pending["expected"].items() if v.get("inactive"))
                 del state["pending"]
                 save(state)
                 return
@@ -238,13 +286,22 @@ def handle(msg, state, snap, authenticated=False):
         save(state)
     version = revision(msg.get("cfgversion") or mgmt.get("cfgversion") or state["cfgversion"])
     wlan_id = snap["wlan_id"]
-    if "system_cfg" not in msg and "vap_table" not in msg:
+    full_wlan = ("vap_table" in msg if "system_cfg" not in msg else
+                 re.search(r"(?m)^(?:wireless|radio)\.[0-9]+\.", msg["system_cfg"]) is not None)
+    if not full_wlan:
         if "cfgversion" in mgmt and version != state.get("mgmt_version"):
             state["mgmt_version"] = version
             if not wlan_id:
                 state["cfgversion"] = version
             save(state)
         return 5
+    if authenticated:
+        learned = report_wlans(msg)
+        offers = automatic_choices(msg, learned)
+        if (state.get("report_wlans") != learned or state.get("automatic_wlans") != offers or
+                state.get("wlan_model") != MODEL):
+            state.update(report_wlans=learned, automatic_wlans=offers, wlan_model=MODEL)
+            save(state)
     if bool(wlan_id) != bool(snap["bindings"]):
         raise ValueError("configure the WLAN ID and its local sections together")
     if wlan_id:
@@ -252,25 +309,24 @@ def handle(msg, state, snap, authenticated=False):
             raise ValueError("WLAN provisioning requires GCM or verified HTTPS")
         if not valid_wlan_id(wlan_id):
             raise ValueError("invalid WLAN ID")
-        rows = sys_vaps(msg["system_cfg"], wlan_id) if "system_cfg" in msg else msg["vap_table"]
-        changes, expected = plan(rows, snap, wlan_id)
+        if snap.get("automatic") and (snap.get("missing_selection") or not controller_bridge(snap)):
+            raise ValueError("selected secondary AP or controller bridge unavailable")
+        automatic = bool(snap.get("automatic"))
+        rows = sys_vaps(msg["system_cfg"], wlan_id, automatic) if "system_cfg" in msg else msg["vap_table"]
+        changes, expected = plan(rows, snap, wlan_id, allow_withdraw=automatic)
     else:
         changes, expected = {}, {}
-    learned = report_wlans(msg) if authenticated else state.get("report_wlans")
-    mapping_changed = learned != state.get("report_wlans")
-    if mapping_changed:
-        state["report_wlans"] = learned
-    model_changed = authenticated and state.get("wlan_model") != MODEL
-    if model_changed:
-        state["wlan_model"] = MODEL
     if not changes:
         if expected and not active(snap["bindings"], expected):
             raise ValueError("WLAN live settings differ, revision withheld")
-        if state["cfgversion"] != version or mapping_changed or model_changed:
-            state["cfgversion"] = version
+        signature = binding_signature(snap)
+        inactive = sorted(b for b, v in expected.items() if v.get("inactive"))
+        if state["cfgversion"] != version or state.get("applied_binding") != signature or state.get("inactive_bands") != inactive:
+            state.update(cfgversion=version, applied_binding=signature, inactive_bands=inactive)
             save(state)
         return 5
-    state["pending"] = dict(changes=changes, expected=expected, version=version, wlan_id=wlan_id)
+    state["pending"] = dict(changes=changes, expected=expected, version=version, wlan_id=wlan_id,
+                            automatic=bool(snap.get("automatic")), network=snap.get("management_network"))
     save(state)
     finish_pending(state)
     return 1

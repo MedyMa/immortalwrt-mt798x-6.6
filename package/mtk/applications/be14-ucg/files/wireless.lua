@@ -8,6 +8,7 @@ local bus = assert(ubus.connect())
 local req = json.decode(io.read("*a"))
 local cursor = uci.cursor(nil, arg[1])
 local config = assert(cursor:get_all("be14_ucg", "main"))
+local automatic = config.auto_provision == "1"
 assert(config.enabled == "1" or req.op == "overview", "agent disabled")
 
 local function call(obj, method, data)
@@ -19,7 +20,7 @@ local function selected()
     local names = config.section or {}
     if type(names) == "string" then names = {names} end
     for _, name in ipairs(names) do
-        assert(name:match("^be14_ucg_[%w_]+$") and not selected[name], "invalid local AP binding")
+        assert(name:match(automatic and "^[%w_]+$" or "^be14_ucg_[%w_]+$") and not selected[name], "invalid local AP binding")
         selected[name] = true
     end
     return selected
@@ -126,10 +127,54 @@ local function station_table(stations, hosts, ap)
     return rows
 end
 
+-- A driver assigns AP indices in UCI order. Insert or enable only after the last
+-- active AP, so existing BSSes keep their interface names and primary BSSID.
+local function secondary_slots(name, code, dev, radio, live)
+    local aps, last, main_live = {}, 0, false
+    cursor:foreach("wireless", "wifi-iface", function(c)
+        if c.device == name and c.mode == "ap" then
+            aps[#aps+1] = c
+            if not defs.disabled(c.disabled) then last = #aps end
+            if live[c[".name"]] and live[c[".name"]].ifname == dev.main_ifname then main_live = true end
+        end
+    end)
+    local options, managed, active, first = {}, {}, 0, nil
+    for index, c in ipairs(aps) do
+        if not defs.disabled(c.disabled) then
+            active = active + 1
+            first = first or index
+        end
+    end
+    local spare = radio.up and main_live and active < defs.max_mbssid and
+        fs.stat("/sys/class/net/" .. dev.ext_ifname .. active) ~= nil
+    for index, c in ipairs(aps) do
+        local section = c[".name"]
+        local network = c.network
+        if type(network) == "table" and #network == 1 then network = network[1] end
+        if not c[".anonymous"] and (network == nil or type(network) == "string") and
+                (c.mldgroup == nil or c.mldgroup == "0") and not defs.disabled(c.mlo) then
+            local owned = c.be14_ucg_managed == "1"
+            local running = live[section]
+            managed[section] = owned and network == config.management_network and first and index > first
+                and (not running or running.ifname ~= dev.main_ifname)
+            if (managed[section] and running) or
+                    (spare and index > last and defs.disabled(c.disabled)) then
+                options[section] = {section=section, band=code, ssid=c.ssid}
+            end
+        end
+    end
+    local new = "be14_ucg_auto_" .. code
+    if spare and not cursor:get("wireless", new) then
+        options[new] = {section=new, band=code, create=true}
+    end
+    return options, new, managed
+end
+
 local function snapshot()
     local profile = assert(l1.load_l1_profile(l1.L1_DAT_PATH))
     local status = call("network.wireless", "status")
     local radios, aps, bindings, candidates = {}, {}, {}, {}
+    local slots, other_ssids = {}, {}
     local hosts
     local owned = selected()
     for name, dev in pairs(profile.devname_ridx) do
@@ -150,10 +195,16 @@ local function snapshot()
                     live[v.section] = v
                 end
             end
+            local options, new, managed = {}, nil, {}
+            if automatic or req.op == "overview" then
+                options, new, managed = secondary_slots(name, code, dev, radio, live)
+                for _, option in pairs(options) do slots[#slots+1] = option end
+            end
             cursor:foreach("wireless", "wifi-iface", function(c)
                 if c.device ~= name or c.mode ~= "ap" then return end
                 local section = c[".name"]
-                if req.op == "overview" and section:match("^be14_ucg_[%w_]+$") and c.mldgroup == "0"
+                if req.op == "overview" and live[section] and live[section].ifname ~= dev.main_ifname
+                    and section:match("^be14_ucg_[%w_]+$") and c.mldgroup == "0"
                     and not defs.disabled(c.mlo) and not defs.disabled(c.disabled) then
                     candidates[#candidates+1] = {section=section, band=code}
                 end
@@ -164,8 +215,12 @@ local function snapshot()
                 row.channel = row.channel or info.channel
                 row.tx_power = row.tx_power or info.txpower
                 row.live_htmode = row.live_htmode or info.htmode
+                if c.ssid and not defs.disabled(c.disabled) and not (automatic and owned[section]) then
+                    other_ssids[c.ssid] = true
+                    if observed then other_ssids[observed] = true end
+                end
                 if owned[section] then
-                    assert(c.mldgroup == "0" and not defs.disabled(c.mlo) and not defs.disabled(c.disabled),
+                    assert(automatic or (c.mldgroup == "0" and not defs.disabled(c.mlo) and not defs.disabled(c.disabled)),
                         "bind an enabled independent test AP with mldgroup 0")
                     assert(not bindings[code], "multiple AP bindings on one band")
                     local applied = {}
@@ -178,6 +233,15 @@ local function snapshot()
                     bindings[code] = {section=section, ssid=c.ssid, observed=observed, applied=applied,
                         encryption=c.encryption, ieee80211w=c.ieee80211w, key=c.key, isolate=c.isolate,
                         hidden=c.hidden, device=name}
+                    if automatic then
+                        bindings[code].eligible = options[section] ~= nil
+                        bindings[code].managed_secondary = managed[section] == true
+                        bindings[code].disabled = c.disabled
+                        bindings[code].be14_ucg_managed = c.be14_ucg_managed
+                        bindings[code].network = c.network
+                        local master = iface and fs.readlink("/sys/class/net/" .. iface .. "/master")
+                        bindings[code].master = master and master:match("([^/]+)$")
+                    end
                     owned[section] = nil
                 end
                 if observed and info.bssid then
@@ -194,10 +258,15 @@ local function snapshot()
                     row.incomplete_associations = true
                 end
             end)
+            if automatic and owned[new] and not cursor:get("wireless", new) then
+                assert(not bindings[code], "multiple AP bindings on one band")
+                bindings[code] = {section=new, device=name, missing=true, eligible=options[new] ~= nil}
+                owned[new] = nil
+            end
         end
     end
     assert(radios.ng and radios.na and radios["6e"], "BE14 tri-band L1 profile required")
-    assert(not next(owned), "bound test AP missing")
+    assert(automatic or not next(owned), "bound test AP missing")
     local net = assert(config.management_network)
     assert(net:match("^[%w_]+$"), "invalid management network")
     local iface = call("network.interface." .. net, "status")
@@ -207,10 +276,21 @@ local function snapshot()
         dev = nil
     end
     local addr = (iface["ipv4-address"] or {})[1]
+    local bridge = dev and fs.stat("/sys/class/net/" .. dev .. "/bridge") ~= nil
+    if bridge then
+        cursor:foreach("dhcp", "dhcp", function(s)
+            if s.interface == net and s.ignore ~= "1" then bridge = false end
+        end)
+    end
     local mac = dev and fs.readfile("/sys/class/net/" .. dev .. "/address")
+    for _, binding in pairs(bindings) do
+        binding.bridge_attached = dev ~= nil and binding.master == dev
+    end
     return {radios=radios, aps=aps, bindings=bindings, mac=mac and mac:match("%S+"),
         management_device=dev, ip=addr and addr.address, url=config.inform_url, wlan_id=config.wlan_id or "",
-        firmware_version=config.firmware_version, candidates=candidates, sshd_port=tonumber(config.sshd_port or 22)}
+        firmware_version=config.firmware_version, candidates=candidates, sshd_port=tonumber(config.sshd_port or 22),
+        automatic=automatic, slots=slots, other_ssids=other_ssids, missing_selection=next(owned) ~= nil,
+        management_network=net, upstream_bridge=bridge == true}
 end
 
 if req.op == "snapshot" or req.op == "overview" then
@@ -222,23 +302,54 @@ elseif req.op == "replace" then
     local normal = uci.cursor()
     assert(not next(normal:changes("wireless") or {}), "pending local wireless edits")
     local state = snapshot()
+    assert(state.wlan_id == req.wlan_id, "WLAN binding changed")
+    assert(automatic == (req.automatic == true), "WLAN management mode changed")
+    if automatic then
+        assert(not state.missing_selection and state.management_network == req.network, "upstream binding changed")
+    end
     local allowed = {}
     for _, k in ipairs(fields) do allowed[k] = true end
+    if automatic then allowed.disabled = true; allowed.be14_ucg_managed = true; allowed.network = true end
     for code, change in pairs(req.changes) do
         local current = assert(state.bindings[code])
         assert(current.section == change.section and current.device == change.device, "AP binding changed")
+        if automatic then
+            if req.rollback or change.after.disabled == "1" then
+                assert(current.managed_secondary, "AP ownership changed")
+            else
+                assert(state.upstream_bridge and current.eligible and not state.other_ssids[change.after.ssid],
+                    "secondary AP unavailable or duplicate SSID")
+            end
+            if change.create then assert(current.missing and current.section == "be14_ucg_auto_" .. code) end
+            if change.remove then assert(req.rollback and current.section == "be14_ucg_auto_" .. code) end
+        end
         for k in pairs(allowed) do
             local now = cursor:get("wireless", current.section, k)
-            assert((now or false) == (change.before[k] or false), "AP changed locally")
+            local was = change.before[k]
+            if type(now) == "table" and type(was) == "table" then
+                assert(#now == 1 and #was == 1 and now[1] == was[1], "AP network changed locally")
+            else
+                assert((now or false) == (was or false), "AP changed locally")
+            end
         end
         for k in pairs(change.after) do assert(allowed[k], "unsupported AP setting") end
     end
     for _, c in pairs(req.changes) do
-        for k in pairs(allowed) do
-            if c.after[k] then
-                assert(cursor:set("wireless", c.section, k, c.after[k]))
-            elseif c.before[k] then
-                assert(cursor:delete("wireless", c.section, k))
+        if automatic and c.remove then
+            assert(cursor:delete("wireless", c.section))
+        else
+            if automatic and c.create then
+                assert(cursor:set("wireless", c.section, "wifi-iface"))
+                assert(cursor:set("wireless", c.section, "mode", "ap"))
+                assert(cursor:set("wireless", c.section, "device", c.device))
+                assert(cursor:set("wireless", c.section, "mldgroup", "0"))
+            end
+            for k in pairs(allowed) do
+                if c.after[k] then
+                    assert(cursor:set("wireless", c.section, k, c.after[k]))
+                elseif c.before[k] then
+                    assert(cursor:delete("wireless", c.section, k))
+                end
             end
         end
     end
