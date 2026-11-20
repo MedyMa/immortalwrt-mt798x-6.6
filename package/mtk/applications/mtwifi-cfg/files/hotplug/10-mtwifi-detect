@@ -13,3 +13,33 @@ if /sbin/wifi config && [ "$before" != "$(uci -q show wireless)" ]; then
 	ubus -t 2 call network reload >/dev/null 2>&1
 fi
 lock -u /tmp/mtwifi-detect.lock
+
+# A saved radio can be handed to netifd before its PCI netdevice is ready.
+# Resume that radio after the failed setup and its teardown have settled.
+wait_file="/var/run/mtwifi-wait-$INTERFACE"
+[ -s "$wait_file" ] || return 0
+(
+	read -r radio < "$wait_file" || exit 0
+	case "$radio" in ''|*[!A-Za-z0-9_]*) exit 0;; esac
+	. /usr/share/libubox/jshn.sh
+	json_init
+	json_add_string device "$radio"
+	request="$(json_dump)"
+	resume_lock="/var/run/mtwifi-resume-$INTERFACE.lock"
+	lock -n "$resume_lock" || exit 0
+	trap 'lock -u "$resume_lock"' EXIT
+	while [ -s "$wait_file" ] && [ -d "/sys/class/net/$INTERFACE" ]; do
+		status="$(ubus call network.wireless status "$request")" || exit 0
+		json_load "$status" && json_select "$radio" || exit 0
+		json_get_vars autostart disabled up pending retry_setup_failed
+		[ "$autostart:$disabled:$up" = '1:0:0' ] || exit 0
+		if [ "$pending" = 0 ]; then
+			[ "$retry_setup_failed" = 1 ] && [ -s "$wait_file" ] || exit 0
+			# The 24.10 netifd clears its exhausted retry count on down.
+			ubus call network.wireless down "$request" >/dev/null &&
+				ubus call network.wireless up "$request" >/dev/null
+			exit
+		fi
+		sleep 1
+	done
+) </dev/null >/dev/null 2>&1 &

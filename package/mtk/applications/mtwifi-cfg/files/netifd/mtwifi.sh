@@ -31,6 +31,10 @@ drv_mtwifi_init_iface_config() {
 	config_add_boolean mumimo_dl mumimo_ul ofdma_dl ofdma_ul amsdu autoba uapsd
 }
 
+# These WEXT handlers have no driver-specific VLAN or station attributes.
+drv_mtwifi_init_vlan_config() { :; }
+drv_mtwifi_init_station_config() { :; }
+
 drv_mtwifi_cleanup() {
 	return
 }
@@ -86,7 +90,7 @@ mtwifi_vif_sta_set_data() {
 }
 
 drv_mtwifi_setup() {
-	local dev="$1"
+	local dev="$1" main_ifname wait_file
 
 	json_add_string device "$dev"
 
@@ -94,6 +98,23 @@ drv_mtwifi_setup() {
 		wireless_setup_failed "MTWIFI_LOCK_FAILED"
 		return 1
 	fi
+
+	main_ifname="$(l1util get "$dev" main_ifname)"
+	case "$(l1util get "$dev" INDEX):$main_ifname" in
+		MT7990:ra0|MT7990:rai0|MT7990:rax0)
+			wait_file="/var/run/mtwifi-wait-$main_ifname"
+			if [ ! -d "/sys/class/net/$main_ifname" ]; then
+				printf '%s\n' "$dev" > "$wait_file"
+				# The add event may have arrived while publishing the waiter.
+				if [ ! -d "/sys/class/net/$main_ifname" ]; then
+					wireless_setup_failed "MTWIFI_WAITING_FOR_NETDEVICE"
+					lock -u "$LOCK_FILE"
+					return 1
+				fi
+			fi
+			rm -f "$wait_file"
+			;;
+	esac
 
 	logger -t "netifd-mtwifi" "up: $dev"
 
@@ -113,8 +134,7 @@ drv_mtwifi_setup() {
 	fi
 
 	MTWIFI_NOTIFY_FAILED=0
-	local dot1x_pid main_ifname
-	main_ifname="$(l1util get "$dev" main_ifname)"
+	local dot1x_pid
 	if [ -r "/var/run/8021xd_${main_ifname}.pid" ]; then
 		read -r dot1x_pid < "/var/run/8021xd_${main_ifname}.pid"
 		mtwifi_notify _wireless_add_process "$dot1x_pid" /usr/bin/8021xd 1 || MTWIFI_NOTIFY_FAILED=1
