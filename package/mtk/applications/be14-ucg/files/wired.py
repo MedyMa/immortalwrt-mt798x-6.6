@@ -30,19 +30,35 @@ def interface(name):
     return isinstance(name, str) and re.fullmatch(r"[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,14}", name)
 
 
-def controller_bridge(snapshot):
+def controller_bridge_error(snapshot):
     dev = snapshot.get("management_device")
-    if not interface(dev) or not snapshot.get("upstream_bridge"):
-        return False
+    if not interface(dev):
+        return "upstream_device"
+    if not snapshot.get("upstream_bridge"):
+        return snapshot.get("upstream_error") or "upstream_bridge"
     host = urlsplit(snapshot.get("url") or "").hostname
     try:
         ipaddress.IPv4Address(host)
     except ValueError:
-        return False
+        return "upstream_ipv4"
     route = net_json("ip", "-j", "-4", "route", "get", host)
-    defaults = net_json("ip", "-j", "-4", "route", "show", "default", "dev", dev)
-    return (len(route) == 1 and route[0].get("dev") == dev and not route[0].get("gateway")
-            and any(r.get("gateway") == host for r in defaults))
+    if (len(route) != 1 or route[0].get("dev") != dev or route[0].get("gateway") not in (None, host)
+            or route[0].get("via") or route[0].get("type", "unicast") != "unicast"):
+        return "upstream_route"
+    # A client lease on this bridge observes the gateway offered to a new BSS,
+    # even when the router itself sends its default traffic through a VPN.
+    if "leased_gateway" in snapshot:
+        return None if snapshot["leased_gateway"] == host else "upstream_gateway"
+    if host in (snapshot.get("upstream_gateways") or []):
+        return None
+    defaults = net_json("ip", "-j", "-4", "route", "show", "table", "all", "default", "dev", dev)
+    if any(r.get("dst") == "default" and r.get("gateway") == host for r in defaults):
+        return None
+    return "upstream_gateway"
+
+
+def controller_bridge(snapshot):
+    return controller_bridge_error(snapshot) is None
 
 
 def unicast(mac):

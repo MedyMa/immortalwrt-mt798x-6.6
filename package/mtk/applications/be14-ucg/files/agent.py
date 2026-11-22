@@ -19,6 +19,7 @@ from cryptography.exceptions import InvalidTag
 from inform import FACTORY_KEY, HEADER, LIMIT, packet, unpack
 from telemetry import wireless_report
 from wired import controller_bridge, uplink_report
+from wired_host import host_mac, status as wired_host_status
 from wlan import automatic_choices, flat, plan, report_wlans, sys_vaps, valid_wlan_id
 
 STATE = Path("/etc/be14-ucg/state.json")
@@ -52,7 +53,13 @@ def run(argv, **kwargs):
 
 def local(op, **data):
     with tempfile.TemporaryDirectory(prefix="be14-uci-") as private:
-        return json.loads(run([BRIDGE, private], input=json.dumps(dict(op=op, **data)).encode()))
+        snap = json.loads(run([BRIDGE, private], input=json.dumps(dict(op=op, **data)).encode()))
+    if snap.get("upstream_bridge") and snap.get("wired_host_enabled") and snap.get("mac"):
+        lease = wired_host_status()
+        if (lease.get("state") == "leased" and lease.get("parent") == snap["management_device"]
+                and lease.get("mac") == host_mac(snap["mac"]) and lease.get("ip")):
+            snap["leased_gateway"] = lease.get("gateway")
+    return snap
 
 
 @contextlib.contextmanager

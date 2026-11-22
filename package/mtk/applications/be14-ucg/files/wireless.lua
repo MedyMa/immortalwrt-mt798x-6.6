@@ -267,7 +267,7 @@ local function snapshot()
     end
     assert(radios.ng and radios.na and radios["6e"], "BE14 tri-band L1 profile required")
     assert(automatic or not next(owned), "bound test AP missing")
-    local net = assert(config.management_network)
+    local net = assert(req.op == "overview" and req.network or config.management_network)
     assert(net:match("^[%w_]+$"), "invalid management network")
     local iface = call("network.interface." .. net, "status")
     local dev = iface.l3_device or iface.device
@@ -276,11 +276,29 @@ local function snapshot()
         dev = nil
     end
     local addr = (iface["ipv4-address"] or {})[1]
-    local bridge = dev and fs.stat("/sys/class/net/" .. dev .. "/bridge") ~= nil
-    if bridge then
+    local upstream_error
+    if not dev then
+        upstream_error = "upstream_device"
+    elseif fs.stat("/sys/class/net/" .. dev .. "/bridge", "type") ~= "dir" then
+        upstream_error = "upstream_bridge"
+    else
+        local ignored = {["1"]=true, on=true, yes=true, ["true"]=true, enabled=true}
         cursor:foreach("dhcp", "dhcp", function(s)
-            if s.interface == net and s.ignore ~= "1" then bridge = false end
+            if not s.interface or ignored[s.ignore] then return end
+            local owner = s.interface == net and iface or call("network.interface." .. s.interface, "status")
+            if (owner.l3_device or owner.device) ~= dev then return end
+            -- dnsmasq does not create an implicit IPv4 pool on a DHCP client.
+            local v4 = s.dhcpv4 and s.dhcpv4 ~= "disabled" or (not s.dhcpv4 and owner.proto ~= "dhcp")
+            if v4 or (s.dhcpv6 and s.dhcpv6 ~= "disabled") or (s.ra and s.ra ~= "disabled") then
+                upstream_error = "upstream_dhcp"
+            end
         end)
+    end
+    local gateways = {}
+    for _, route in ipairs(iface.route or {}) do
+        if route.target == "0.0.0.0" and tonumber(route.mask) == 0 and route.nexthop then
+            gateways[#gateways+1] = route.nexthop
+        end
     end
     local mac = dev and fs.readfile("/sys/class/net/" .. dev .. "/address")
     for _, binding in pairs(bindings) do
@@ -290,7 +308,8 @@ local function snapshot()
         management_device=dev, ip=addr and addr.address, url=config.inform_url, wlan_id=config.wlan_id or "",
         firmware_version=config.firmware_version, candidates=candidates, sshd_port=tonumber(config.sshd_port or 22),
         automatic=automatic, slots=slots, other_ssids=other_ssids, missing_selection=next(owned) ~= nil,
-        management_network=net, upstream_bridge=bridge == true}
+        management_network=net, upstream_bridge=upstream_error == nil, upstream_error=upstream_error,
+        upstream_gateways=gateways, wired_host_enabled=config.wired_host == "1"}
 end
 
 if req.op == "snapshot" or req.op == "overview" then
