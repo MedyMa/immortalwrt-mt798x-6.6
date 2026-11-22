@@ -244,6 +244,8 @@ local function snapshot()
                     end
                     owned[section] = nil
                 end
+                -- Provisioning needs the live BSS and bridge, not station discovery.
+                if req.stations == false then return end
                 if observed and info.bssid then
                     local ap = {section=section, name=iface, radio=code, radio_name=row.name,
                         essid=observed, bssid=info.bssid:lower(), channel=info.channel,

@@ -62,10 +62,18 @@ def local(op, **data):
     return snap
 
 
+class AgentBusy(Exception):
+    """Another process holds the provisioning lock."""
+
+
 @contextlib.contextmanager
-def locked():
+def locked(blocking=True):
     with open(LOCK, "a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle, flags)
+        except BlockingIOError as exc:
+            raise AgentBusy from exc
         yield
 
 
@@ -220,9 +228,9 @@ def finish_pending(state, read=None, reload=None, wait=time.sleep):
                 and (not change.get("create") or bool(binding.get("missing")) == (which == "before"))
                 and all(binding.get(k) == change[which].get(k) for k in change["before"].keys() | change["after"].keys()))
     def replace(updates, rollback=False):
-        read("replace", wlan_id=pending["wlan_id"], changes=updates, automatic=bool(pending.get("automatic")),
+        read("replace", stations=False, wlan_id=pending["wlan_id"], changes=updates, automatic=bool(pending.get("automatic")),
              network=pending.get("network"), rollback=rollback)
-    snap = read("snapshot")
+    snap = read("snapshot", stations=False)
     if not still_bound(snap):
         return
     bindings = snap["bindings"]
@@ -231,7 +239,7 @@ def finish_pending(state, read=None, reload=None, wait=time.sleep):
         # A failed update on another band must not re-enable a withdrawn or restricted SSID.
         reversible = {c: ch for c, ch in changes.items() if not pending["expected"][c].get("inactive")}
         if reversible:
-            fresh = read("snapshot")
+            fresh = read("snapshot", stations=False)
             if not still_bound(fresh):
                 return
             current = fresh["bindings"]
@@ -262,7 +270,7 @@ def finish_pending(state, read=None, reload=None, wait=time.sleep):
         if changes:
             reload()
         for attempt in range(21):
-            fresh = read("snapshot")
+            fresh = read("snapshot", stations=False)
             if not still_bound(fresh):
                 return
             if active(fresh["bindings"], pending["expected"]):
@@ -351,33 +359,49 @@ def tick():
     snap = local("snapshot")
     state = state_for(snap["url"])
     if "pending" in state:
-        try:
-            finish_pending(state)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            print("Pending WLAN revision could not be confirmed", file=sys.stderr, flush=True)
+        with locked():
+            state = state_for(snap["url"])
+            if "pending" in state:
+                try:
+                    finish_pending(state)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    print("Pending WLAN revision could not be confirmed", file=sys.stderr, flush=True)
         snap = local("snapshot")
+        state = state_for(snap["url"])
     payload = report(snap, state)
     mac = bytes.fromhex(payload["mac"].replace(":", ""))
     reply = post(state["url"], packet(payload, mac, state["key"], state["gcm"]))
     if reply is None:
         return 5 if state["key"] == FACTORY_KEY else 15
     msg = unpack(reply, mac, state["key"], state["gcm"])
-    if state["key"] != FACTORY_KEY:
-        # tmpfs only. A saved adoption can outlive a reachable controller.
-        try:
-            with tempfile.NamedTemporaryFile(dir=LAST_INFORM.parent, delete=False, mode="w") as marker:
-                json.dump([state["url"], payload["mac"], payload["version"], int(time.time())], marker)
-            os.replace(marker.name, LAST_INFORM)
-        except OSError:
-            pass
-    # An authenticated GCM reply can itself negotiate the switch from CBC.
-    if int.from_bytes(reply[14:16], "big") & 8 and state["key"] != FACTORY_KEY and not state["gcm"]:
-        state["gcm"] = True
-        save(state)
-    if "pending" in state:
-        return 10
-    protected = bool(int.from_bytes(reply[14:16], "big") & 8) or endpoint(state["url"]).scheme == "https"
-    return handle(msg, state, snap, protected)
+    with locked():
+        # The controller can take several seconds to reply. Only apply it to
+        # the adoption and AP selection that produced this inform.
+        if state_for(snap["url"]) != state:
+            return 1
+        if msg.get("_type") != "noop":
+            fresh = local("snapshot", stations=False)
+            fields = ("url", "mac", "management_network", "firmware_version", "wlan_id", "automatic", "missing_selection")
+            if (any(snap.get(k) != fresh.get(k) for k in fields)
+                    or binding_signature(snap) != binding_signature(fresh)):
+                return 1
+            snap = fresh
+        if state["key"] != FACTORY_KEY:
+            # tmpfs only. A saved adoption can outlive a reachable controller.
+            try:
+                with tempfile.NamedTemporaryFile(dir=LAST_INFORM.parent, delete=False, mode="w") as marker:
+                    json.dump([state["url"], payload["mac"], payload["version"], int(time.time())], marker)
+                os.replace(marker.name, LAST_INFORM)
+            except OSError:
+                pass
+        # An authenticated GCM reply can itself negotiate the switch from CBC.
+        if int.from_bytes(reply[14:16], "big") & 8 and state["key"] != FACTORY_KEY and not state["gcm"]:
+            state["gcm"] = True
+            save(state)
+        if "pending" in state:
+            return 10
+        protected = bool(int.from_bytes(reply[14:16], "big") & 8) or endpoint(state["url"]).scheme == "https"
+        return handle(msg, state, snap, protected)
 
 
 def main():
@@ -397,8 +421,7 @@ def main():
         return 0
     while True:
         try:
-            with locked():
-                interval = tick()
+            interval = tick()
         except (OSError, ValueError, KeyError, TypeError, RecursionError, InvalidTag, zlib.error,
                 http.client.HTTPException, subprocess.SubprocessError) as exc:
             # Controller replies and local UCI documents may contain credentials.
