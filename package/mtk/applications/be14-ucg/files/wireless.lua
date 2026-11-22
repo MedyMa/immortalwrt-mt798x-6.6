@@ -170,6 +170,39 @@ local function secondary_slots(name, code, dev, radio, live)
     return options, new, managed
 end
 
+-- netifd can put several logical interfaces (often wan and wan6) on one bridge.
+local function address_services(net, iface, dev)
+    local conflicts = {}
+    local enabled = {["1"]=true, on=true, yes=true, ["true"]=true, enabled=true}
+    local main_dhcp = false
+    cursor:foreach("dhcp", "odhcpd", function(c)
+        if c.maindhcp ~= nil then main_dhcp = enabled[c.maindhcp] end
+    end)
+    cursor:foreach("dhcp", "dhcp", function(s)
+        local name = s.interface or s[".name"]
+        if type(name) ~= "string" or name == "" then return end
+        local owner = name == net and iface or call("network.interface." .. name, "status")
+        if (owner.l3_device or owner.device) ~= dev then return end
+
+        local row = {interface=name}
+        -- dnsmasq creates IPv4 ranges only for static networks with an IPv4 subnet.
+        -- Its ignore flag does not turn off odhcpd's explicitly configured services.
+        local addr = (owner["ipv4-address"] or {})[1]
+        local pool = s.interface and owner.proto == "static" and addr and addr.address and
+            not enabled[s.ignore] and s.dhcpv4 ~= "disabled"
+        if pool or (main_dhcp and s.dhcpv4 == "server") then row.dhcpv4 = "server" end
+        for _, key in ipairs({"ra", "dhcpv6"}) do
+            local mode = s[key]
+            -- A relay master listens upstream. A downstream hybrid may act as a server.
+            if mode == "server" or (not enabled[s.master] and (mode == "hybrid" or mode == "relay")) then
+                row[key] = mode
+            end
+        end
+        if row.dhcpv4 or row.ra or row.dhcpv6 then conflicts[#conflicts+1] = row end
+    end)
+    return conflicts
+end
+
 local function snapshot()
     local profile = assert(l1.load_l1_profile(l1.L1_DAT_PATH))
     local status = call("network.wireless", "status")
@@ -278,23 +311,14 @@ local function snapshot()
         dev = nil
     end
     local addr = (iface["ipv4-address"] or {})[1]
-    local upstream_error
+    local upstream_error, conflicts
     if not dev then
         upstream_error = "upstream_device"
     elseif fs.stat("/sys/class/net/" .. dev .. "/bridge", "type") ~= "dir" then
         upstream_error = "upstream_bridge"
     else
-        local ignored = {["1"]=true, on=true, yes=true, ["true"]=true, enabled=true}
-        cursor:foreach("dhcp", "dhcp", function(s)
-            if not s.interface or ignored[s.ignore] then return end
-            local owner = s.interface == net and iface or call("network.interface." .. s.interface, "status")
-            if (owner.l3_device or owner.device) ~= dev then return end
-            -- dnsmasq does not create an implicit IPv4 pool on a DHCP client.
-            local v4 = s.dhcpv4 and s.dhcpv4 ~= "disabled" or (not s.dhcpv4 and owner.proto ~= "dhcp")
-            if v4 or (s.dhcpv6 and s.dhcpv6 ~= "disabled") or (s.ra and s.ra ~= "disabled") then
-                upstream_error = "upstream_dhcp"
-            end
-        end)
+        conflicts = address_services(net, iface, dev)
+        if #conflicts > 0 then upstream_error = "upstream_dhcp" end
     end
     local gateways = {}
     for _, route in ipairs(iface.route or {}) do
@@ -311,6 +335,7 @@ local function snapshot()
         firmware_version=config.firmware_version, candidates=candidates, sshd_port=tonumber(config.sshd_port or 22),
         automatic=automatic, slots=slots, other_ssids=other_ssids, missing_selection=next(owned) ~= nil,
         management_network=net, upstream_bridge=upstream_error == nil, upstream_error=upstream_error,
+        upstream_conflicts=upstream_error == "upstream_dhcp" and conflicts or nil,
         upstream_gateways=gateways, wired_host_enabled=config.wired_host == "1"}
 end
 
